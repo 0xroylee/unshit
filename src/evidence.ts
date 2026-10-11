@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { describeRequestFailure, registeredRequestFailure } from "./request-failure.ts";
 import { encodeRepositoryPath, type GitHubResearcher } from "./github.ts";
-import { chooseLocalReferenceFiles, readLocalSource, type LocalIndex } from "./local.ts";
+import { isRootLicensePath, isTestPath, isTextSourcePath, rankTreeFiles, type RankedTerm } from "./file-ranking.ts";
+import { chooseLocalReferenceFiles, localReadFailureText, readLocalSource, type LocalIndex } from "./local.ts";
 import type {
   EvidenceExcerpt,
   EvidenceSource,
@@ -41,6 +43,7 @@ export async function loadSelectedEvidence(options: {
   modelSelection: SelectedFile[];
   github: GitHubResearcher;
   relevantText: string;
+  domainTerms?: RankedTerm[];
   signal?: AbortSignal;
 }): Promise<LoadedEvidence> {
   const remoteTrees = options.repositories.flatMap((repository) => repository.files.map((file) => ({ file, repository })));
@@ -84,10 +87,10 @@ export async function loadSelectedEvidence(options: {
       const entry = remoteById.get(selection.fileId);
       return entry?.repository.candidate.id === repository.candidate.id ? [{ selection, file: entry.file }] : [];
     });
-    const ranked = rankRepositorySourceFiles(repository.files);
+    const ranked = rankTreeFiles(repository.files, options.domainTerms ?? [], repository.files.length);
     const selectedProduction = selectedFromRepository.find(({ selection, file }) => selection.role === "production" && isImplementationSourceFile(file.path));
     const production = selectedProduction?.file ?? ranked.find((file) => isImplementationSourceFile(file.path));
-    const selectedTest = selectedFromRepository.find(({ selection, file }) => selection.role === "test" && isTestPath(file.path) && isEvidenceSourceFile(file.path));
+    const selectedTest = selectedFromRepository.find(({ selection, file }) => selection.role === "test" && isTestPath(file.path) && isTextSourcePath(file.path));
     const test = selectedTest?.file ?? ranked.find((file) => isTestPath(file.path));
     if (production) {
       if (!add({ file: production, role: "production", kind: "remote", repository })) {
@@ -148,9 +151,16 @@ export async function loadSelectedEvidence(options: {
       const bytes = item.kind === "local"
         ? await readLocalSource(options.local.root, item.file)
         : await options.github.fetchSource(item.repository!, item.file.path, options.signal);
-      if (bytes.byteLength > (item.kind === "local" ? 256_000 : 1_000_000)) throw new Error("source exceeded the file-size limit");
-      const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-      if (text.includes("\u0000")) throw new Error("binary content is outside the text evidence format");
+      if (bytes.byteLength > (item.kind === "local" ? 256_000 : 1_000_000)) {
+        throw new EvidenceReadError(item.kind === "local" ? "local_size_limit" : "remote_size_limit");
+      }
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        throw new EvidenceReadError("invalid_utf8");
+      }
+      if (text.includes("\u0000")) throw new EvidenceReadError("binary");
       const lines = splitLines(text);
       const sourceId = `S${++sourceNumber}`;
       const sha256 = createHash("sha256").update(bytes).digest("hex");
@@ -193,9 +203,10 @@ export async function loadSelectedEvidence(options: {
       }
     } catch (error) {
       if (options.signal?.aborted) break;
+      const repository = item.kind === "remote" ? ` from ${item.repository!.candidate.fullName}` : "";
       gaps.push({
         kind: item.kind === "local" ? "local" : "file",
-        message: `Could not read ${item.file.path}: ${safeError(error)}.`,
+        message: `Could not read ${item.file.path}${repository}; ${describeReadFailure(error)}.`,
         material: true,
       });
     }
@@ -264,7 +275,8 @@ function chooseRepositoryReferenceFiles(files: TreeFile[]): Array<{ file: TreeFi
   const result: Array<{ file: TreeFile; role: "manifest" | "ci" | "license" | "config" }> = [];
   const manifest = choose((file) => path.posix.dirname(file.path) === "." && /^(package\.json|pyproject\.toml|cargo\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|composer\.json)$/i.test(path.posix.basename(file.path)));
   if (manifest) result.push({ file: manifest, role: "manifest" });
-  const license = choose((file) => path.posix.dirname(file.path) === "." && /^(license|copying|notice)(\.txt|\.md)?$/i.test(path.posix.basename(file.path)));
+  const license = choose((file) => isRootLicensePath(file.path))
+    ?? choose((file) => path.posix.dirname(file.path) === "." && /^notice(\.txt|\.md|\.rst)?$/i.test(path.posix.basename(file.path)));
   if (license && !result.some((entry) => entry.file.id === license.id)) result.push({ file: license, role: "license" });
   const ci = choose((file) => file.path.startsWith(".github/workflows/") || rootFile(".gitlab-ci.yml")(file) || rootFile("jenkinsfile")(file));
   if (ci && !result.some((entry) => entry.file.id === ci.id)) result.push({ file: ci, role: "ci" });
@@ -274,42 +286,17 @@ function chooseRepositoryReferenceFiles(files: TreeFile[]): Array<{ file: TreeFi
   return result;
 }
 
-function rankRepositorySourceFiles(files: TreeFile[]): TreeFile[] {
-  return files.filter((file) => isEvidenceSourceFile(file.path))
-    .sort((left, right) => repositoryPathScore(right.path) - repositoryPathScore(left.path) || left.path.localeCompare(right.path));
-}
-
-function repositoryPathScore(filePath: string): number {
-  const lower = filePath.toLowerCase();
-  let score = 0;
-  if (isTestPath(lower)) score += 14;
-  if (/(^|\/)(src|lib|app|packages|internal)\//.test(lower)) score += 10;
-  if (/(^|\/)(docs|examples|fixtures|testdata|vendor|node_modules)\//.test(lower)) score -= 8;
-  if (/\.(min\.|lock$|svg$|map$|snap$)/.test(lower)) score -= 10;
-  return score;
-}
-
-function isEvidenceSourceFile(filePath: string): boolean {
-  return /\.(c|cc|cpp|cs|css|go|h|hpp|html?|java|js|jsx|json|kt|md|mjs|php|py|rb|rs|scss|sh|sql|swift|toml|ts|tsx|txt|vue|xml|yaml|yml|zig)$/i.test(filePath)
-    || /(^|\/)(Dockerfile|Makefile|Justfile|Jenkinsfile)$/i.test(filePath);
-}
-
 function isImplementationSourceFile(filePath: string): boolean {
   const lower = filePath.toLowerCase();
-  if (!isEvidenceSourceFile(lower) || isTestPath(lower)) return false;
+  if (!isTextSourcePath(lower) || isTestPath(lower)) return false;
   if (/(^|\/)(docs?|examples?|fixtures|testdata|vendor|node_modules|third_party)\//.test(lower)) return false;
   if (/^(\.github|\.gitlab|\.circleci|\.buildkite)\//.test(lower) || /(^|\/)\.github\/workflows\//.test(lower)) return false;
   const basename = path.posix.basename(lower);
-  if (/^(readme|license|copying|notice)(\.|$)/.test(basename)) return false;
+  if (/^(readme|license|licen[sc]e|unlicense|copying|notice)(\.|$)/.test(basename)) return false;
   if (/^(package(-lock)?\.json|bun\.lockb?|pnpm-lock\.yaml|yarn\.lock|pyproject\.toml|cargo\.(toml|lock)|go\.(mod|sum)|pom\.xml|build\.gradle(\.kts)?|composer\.(json|lock)|tsconfig[^/]*\.json)$/.test(basename)) return false;
   if (/^(jest|vitest|playwright|cypress|karma|mocha|webpack|vite|rollup|babel|postcss|tailwind|eslint|prettier)\.config\./.test(basename)
     || /^(pytest\.ini|tox\.ini|phpunit\.xml|\.mocharc)/.test(basename)) return false;
   return /\.(c|cc|cpp|cs|css|go|h|hpp|html?|java|js|jsx|kt|mjs|php|py|rb|rs|scss|sh|sql|swift|ts|tsx|vue|zig)$/i.test(basename);
-}
-
-function isTestPath(filePath: string): boolean {
-  const lower = filePath.toLowerCase();
-  return /(^|\/)(__tests__|tests?|spec)\//.test(lower) || /\.(test|spec)\.[^.]+$/.test(lower) || lower.endsWith("_test.go");
 }
 
 function remoteReadCount(planned: Map<string, FileToRead>): number {
@@ -373,7 +360,37 @@ function chooseExcerptRanges(lines: string[], relevantText: string, remainingCha
   return ranges;
 }
 
-function safeError(error: unknown): string {
-  if (error instanceof Error) return error.message.replace(/https?:\/\/\S+/g, "remote endpoint").slice(0, 180);
-  return "read failed";
+type EvidenceReadReason = "remote_size_limit" | "local_size_limit" | "invalid_utf8" | "binary";
+
+const EVIDENCE_READ_ERROR_MESSAGES: Record<EvidenceReadReason, string> = {
+  remote_size_limit: "the content exceeded the 1 MB remote file limit",
+  local_size_limit: "the content exceeded the 256 KB local file limit",
+  invalid_utf8: "the content is not valid UTF-8 text",
+  binary: "the content is binary",
+};
+
+const EVIDENCE_READ_REASONS = new WeakMap<object, EvidenceReadReason>();
+
+function evidenceReadFailureText(error: unknown): string | undefined {
+  const reason = EVIDENCE_READ_REASONS.get(error as object);
+  if (reason === undefined) return undefined;
+  if (!Object.hasOwn(EVIDENCE_READ_ERROR_MESSAGES, reason)) return undefined;
+  return EVIDENCE_READ_ERROR_MESSAGES[reason];
+}
+
+class EvidenceReadError extends Error {
+  readonly reason: EvidenceReadReason;
+
+  constructor(reason: EvidenceReadReason) {
+    super(EVIDENCE_READ_ERROR_MESSAGES[reason]);
+    this.name = "EvidenceReadError";
+    this.reason = reason;
+    EVIDENCE_READ_REASONS.set(this, reason);
+  }
+}
+
+function describeReadFailure(error: unknown): string {
+  const failure = registeredRequestFailure(error);
+  if (failure) return describeRequestFailure(failure);
+  return localReadFailureText(error) ?? evidenceReadFailureText(error) ?? "the file could not be read";
 }

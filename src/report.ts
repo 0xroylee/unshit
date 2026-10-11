@@ -1,10 +1,13 @@
 import { topologicalTasks } from "./model-schema.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import type { ExistingCommand } from "./types.ts";
-import type { FinalSource, IntakeBrief, PlanDocument, ResearchGap, ResolvedAnswer, ReviewResult, RunArtifacts, ValidationRecord } from "./types.ts";
+import type { FinalSource, IntakeBrief, PlanDocument, ResearchGap, ResearchSummary, ResolvedAnswer, ReviewResult, RunArtifacts, ValidationRecord } from "./types.ts";
+import { describeRequestFailure } from "./request-failure.ts";
 
 export interface ReportInput {
   brief: IntakeBrief;
+  initialBrief?: IntakeBrief;
+  research?: ResearchSummary;
   resolvedAnswers: ResolvedAnswer[];
   plan: PlanDocument;
   sources: FinalSource[];
@@ -31,7 +34,9 @@ export function renderReport(input: ReportInput): string {
     lines.push(`Saved report: \`${input.artifacts.reportPath}\``, `Evidence manifest: \`${input.artifacts.manifestPath}\``, "");
   }
 
-  lines.push("## Scope", "", `**Final plan scope.** ${plan.summary}`, `**Initial intake summary (before material answers and source review).** ${brief.summary}`, "");
+  lines.push("## Scope", "", `**Final plan scope.** ${plan.summary}`);
+  if (input.initialBrief) lines.push(`**Clarified brief (after material answers).** ${brief.summary}`);
+  lines.push(`**Initial intake summary (before material answers and source review).** ${input.initialBrief?.summary ?? brief.summary}`, "");
   if (input.resolvedAnswers.length > 0) {
     lines.push("## Confirmed decisions", "");
     for (const answer of input.resolvedAnswers) {
@@ -98,18 +103,43 @@ export function renderReport(input: ReportInput): string {
     }
   }
 
+  if (input.research) {
+    const research = input.research;
+    const bar = research.qualityBar;
+    lines.push("## Reference research", "", `Quality bar: ${bar.requireLicense ? "license required" : "license optional"}; at least ${bar.minStars} stars; pushed within ${bar.maxMonthsSincePush} months; created at least ${bar.minAgeDays} days ago; not archived; not a fork${bar.requireTests ? "; test files required" : ""}.`);
+    lines.push(`Search requests: GitHub ${research.searchRequests.github}/${research.searchRequests.budget}; GitLab ${research.searchRequests.gitlab}. Matched ${research.matched}; passed metadata bar ${research.passedMetadataBar}; tree-verified shortlist ${research.shortlisted}; host exclusions ${research.excluded}; tree resolutions ${research.treeResolutions}; rate limited ${research.rateLimited ? "yes" : "no"}.`);
+    if (research.queries.length > 0) {
+      lines.push("Queries:");
+      for (const query of research.queries) {
+        const label = query.provider === "gitlab" ? "gitlab fallback" : `github tier ${query.tier}`;
+        const failure = query.failure ? ` (${describeRequestFailure(query.failure)})` : "";
+        lines.push(`- ${label} \`${query.query}\` — ${query.status}${failure}; ${query.resultCount} result(s), ${query.newCandidates} new candidate(s).`);
+      }
+    }
+    if (!research.trustworthyReferenceFound) {
+      const noTrustGap = input.gaps.find((gap) => gap.message.startsWith("No trustworthy public reference repository was found"));
+      lines.push(noTrustGap?.message ?? "No trustworthy public reference repository was found.");
+    }
+    lines.push("");
+  }
+
   if (plan.repositoryChoices.length > 0) {
     lines.push("## Repository screening", "");
     for (const choice of plan.repositoryChoices) {
       const label = `[${choice.provider}:${choice.repository}](${choice.webUrl})`;
-      if (choice.outcome === "selected") {
+      const signals = choice.signals
+        ? ` Signals: ${choice.signals.stars === null ? "star count unavailable" : `${choice.signals.stars} stars`}; ${choice.signals.forks === null ? "fork count unavailable" : `${choice.signals.forks} forks`}; archived ${choice.signals.archived ?? "unknown"}; fork ${choice.signals.fork ?? "unknown"}; ${choice.signals.language ?? "language unknown"}; topics ${choice.signals.topics.join(", ") || "none"}; pushed ${choice.signals.pushedAt ?? "date unavailable"}; created ${choice.signals.createdAt ?? "date unavailable (age unknown)"}; license ${choice.signals.licenseSpdxId ?? "not reported"}${choice.licenseEvidence ? ` (${choice.licenseEvidence} evidence)` : ""}; ${choice.testFileCount === undefined ? "test count unknown" : `${choice.testFileCount} test files`}.`
+        : "";
+      if (choice.decidedBy === "host") {
+        lines.push(`- Host excluded ${label}. Reason: ${choice.rationale}${signals}`);
+      } else if (choice.outcome === "selected") {
         const commit = choice.commitSha ? `, inspected at \`${choice.commitSha}\`` : ", selected but its tree could not be read";
         const activity = choice.lastActivityAt ? `, last activity reported ${choice.lastActivityAt}` : "";
         const commitDate = choice.commitDate ? `, commit dated ${choice.commitDate}` : "";
-        lines.push(`- Selected ${label}${commit}${commitDate}${activity}. ${choice.rationale}`);
+        lines.push(`- Selected ${label}${commit}${commitDate}${activity}.${signals} ${choice.rationale}`);
       } else {
         const activity = choice.lastActivityAt ? ` Search metadata reported last activity ${choice.lastActivityAt}.` : "";
-        lines.push(`- Rejected ${label} after search metadata only.${activity} ${choice.rationale}`);
+        lines.push(`- Rejected ${label}.${activity}${signals} ${choice.rationale}`);
       }
     }
     lines.push("");

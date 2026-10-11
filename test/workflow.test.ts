@@ -1,13 +1,17 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { JsonRecord, ModelGateway, ModelSession, ModelTurnResult } from "../src/app-server.ts";
-import type { GitHubResearcher } from "../src/github.ts";
+import { GitHubResearcher } from "../src/github.ts";
+import { ProviderRequestError } from "../src/request-failure.ts";
 import { parseIntake } from "../src/model-schema.ts";
+import { DEFAULT_QUALITY_BAR } from "../src/repository-screening.ts";
 import type { RepositoryCandidate, RepositorySnapshot, TreeFile } from "../src/types.ts";
+import type { DomainMaterial } from "../src/repository-screening.ts";
 import { REFERENCE_PLAN_MODULES, REFERENCE_POLICY_INPUTS } from "../src/instructions.ts";
 import { renderReport } from "../src/report.ts";
+import { writeCheckpointArtifacts, writePlanArtifacts } from "../src/storage.ts";
 import { runWorkflow } from "../src/workflow.ts";
 
 function baseIntake(questions: Array<{ question: string; whyMaterial: string }> = []) {
@@ -18,6 +22,8 @@ function baseIntake(questions: Array<{ question: string; whyMaterial: string }> 
     assumptions: [],
     materialQuestions: questions,
     researchQueries: ["refund request service"],
+    domainTerms: ["refund request", "refund status"],
+    topicSlugs: ["refunds"],
   };
 }
 
@@ -38,6 +44,16 @@ function repositorySnapshot(): RepositorySnapshot {
     commitDate: "2025-12-01T00:00:00Z",
     treeTruncated: false,
     files,
+  };
+}
+
+function snapshotFor(candidate: RepositoryCandidate, treeTruncated = false): RepositorySnapshot {
+  const base = repositorySnapshot();
+  return {
+    ...base,
+    candidate,
+    treeTruncated,
+    files: base.files.map((file, index) => ({ ...file, id: `${candidate.id}F${index + 1}` })),
   };
 }
 
@@ -92,6 +108,7 @@ function noReferencesPlan() {
 
 function gateway(options: {
   intake: unknown;
+  refined?: unknown;
   plans?: unknown[];
   reviews?: unknown[];
   selection?: unknown;
@@ -109,7 +126,9 @@ function gateway(options: {
           options.onPrompt?.(prompt, schema);
           const properties = schema.properties as Record<string, unknown>;
           let result: unknown;
-          if ("requirements" in properties) result = options.intake;
+          if ((properties.materialQuestions as { maxItems?: number } | undefined)?.maxItems === 0) {
+            result = options.refined ?? { ...(options.intake as Record<string, unknown>), materialQuestions: [] };
+          } else if ("requirements" in properties) result = options.intake;
           else if ("selected" in properties) result = options.selection ?? { selected: [{ candidateId: "C1", rationale: "The repository implements refund requests." }], rejected: [] };
           else if ("files" in properties) result = options.fileSelection ?? { files: [{ fileId: "C1F1", role: "production", rationale: "Main request handler." }] };
           else if ("tasks" in properties) result = options.plans?.[planIndex++] ?? validPlan();
@@ -124,8 +143,24 @@ function gateway(options: {
   };
 }
 
-function researcher(options: { candidates?: RepositoryCandidate[]; snapshots?: RepositorySnapshot[]; failReads?: boolean } = {}): { value: GitHubResearcher; searches: number } {
+function researcher(options: {
+  candidates?: RepositoryCandidate[];
+  snapshots?: RepositorySnapshot[];
+  failReads?: boolean;
+  sourceFailure?: unknown;
+  sourceFailurePath?: string;
+  discoveryExcluded?: Array<{ candidate: RepositoryCandidate; reasons: string[] }>;
+  shortlistExcluded?: Array<{
+    candidate: RepositoryCandidate;
+    reasons: string[];
+    resolution?: { commitSha: string; commitDate?: string; treeFileCount: number; testFileCount: number; licensePath?: string };
+  }>;
+  shortlistGaps?: Array<{ kind: "tree" | "search"; message: string; material: boolean }>;
+  shortlistRateLimited?: boolean;
+  discoveryGaps?: Array<{ kind: "search"; message: string; material: boolean }>;
+} = {}): { value: GitHubResearcher; searches: number; materials: DomainMaterial[] } {
   let searches = 0;
+  const materials: DomainMaterial[] = [];
   const snapshots = options.snapshots ?? [repositorySnapshot()];
   const candidates = options.candidates ?? snapshots.map((snapshot) => snapshot.candidate);
   const content = new Map<string, string>([
@@ -137,19 +172,91 @@ function researcher(options: { candidates?: RepositoryCandidate[]; snapshots?: R
     ["vitest.config.ts", "export default {};\n"],
   ]);
   const value = {
-    async discover() {
+    async discover(material: DomainMaterial) {
       searches += 1;
-      return { candidates, gaps: candidates.length ? [] : [{ kind: "search", message: "Public source providers were unavailable.", material: true }] };
+      materials.push(material);
+      return {
+        candidates,
+        excluded: options.discoveryExcluded ?? [],
+        gaps: options.discoveryGaps ?? (candidates.length ? [] : [{ kind: "search", message: "Public source providers were unavailable.", material: true }]),
+        research: {
+          queries: [],
+          searchRequests: { github: 0, gitlab: 0, budget: 9 },
+          treeResolutions: 0,
+          qualityBar: { ...DEFAULT_QUALITY_BAR },
+          matched: candidates.length + (options.discoveryExcluded?.length ?? 0),
+          passedMetadataBar: candidates.length,
+          shortlisted: 0,
+          excluded: options.discoveryExcluded?.length ?? 0,
+          rateLimited: false,
+          trustworthyReferenceFound: false,
+        },
+      };
     },
-    async resolveSelected(_candidates: RepositoryCandidate[], selectedIds: string[]) {
-      return { snapshots: snapshots.filter((snapshot) => selectedIds.includes(snapshot.candidate.id)), gaps: [] };
+    async resolveShortlist() {
+      const excluded = options.shortlistExcluded ?? [];
+      return { snapshots, excluded, resolutions: snapshots.length + excluded.length, gaps: options.shortlistGaps ?? [], rateLimited: options.shortlistRateLimited ?? false };
     },
     async fetchSource(_snapshot: RepositorySnapshot, filePath: string) {
+      if (options.sourceFailure !== undefined && (!options.sourceFailurePath || filePath === options.sourceFailurePath)) {
+        throw options.sourceFailure;
+      }
       if (options.failReads) throw new Error("fixture source outage");
       return new TextEncoder().encode(content.get(filePath) ?? `export const path = '${filePath}';\n`);
     },
   } as unknown as GitHubResearcher;
-  return { value, get searches() { return searches; } };
+  return { value, get searches() { return searches; }, materials };
+}
+
+function providerFailureWithThrowingGetter(marker: string): ProviderRequestError {
+  const error = new ProviderRequestError({
+    provider: "github",
+    endpoint: "source",
+    category: "network",
+    attempts: 1,
+    retryRefused: false,
+  });
+  Object.defineProperty(error, "failure", {
+    get() {
+      throw new Error(marker);
+    },
+  });
+  return error;
+}
+
+function valueWithThrowingPrototypeLookup(marker: string): unknown {
+  return new Proxy({}, {
+    getPrototypeOf() {
+      throw new Error(marker);
+    },
+  });
+}
+
+function forgedProviderError(marker: string): { value: unknown; reads: () => number } {
+  let failureReads = 0;
+  let statusReads = 0;
+  const failure = {
+    provider: "github",
+    endpoint: "search",
+    category: "http_status",
+    attempts: 1,
+    retryRefused: false,
+  } as Record<string, unknown>;
+  Object.defineProperty(failure, "status", {
+    get() {
+      statusReads += 1;
+      return statusReads === 1 ? 500 : marker;
+    },
+  });
+  const value = Object.create(ProviderRequestError.prototype) as object;
+  Object.defineProperty(value, "message", { value: marker, enumerable: true });
+  Object.defineProperty(value, "failure", {
+    get() {
+      failureReads += 1;
+      return failure;
+    },
+  });
+  return { value, reads: () => failureReads + statusReads };
 }
 
 async function tempDirectory(): Promise<string> {
@@ -164,7 +271,187 @@ function expectPhaseModules(prompt: string, phase: keyof typeof REFERENCE_PLAN_M
   }
 }
 
+function expectNoCredentialFragments(value: string, tokens: string[]): void {
+  for (const token of tokens) {
+    for (let index = 0; index <= token.length - 8; index += 1) {
+      if (value.includes(token.slice(index, index + 8))) throw new Error("workflow output contains a credential fragment");
+    }
+  }
+}
+
+const readFailureExtractionCases = [
+  {
+    name: "ProviderRequestError with a throwing failure getter",
+    marker: "MARKER_ALPHA_7Q2W9E4R",
+    create: providerFailureWithThrowingGetter,
+  },
+  {
+    name: "value with a throwing prototype lookup",
+    marker: "MARKER_BRAVO_3X8N5K1P",
+    create: valueWithThrowingPrototypeLookup,
+  },
+] as const;
+
 describe("workflow gates and readiness", () => {
+  for (const fixture of readFailureExtractionCases) {
+    test(`keeps ${fixture.name} out of workflow read diagnostics`, async () => {
+      const cwd = await tempDirectory();
+      const failure = fixture.create(fixture.marker);
+      const refs = researcher({ sourceFailure: failure, sourceFailurePath: "src/index.ts" });
+      let report = "";
+      try {
+        const outcome = await runWorkflow({
+          cwd,
+          requirement: "Build a refund request service.",
+          modelGateway: gateway({ intake: baseIntake() }),
+          researcher: refs.value,
+          onArtifacts: async (input) => {
+            report = renderReport(input);
+            return undefined;
+          },
+        });
+
+        expect(outcome.status).toBe("completed");
+        if (outcome.status === "completed") {
+          const expected = fixture.name.startsWith("ProviderRequestError")
+            ? "Could not read src/index.ts from org/refunds; GitHub source request failed: no response (network failure)."
+            : "Could not read src/index.ts from org/refunds; the file could not be read.";
+          expect(outcome.gaps.some((gap) => gap.message === expected)).toBe(true);
+        }
+        expect(report.length).toBeGreaterThan(0);
+        expectNoCredentialFragments(JSON.stringify(outcome), [fixture.marker]);
+        expectNoCredentialFragments(report, [fixture.marker]);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("keeps a forged failure thrown inside the search request out of every host output and manifest", async () => {
+    const cwd = await tempDirectory();
+    const marker = "MARKER_FOXTROT_8D3J6M1Q";
+    const forged = forgedProviderError(marker);
+    const urls: URL[] = [];
+    const entries = ["refund-one", "refund-two"].map((name) => ({
+      full_name: `org/${name}`,
+      default_branch: "main",
+      description: "Refund request service",
+      stargazers_count: 250,
+      forks_count: 20,
+      archived: false,
+      fork: false,
+      license: { spdx_id: "MIT" },
+      language: "TypeScript",
+      topics: ["refunds"],
+      pushed_at: "2026-06-01T00:00:00Z",
+      created_at: "2020-01-01T00:00:00Z",
+    }));
+    const files = [
+      { path: "src/index.ts", type: "blob", size: 60 },
+      { path: "tests/index.test.ts", type: "blob", size: 50 },
+      { path: "package.json", type: "blob", size: 20 },
+      { path: "LICENSE", type: "blob", size: 20 },
+      { path: ".github/workflows/check.yml", type: "blob", size: 20 },
+      { path: "vitest.config.ts", type: "blob", size: 20 },
+    ];
+    const fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = input instanceof Request ? new URL(input.url) : new URL(input.toString());
+      urls.push(url);
+      if (url.origin === "https://api.github.com" && url.pathname === "/search/repositories") {
+        return new Response(JSON.stringify({ items: entries }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/repos/org/refund-one/commits/main") || url.pathname.endsWith("/repos/org/refund-two/commits/main")) {
+        return new Response(JSON.stringify({ sha: "8e0d33a8257952f4d02d92fd566297082b9a7f2e" }), { status: 200 });
+      }
+      if (url.pathname.includes("/repos/org/refund-one/git/trees/") || url.pathname.includes("/repos/org/refund-two/git/trees/")) {
+        return new Response(JSON.stringify({ tree: files, truncated: false }), { status: 200 });
+      }
+      if (url.origin === "https://raw.githubusercontent.com") return new Response("export const value = true;\n", { status: 200 });
+      return new Response("unexpected request", { status: 404 });
+    };
+    const realResearcher = new GitHubResearcher({
+      fetch,
+      now: () => new Date("2026-10-10T00:00:00.000Z"),
+      minimumPassing: 2,
+      maxTreeResolutions: 2,
+      shortlistSize: 2,
+      searchTiers: [{ tier: 0, minStars: 200, maxMonthsSincePush: 12 }],
+    });
+    const runId = "failure-registry-e2e";
+    const hostOutputs: string[] = [];
+    const checkpointManifests: string[] = [];
+    const progressEvents: string[] = [];
+    let throwCount = 0;
+    let finalManifest = "";
+    let savedReport = "";
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          plans: [noReferencesPlan()],
+          selection: {
+            selected: [{ candidateId: "C1", rationale: "Use the first verified refund service." }],
+            rejected: [{ candidateId: "C2", rationale: "The first repository is the comparator for this run." }],
+          },
+          fileSelection: { files: [] },
+        }),
+        researcher: realResearcher,
+        onProgress: (event) => {
+          const serialized = JSON.stringify(event);
+          progressEvents.push(serialized);
+          if (throwCount === 0 && event.stage === "repository_search" && event.message.startsWith("GitHub tier")) {
+            throwCount += 1;
+            throw forged.value;
+          }
+        },
+        onCheckpoint: async (input, stage) => {
+          hostOutputs.push(JSON.stringify({ input, stage }));
+          const manifestPath = await writeCheckpointArtifacts({ cwd, runId, stage, input });
+          checkpointManifests.push(await readFile(manifestPath, "utf8"));
+          return manifestPath;
+        },
+        onArtifacts: async (input) => {
+          hostOutputs.push(JSON.stringify(input));
+          const artifacts = await writePlanArtifacts({ cwd, runId, input });
+          finalManifest = await readFile(artifacts.manifestPath, "utf8");
+          savedReport = await readFile(artifacts.reportPath, "utf8");
+          return artifacts;
+        },
+      });
+
+      if (outcome.status !== "completed") throw new Error(JSON.stringify(outcome));
+      expect(outcome.status).toBe("completed");
+      expect(throwCount).toBe(1);
+      if (outcome.status === "completed") {
+        expect(outcome.research?.queries[0]).toMatchObject({
+          provider: "github",
+          status: "failed",
+          failure: { provider: "github", endpoint: "search", category: "internal", attempts: 0, retryRefused: false },
+        });
+        expect(outcome.research?.queries.some((query) => query.provider === "github" && query.status === "ok")).toBe(true);
+        expect(outcome.gaps.some((gap) => gap.message.includes("GitHub search request failed: internal host error (tier 0 query)."))).toBe(true);
+      }
+      expect(urls.filter((url) => url.origin === "https://api.github.com" && url.pathname === "/search/repositories").length).toBeGreaterThanOrEqual(2);
+      expect(urls.some((url) => url.pathname.endsWith("/repos/org/refund-one/commits/main"))).toBe(true);
+      expect(urls.some((url) => url.pathname.endsWith("/repos/org/refund-two/commits/main"))).toBe(true);
+      expect(urls.some((url) => url.pathname.includes("/repos/org/refund-one/git/trees/"))).toBe(true);
+      expect(urls.some((url) => url.pathname.includes("/repos/org/refund-two/git/trees/"))).toBe(true);
+      expect(urls.some((url) => url.origin === "https://raw.githubusercontent.com")).toBe(true);
+      expect(checkpointManifests.length).toBeGreaterThan(0);
+      expect(finalManifest).not.toBe("");
+      expect(savedReport).not.toBe("");
+      expect(forged.reads()).toBe(0);
+      const outputs = [
+        JSON.stringify(outcome), savedReport, finalManifest, ...hostOutputs, ...progressEvents, ...checkpointManifests,
+      ];
+      for (const output of outputs) expectNoCredentialFragments(output, [marker]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("reuses exact question context when intake order and phrasing change", async () => {
     const firstQuestions = [
       { question: "Who may approve a refund?", whyMaterial: "This decides the authorization boundary." },
@@ -223,6 +510,141 @@ describe("workflow gates and readiness", () => {
     }
   });
 
+  test("ends the run before research when the initial intake violates the topic slug contract", async () => {
+    const invalidCwd = await tempDirectory();
+    const validCwd = await tempDirectory();
+    const invalidResearcher = researcher();
+    const validResearcher = researcher();
+    try {
+      const invalid = await runWorkflow({
+        cwd: invalidCwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: { ...baseIntake(), topicSlugs: ["a".repeat(51)] } }),
+        researcher: invalidResearcher.value,
+      });
+      expect(invalid).toMatchObject({ status: "error", message: "topicSlugs[1] must contain 1 to 50 characters." });
+      expect(invalidResearcher.searches).toBe(0);
+
+      const valid = await runWorkflow({
+        cwd: validCwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: { ...baseIntake(), topicSlugs: ["a".repeat(50)] } }),
+        researcher: validResearcher.value,
+      });
+      expect(valid.status).toBe("completed");
+      expect(validResearcher.materials[0]?.topics).toEqual(["a".repeat(50)]);
+    } finally {
+      await rm(invalidCwd, { recursive: true, force: true });
+      await rm(validCwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps every host output free of adapter text when real provider requests fail", async () => {
+    const cwd = await tempDirectory();
+    const githubToken = "SENTINEL_GITHUB_7f3b9d2a4c6e8f10";
+    const gitlabToken = "SENTINEL_GITLAB_2a4c6e8f0b1d3f57";
+    const tokens = [githubToken, gitlabToken];
+    const urls: URL[] = [];
+    const sentinelText = `${githubToken} ${gitlabToken}`;
+    let firstSearchQuery: string | undefined;
+    const files = [
+      { path: "src/index.ts", type: "blob", size: 60 },
+      { path: "tests/index.test.ts", type: "blob", size: 50 },
+      { path: "package.json", type: "blob", size: 20 },
+      { path: "LICENSE", type: "blob", size: 20 },
+      { path: ".github/workflows/check.yml", type: "blob", size: 20 },
+      { path: "vitest.config.ts", type: "blob", size: 20 },
+    ];
+    const entries = ["refund-one", "refund-two"].map((name) => ({
+      full_name: `org/${name}`,
+      default_branch: "main",
+      description: "Refund request service",
+      stargazers_count: 250,
+      forks_count: 20,
+      archived: false,
+      fork: false,
+      license: { spdx_id: "MIT" },
+      language: "TypeScript",
+      topics: ["refunds"],
+      pushed_at: "2026-06-01T00:00:00Z",
+      created_at: "2020-01-01T00:00:00Z",
+    }));
+    const fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = input instanceof Request ? new URL(input.url) : new URL(input.toString());
+      urls.push(url);
+      if (url.origin === "https://api.github.com" && url.pathname === "/search/repositories") {
+        const query = url.searchParams.get("q") ?? "";
+        if (firstSearchQuery === undefined) firstSearchQuery = query;
+        if (query === firstSearchQuery) throw new Error(sentinelText);
+        return new Response(JSON.stringify({ items: entries }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/repos/org/refund-one/commits/main") || url.pathname.endsWith("/repos/org/refund-two/commits/main")) {
+        return new Response(JSON.stringify({ sha: "8e0d33a8257952f4d02d92fd566297082b9a7f2e" }), { status: 200 });
+      }
+      if (url.pathname.includes("/repos/org/refund-one/git/trees/")) {
+        return new Response(JSON.stringify({ tree: files, truncated: false }), { status: 200 });
+      }
+      if (url.pathname.includes("/repos/org/refund-two/git/trees/")) throw new Error(sentinelText);
+      if (url.origin === "https://raw.githubusercontent.com" && url.pathname.endsWith("/src/index.ts")) throw new Error(sentinelText);
+      if (url.origin === "https://raw.githubusercontent.com") return new Response("export const value = true;\n", { status: 200 });
+      return new Response("unexpected request", { status: 404 });
+    };
+    const realResearcher = new GitHubResearcher({
+      fetch,
+      githubToken,
+      gitlabToken,
+      now: () => new Date("2026-10-10T00:00:00.000Z"),
+      minimumPassing: 2,
+      maxTreeResolutions: 2,
+      shortlistSize: 2,
+      searchTiers: [{ tier: 0, minStars: 200, maxMonthsSincePush: 12 }],
+    });
+    const artifactOutputs: string[] = [];
+    const checkpointOutputs: string[] = [];
+    const progressMessages: string[] = [];
+    let report = "";
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), plans: [noReferencesPlan()], fileSelection: { files: [] } }),
+        researcher: realResearcher,
+        onArtifacts: async (input) => {
+          artifactOutputs.push(JSON.stringify(input));
+          report = renderReport(input);
+          return undefined;
+        },
+        onCheckpoint: async (input, stage) => {
+          checkpointOutputs.push(JSON.stringify({ input, stage }));
+          return undefined;
+        },
+        onProgress: (event) => progressMessages.push(JSON.stringify(event)),
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.readiness).toBe("draft");
+        expect(outcome.gaps.some((gap) => gap.message.includes("GitHub search request failed"))).toBe(true);
+        expect(outcome.gaps.some((gap) => gap.message.includes("GitHub tree request failed"))).toBe(true);
+        expect(outcome.gaps.some((gap) => gap.message.includes("GitHub source request failed"))).toBe(true);
+      }
+      expect(urls.some((url) => url.pathname === "/search/repositories")).toBe(true);
+      expect(urls.some((url) => url.pathname.endsWith("/repos/org/refund-one/commits/main"))).toBe(true);
+      expect(urls.some((url) => url.pathname.endsWith("/repos/org/refund-two/commits/main"))).toBe(true);
+      expect(urls.some((url) => url.pathname.includes("/repos/org/refund-one/git/trees/"))).toBe(true);
+      expect(urls.some((url) => url.pathname.includes("/repos/org/refund-two/git/trees/"))).toBe(true);
+      expect(urls.some((url) => url.origin === "https://raw.githubusercontent.com" && url.pathname.endsWith("/src/index.ts"))).toBe(true);
+      expect(report).not.toBe("");
+      expect(artifactOutputs.length).toBeGreaterThan(0);
+      expect(checkpointOutputs.length).toBeGreaterThan(0);
+      for (const output of [JSON.stringify(outcome), report, ...artifactOutputs, ...checkpointOutputs, ...progressMessages]) {
+        expectNoCredentialFragments(output, tokens);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("reaches Ready for a new target when pinned production, test, and metadata evidence is complete", async () => {
     const cwd = await tempDirectory();
     try {
@@ -246,18 +668,280 @@ describe("workflow gates and readiness", () => {
   test("keeps a full plan Draft when public reference sources are unavailable", async () => {
     const cwd = await tempDirectory();
     const noCandidates = researcher({ candidates: [], snapshots: [] });
+    const prompts: string[] = [];
+    let finalReport = "";
     try {
       const outcome = await runWorkflow({
         cwd,
         requirement: "Build a refund request service.",
-        modelGateway: gateway({ intake: baseIntake(), plans: [noReferencesPlan()] }),
+        modelGateway: gateway({ intake: baseIntake(), plans: [noReferencesPlan()], onPrompt: (prompt) => prompts.push(prompt) }),
         researcher: noCandidates.value,
+        onArtifacts: async (details) => { finalReport = renderReport(details); return undefined; },
       });
       expect(outcome.status).toBe("completed");
       if (outcome.status === "completed") {
         expect(outcome.readiness).toBe("draft");
         expect(outcome.plan.tasks).toHaveLength(1);
+        expect(outcome.research?.trustworthyReferenceFound).toBe(false);
+        expect(outcome.gaps.find((gap) => gap.message.startsWith("No trustworthy public reference repository was found"))?.message).toContain("a license");
       }
+      expect(prompts.some((prompt) => prompt.startsWith("Select zero to three public repository"))).toBe(false);
+      expect(finalReport).toContain("No trustworthy public reference repository was found");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("records resolved tree evidence for host-excluded repositories and reports their test counts", async () => {
+    const cwd = await tempDirectory();
+    const candidateWithTestsMissing: RepositoryCandidate = {
+      id: "C7",
+      provider: "github",
+      fullName: "org/no-tests",
+      description: "Refund project",
+      defaultBranch: "main",
+      webUrl: "https://github.com/org/no-tests",
+      signals: { stars: 80, forks: 4, archived: false, fork: false, licenseSpdxId: null, language: "PHP", topics: [], pushedAt: "2026-07-01T00:00:00.000Z", createdAt: "2020-01-01T00:00:00.000Z" },
+    };
+    const candidateWithoutLicense: RepositoryCandidate = {
+      id: "C8",
+      provider: "github",
+      fullName: "org/no-license",
+      description: "Refund project",
+      defaultBranch: "main",
+      webUrl: "https://github.com/org/no-license",
+      signals: { stars: 80, forks: 4, archived: false, fork: false, licenseSpdxId: null, language: "PHP", topics: [], pushedAt: "2026-07-01T00:00:00.000Z", createdAt: "2020-01-01T00:00:00.000Z" },
+    };
+    const commitWithoutTests = "a".repeat(40);
+    const commitWithoutLicense = "b".repeat(40);
+    const noTestReason = `no test file at ${commitWithoutTests}`;
+    const noLicenseReason = `no license: GitHub reported no license and the tree at ${commitWithoutLicense} has no root LICENSE, LICENCE, UNLICENSE or COPYING file`;
+    let finalReport = "";
+    const refs = researcher({
+      candidates: [candidateWithTestsMissing, candidateWithoutLicense],
+      snapshots: [],
+      shortlistExcluded: [
+        {
+          candidate: candidateWithTestsMissing,
+          reasons: [noTestReason],
+          resolution: { commitSha: commitWithoutTests, commitDate: "2026-09-20T00:00:00.000Z", treeFileCount: 2, testFileCount: 0, licensePath: "LICENSE.md" },
+        },
+        {
+          candidate: candidateWithoutLicense,
+          reasons: [noLicenseReason],
+          resolution: { commitSha: commitWithoutLicense, commitDate: "2026-09-21T00:00:00.000Z", treeFileCount: 2, testFileCount: 1 },
+        },
+      ],
+    });
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), plans: [noReferencesPlan()] }),
+        researcher: refs.value,
+        onArtifacts: async (details) => { finalReport = renderReport(details); return undefined; },
+      });
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.research?.excluded).toBe(2);
+        expect(outcome.plan.repositoryChoices.find((choice) => choice.candidateId === "C7")).toMatchObject({
+          outcome: "rejected",
+          decidedBy: "host",
+          commitSha: commitWithoutTests,
+          commitDate: "2026-09-20T00:00:00.000Z",
+          treeFileCount: 2,
+          testFileCount: 0,
+          licenseEvidence: "tree",
+          licensePath: "LICENSE.md",
+          rationale: noTestReason,
+        });
+        expect(outcome.plan.repositoryChoices.find((choice) => choice.candidateId === "C8")).toMatchObject({
+          outcome: "rejected",
+          decidedBy: "host",
+          commitSha: commitWithoutLicense,
+          commitDate: "2026-09-21T00:00:00.000Z",
+          treeFileCount: 2,
+          testFileCount: 1,
+          licenseEvidence: "none",
+          rationale: noLicenseReason,
+        });
+        expect(outcome.plan.repositoryChoices.find((choice) => choice.candidateId === "C8")).not.toHaveProperty("licensePath");
+      }
+      expect(finalReport).toContain("0 test files");
+      expect(finalReport).toContain("1 test files");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("records root LICENSE.md tree evidence on the repository choice", async () => {
+    const cwd = await tempDirectory();
+    const candidateWithTreeLicense: RepositoryCandidate = {
+      ...repositorySnapshot().candidate,
+      id: "C7",
+      fullName: "org/tree-licensed",
+      webUrl: "https://github.com/org/tree-licensed",
+      signals: { stars: 80, forks: 4, archived: false, fork: false, licenseSpdxId: null, language: "PHP", topics: [], pushedAt: "2026-07-01T00:00:00.000Z", createdAt: "2020-01-01T00:00:00.000Z" },
+    };
+    const snapshot = snapshotFor(candidateWithTreeLicense);
+    snapshot.files = snapshot.files.map((file) => file.path === "LICENSE" ? { ...file, path: "LICENSE.md" } : file);
+    snapshot.licensePath = "LICENSE.md";
+    snapshot.testFileCount = 1;
+    const plan = validPlan();
+    plan.referenceComparisons[0]!.candidateId = "C7";
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          selection: { selected: [{ candidateId: "C7", rationale: "GitHub did not classify the root license file." }], rejected: [] },
+          fileSelection: { files: [{ fileId: "C7F1", role: "production", rationale: "Main handler." }, { fileId: "C7F2", role: "test", rationale: "Tests." }] },
+          plans: [plan],
+        }),
+        researcher: researcher({ candidates: [candidateWithTreeLicense], snapshots: [snapshot] }).value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.plan.repositoryChoices.find((choice) => choice.candidateId === "C7")).toMatchObject({
+          licenseEvidence: "tree",
+          licensePath: "LICENSE.md",
+          treeFileCount: 6,
+          testFileCount: 1,
+        });
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("stays Ready when a failed tree is followed by six verified candidates", async () => {
+    const cwd = await tempDirectory();
+    const failedCandidate: RepositoryCandidate = {
+      ...repositorySnapshot().candidate,
+      id: "C0",
+      fullName: "org/unreadable-first",
+      webUrl: "https://github.com/org/unreadable-first",
+    };
+    const verifiedCandidates = Array.from({ length: 6 }, (_, index) => ({
+      ...repositorySnapshot().candidate,
+      id: `C${index + 1}`,
+      fullName: `org/refund-${index + 1}`,
+      webUrl: `https://github.com/org/refund-${index + 1}`,
+    }));
+    const verifiedSnapshots = verifiedCandidates.map((candidate) => snapshotFor(candidate));
+    const refs = researcher({
+      candidates: [failedCandidate, ...verifiedCandidates],
+      snapshots: verifiedSnapshots,
+      shortlistExcluded: [{ candidate: failedCandidate, reasons: ["could not resolve commit-pinned tree: HTTP 500"] }],
+      shortlistGaps: [{ kind: "tree", message: "Could not read the first commit-pinned tree: HTTP 500.", material: false }],
+    });
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          selection: {
+            selected: [{ candidateId: "C1", rationale: "Use the first verified repository." }],
+            rejected: verifiedCandidates.slice(1).map((candidate) => ({ candidateId: candidate.id, rationale: "The first comparator is sufficient." })),
+          },
+        }),
+        researcher: refs.value,
+      });
+
+      if (outcome.status !== "completed") {
+        throw new Error(`Workflow returned ${outcome.status}${outcome.status === "error" ? `: ${outcome.message}` : ""}`);
+      }
+      if (outcome.status === "completed") {
+        expect(outcome.research?.shortlisted).toBe(6);
+        expect(outcome.gaps.find((gap) => gap.message.includes("first commit-pinned tree"))).toMatchObject({ material: false });
+        expect(outcome.readiness).toBe("ready");
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("does not add a truncation gap when the model rejects the truncated candidate", async () => {
+    const cwd = await tempDirectory();
+    const truncatedCandidate = { ...repositorySnapshot().candidate, id: "C1" };
+    const completeCandidate: RepositoryCandidate = {
+      ...repositorySnapshot().candidate,
+      id: "C2",
+      fullName: "org/complete-refund",
+      webUrl: "https://github.com/org/complete-refund",
+    };
+    const plan = validPlan();
+    plan.referenceComparisons[0]!.candidateId = "C2";
+    const refs = researcher({
+      candidates: [truncatedCandidate, completeCandidate],
+      snapshots: [snapshotFor(truncatedCandidate, true), snapshotFor(completeCandidate)],
+    });
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          selection: { selected: [{ candidateId: "C2", rationale: "Use the complete repository." }], rejected: [{ candidateId: "C1", rationale: "The tree is incomplete." }] },
+          fileSelection: { files: [{ fileId: "C2F1", role: "production", rationale: "Main handler." }, { fileId: "C2F2", role: "test", rationale: "Tests." }] },
+          plans: [plan],
+        }),
+        researcher: refs.value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.gaps.filter((gap) => gap.message.includes("indexed tree") && gap.message.includes("truncated"))).toHaveLength(0);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("adds exactly one material truncation gap for a selected truncated repository", async () => {
+    const cwd = await tempDirectory();
+    const truncated = snapshotFor(repositorySnapshot().candidate, true);
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake() }),
+        researcher: researcher({ snapshots: [truncated] }).value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        const truncationGaps = outcome.gaps.filter((gap) => gap.message.includes("indexed tree") && gap.message.includes("truncated"));
+        expect(truncationGaps).toHaveLength(1);
+        expect(truncationGaps[0]?.material).toBe(true);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("carries shortlist tree rate limits into research and the report", async () => {
+    const cwd = await tempDirectory();
+    let finalReport = "";
+    const refs = researcher({
+      shortlistRateLimited: true,
+      shortlistGaps: [{ kind: "tree", message: "GitHub rate limit reached during tree resolution.", material: false }],
+    });
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake() }),
+        researcher: refs.value,
+        onArtifacts: async (details) => { finalReport = renderReport(details); return undefined; },
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") expect(outcome.research?.rateLimited).toBe(true);
+      expect(finalReport).toContain("rate limited yes");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -389,6 +1073,140 @@ describe("workflow gates and readiness", () => {
         expect(outcome.readiness).toBe("draft");
         expect(outcome.plan.tasks).toHaveLength(1);
         expect(outcome.validationIssues.length).toBeGreaterThan(0);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("rebuilds the brief once after an interactive answer and uses it for search, planning, review, and report", async () => {
+    const cwd = await tempDirectory();
+    const question = { question: "Which event is in scope?", whyMaterial: "This changes ticket inventory and admission." };
+    const questionId = parseIntake(baseIntake([question])).materialQuestions[0]!.id;
+    const refined = {
+      ...baseIntake(),
+      summary: "Rebuilt event-admission brief.",
+      requirements: [{ description: "Sell tickets and verify event admission.", observableAcceptance: ["A ticket can be sold and scanned."] }],
+      domainTerms: ["event admission", "ticket sales"],
+      topicSlugs: ["event-ticketing"],
+      researchQueries: ["event admission ticketing"],
+    };
+    const schemas: JsonRecord[] = [];
+    const prompts: string[] = [];
+    let finalReport = "";
+    const refs = researcher();
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build an event ticketing system.",
+        answerQuestion: async () => "One event; entry is checked by QR scan.",
+        modelGateway: gateway({
+          intake: baseIntake([question]),
+          refined,
+          onPrompt: (prompt, schema) => { prompts.push(prompt); schemas.push(schema); },
+        }),
+        researcher: refs.value,
+        onArtifacts: async (details) => { finalReport = renderReport(details); return undefined; },
+      });
+      expect(outcome.status).toBe("completed");
+      const intakeTurns = schemas.filter((schema) => "requirements" in (schema.properties as Record<string, unknown>));
+      expect(intakeTurns).toHaveLength(2);
+      expect((intakeTurns[1]!.properties as Record<string, { maxItems?: number }>).materialQuestions?.maxItems).toBe(0);
+      expect(prompts.find((prompt) => prompt.includes("Rebuild the software brief"))).toContain("One event; entry is checked by QR scan.");
+      expect(refs.materials).toEqual([{ phrases: ["event admission", "ticket sales"], topics: ["event-ticketing"] }]);
+      expect(prompts.some((prompt) => prompt.startsWith("Produce a detailed implementation plan") && prompt.includes("Rebuilt event-admission brief."))).toBe(true);
+      expect(prompts.some((prompt) => prompt.startsWith("Independently review this plan") && prompt.includes("Rebuilt event-admission brief."))).toBe(true);
+      expect(finalReport).toContain("**Final plan scope.** Validate and record a refund request.");
+      expect(finalReport).toContain("**Clarified brief (after material answers).** Rebuilt event-admission brief.");
+      expect(finalReport).toContain("**Initial intake summary (before material answers and source review).** Build a small refund request service.");
+      if (outcome.status === "completed") {
+        expect(outcome.initialBrief?.summary).toBe("Build a small refund request service.");
+        expect(outcome.brief.summary).toBe("Rebuilt event-admission brief.");
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("rebuilds the brief on a validated --answers rerun", async () => {
+    const cwd = await tempDirectory();
+    const question = { question: "Which event is in scope?", whyMaterial: "This changes ticket inventory." };
+    const priorQuestions = parseIntake(baseIntake([question])).materialQuestions;
+    const refined = {
+      ...baseIntake(),
+      summary: "Clarified ticket and refund brief.",
+      domainTerms: ["ticket refund"],
+      topicSlugs: ["event-ticketing"],
+    };
+    const schemas: JsonRecord[] = [];
+    const prompts: string[] = [];
+    let finalReport = "";
+    const refs = researcher();
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund service.",
+        priorQuestions,
+        answers: { [priorQuestions[0]!.id]: "One event with QR admission." },
+        modelGateway: gateway({ intake: baseIntake(), refined, onPrompt: (prompt, schema) => { prompts.push(prompt); schemas.push(schema); } }),
+        researcher: refs.value,
+        onArtifacts: async (details) => { finalReport = renderReport(details); return undefined; },
+      });
+      expect(outcome.status).toBe("completed");
+      expect(schemas.filter((schema) => "requirements" in (schema.properties as Record<string, unknown>))).toHaveLength(2);
+      expect(refs.materials[0]).toEqual({ phrases: ["ticket refund"], topics: ["event-ticketing"] });
+      expect(prompts.some((prompt) => prompt.startsWith("Produce a detailed implementation plan") && prompt.includes("Clarified ticket and refund brief."))).toBe(true);
+      expect(prompts.some((prompt) => prompt.startsWith("Independently review this plan") && prompt.includes("Clarified ticket and refund brief."))).toBe(true);
+      expect(finalReport).toContain("**Final plan scope.** Validate and record a refund request.");
+      expect(finalReport).toContain("**Clarified brief (after material answers).** Clarified ticket and refund brief.");
+      expect(finalReport).toContain("**Initial intake summary (before material answers and source review).** Build a small refund request service.");
+      if (outcome.status === "completed") {
+        expect(outcome.initialBrief?.materialQuestions).toEqual(priorQuestions);
+        expect(outcome.brief.summary).toBe("Clarified ticket and refund brief.");
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("does not make a refine turn when no material answer was resolved", async () => {
+    const cwd = await tempDirectory();
+    const schemas: JsonRecord[] = [];
+    try {
+      await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), onPrompt: (_prompt, schema) => schemas.push(schema) }),
+        researcher: researcher().value,
+      });
+      expect(schemas.filter((schema) => "requirements" in (schema.properties as Record<string, unknown>))).toHaveLength(1);
+      expect(schemas.filter((schema) => ((schema.properties as Record<string, any>).materialQuestions?.maxItems === 0))).toHaveLength(0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the initial brief and records a material gap when the rebuild adds a question", async () => {
+    const cwd = await tempDirectory();
+    const question = { question: "Which event is in scope?", whyMaterial: "This changes ticket inventory." };
+    const badRefined = {
+      ...baseIntake(),
+      summary: "The model tried to add another round.",
+      materialQuestions: [{ question: "Which ticket currency?", whyMaterial: "This changes payment handling." }],
+    };
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        answers: { [parseIntake(baseIntake([question])).materialQuestions[0]!.id]: "One event." },
+        modelGateway: gateway({ intake: baseIntake([question]), refined: badRefined }),
+        researcher: researcher().value,
+      });
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.brief.summary).toBe("Build a small refund request service.");
+        expect(outcome.gaps.some((gap) => gap.kind === "validation" && gap.material && gap.message.includes("could not be rebuilt"))).toBe(true);
+        expect(outcome.readiness).toBe("draft");
       }
     } finally {
       await rm(cwd, { recursive: true, force: true });

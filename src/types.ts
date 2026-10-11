@@ -17,6 +17,31 @@ export interface MaterialQuestion {
   whyMaterial: string;
 }
 
+export type RequestEndpoint = "search" | "commit" | "tree" | "source";
+export type RequestFailureCategory =
+  | "http_status"
+  | "rate_limit"
+  | "timeout"
+  | "size_limit"
+  | "invalid_json"
+  | "invalid_response"
+  | "network"
+  | "cancelled"
+  | "request_budget"
+  | "invalid_request"
+  | "internal";
+
+export interface RequestFailure {
+  provider: "github" | "gitlab";
+  endpoint: RequestEndpoint;
+  category: RequestFailureCategory;
+  status?: number;
+  limitBytes?: number;
+  page?: number;
+  attempts: number;
+  retryRefused: boolean;
+}
+
 export interface ResolvedAnswer {
   questionId: string;
   question: string;
@@ -31,6 +56,54 @@ export interface IntakeBrief {
   assumptions: string[];
   materialQuestions: MaterialQuestion[];
   researchQueries: string[];
+  domainTerms: string[];
+  topicSlugs: string[];
+}
+
+export interface RepositoryQualitySignals {
+  stars: number | null;
+  forks: number | null;
+  archived: boolean | null;
+  fork: boolean | null;
+  licenseSpdxId: string | null;
+  language: string | null;
+  topics: string[];
+  pushedAt: string | null;
+  createdAt: string | null;
+}
+
+export type LicenseEvidence = "metadata" | "tree" | "none";
+
+export interface QualityBar {
+  minStars: number;
+  maxMonthsSincePush: number;
+  minAgeDays: number;
+  requireTests: boolean;
+  requireLicense: boolean;
+}
+
+export interface SearchQueryRecord {
+  provider: "github" | "gitlab";
+  // GitLab fallback keeps tier 2 as the required manifest sentinel; it is not a widening tier.
+  tier: 0 | 1 | 2;
+  query: string;
+  status: "ok" | "failed" | "rate_limited" | "skipped";
+  resultCount: number;
+  newCandidates: number;
+  failure?: RequestFailure;
+}
+
+export interface ResearchSummary {
+  queries: SearchQueryRecord[];
+  searchRequests: { github: number; gitlab: number; budget: number };
+  treeResolutions: number;
+  qualityBar: QualityBar;
+  matched: number;
+  passedMetadataBar: number;
+  shortlisted: number;
+  excluded: number;
+  rateLimited: boolean;
+  trustworthyReferenceFound: boolean;
 }
 
 export interface RepositoryCandidate {
@@ -42,6 +115,9 @@ export interface RepositoryCandidate {
   webUrl: string;
   lastActivityAt?: string;
   providerProjectId?: string;
+  signals?: RepositoryQualitySignals;
+  searchRank?: number;
+  matchedQueries?: string[];
 }
 
 export interface RepositorySnapshot {
@@ -50,6 +126,8 @@ export interface RepositorySnapshot {
   commitDate?: string;
   treeTruncated: boolean;
   files: TreeFile[];
+  testFileCount?: number;
+  licensePath?: string;
 }
 
 export interface TreeFile {
@@ -172,6 +250,12 @@ export interface RepositoryChoice {
   lastActivityAt?: string;
   commitSha?: string;
   commitDate?: string;
+  decidedBy?: "host" | "model";
+  signals?: RepositoryQualitySignals;
+  treeFileCount?: number;
+  testFileCount?: number;
+  licenseEvidence?: LicenseEvidence;
+  licensePath?: string;
 }
 
 export interface ReferenceComparison {
@@ -264,6 +348,6 @@ export interface ValidationRecord {
 
 export type RunOutcome =
   | { status: "needs_input"; questions: MaterialQuestion[]; brief: IntakeBrief; answersFile?: string; checkpointPath?: string }
-  | { status: "completed"; readiness: Readiness; brief: IntakeBrief; resolvedAnswers: ResolvedAnswer[]; plan: PlanDocument; sources: FinalSource[]; gaps: ResearchGap[]; reviews: ReviewResult[]; artifacts?: RunArtifacts; validationIssues: string[]; validationHistory: ValidationRecord[] }
+  | { status: "completed"; readiness: Readiness; brief: IntakeBrief; initialBrief?: IntakeBrief; research?: ResearchSummary; resolvedAnswers: ResolvedAnswer[]; plan: PlanDocument; sources: FinalSource[]; gaps: ResearchGap[]; reviews: ReviewResult[]; artifacts?: RunArtifacts; validationIssues: string[]; validationHistory: ValidationRecord[] }
   | { status: "interrupted"; message: string; checkpointPath?: string }
   | { status: "error"; message: string; checkpointPath?: string };
