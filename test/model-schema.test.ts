@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseIntake, parsePlan, stableMaterialQuestionId } from "../src/model-schema.ts";
+import { INTAKE_SCHEMA, ModelOutputError, REFINED_BRIEF_SCHEMA, parseIntake, parsePlan, parseRefinedBrief, stableMaterialQuestionId } from "../src/model-schema.ts";
 import type { EvidenceExcerpt, EvidenceSource, IntakeBrief, RepositorySnapshot } from "../src/types.ts";
 
 const brief = parseIntake({
@@ -111,6 +111,109 @@ describe("material question identities", () => {
     expect(first.materialQuestions[1]!.id).toBe(reversed.materialQuestions[0]!.id);
     expect(first.materialQuestions[0]!.id).toMatch(/^Q-[a-f0-9]{12}$/);
     expect(stableMaterialQuestionId("Who can approve a refund?", "This changes authorization.")).toBe(first.materialQuestions[0]!.id);
+  });
+
+  test("keeps domain terms and topic slugs unchanged while enforcing their bounds", () => {
+    const intakeProperties = INTAKE_SCHEMA.properties as Record<string, any>;
+    const refinedProperties = REFINED_BRIEF_SCHEMA.properties as Record<string, any>;
+    expect((INTAKE_SCHEMA.required as string[])).toContain("domainTerms");
+    expect((INTAKE_SCHEMA.required as string[])).toContain("topicSlugs");
+    expect(REFINED_BRIEF_SCHEMA.required).toEqual(INTAKE_SCHEMA.required);
+    expect(refinedProperties.materialQuestions.maxItems).toBe(0);
+    expect({ ...refinedProperties, materialQuestions: undefined }).toEqual({ ...intakeProperties, materialQuestions: undefined });
+    const domainTerms = ["  stars:>5 NOT \"event ticketing\"  ", "ticket -refund", "--- "];
+    const topicSlugs = ["../invalid", "Event-Ticketing ", "event-ticketing", "ticket:system"];
+    const parsed = parseIntake({
+      summary: "Event tickets.",
+      requirements: [{ description: "Sell tickets.", observableAcceptance: ["The order is recorded."] }],
+      materialQuestions: [],
+      researchQueries: ["event ticketing"],
+      domainTerms,
+      topicSlugs,
+    });
+    expect(parsed.domainTerms).toEqual(domainTerms);
+    expect(parsed.topicSlugs).toEqual(topicSlugs);
+    expect(parseIntake({
+      summary: "Event tickets.",
+      requirements: [{ description: "Sell tickets.", observableAcceptance: ["The order is recorded."] }],
+      materialQuestions: [],
+      researchQueries: ["event ticketing"],
+    }).domainTerms).toEqual([]);
+    expect(() => parseIntake({
+      summary: "Event tickets.",
+      requirements: [{ description: "Sell tickets.", observableAcceptance: ["The order is recorded."] }],
+      materialQuestions: [],
+      researchQueries: ["event ticketing"],
+      domainTerms: Array(7).fill("ticket"),
+      topicSlugs: [],
+    })).toThrow("at most 6 items");
+    expect(() => parseIntake({
+      summary: "Event tickets.",
+      requirements: [{ description: "Sell tickets.", observableAcceptance: ["The order is recorded."] }],
+      materialQuestions: [],
+      researchQueries: ["event ticketing"],
+      domainTerms: ["ticket"],
+      topicSlugs: ["a", "b", "c", "d", "e"],
+    })).toThrow("at most 4 items");
+    expect(() => parseIntake({
+      summary: "Event tickets.",
+      requirements: [{ description: "Sell tickets.", observableAcceptance: ["The order is recorded."] }],
+      materialQuestions: [],
+      researchQueries: ["event ticketing"],
+      domainTerms: [3],
+      topicSlugs: [],
+    })).toThrow("must contain 1 to 120 characters");
+  });
+
+  test("advertises and enforces the same topic slug bounds", () => {
+    const intakeProperties = INTAKE_SCHEMA.properties as Record<string, any>;
+    const refinedProperties = REFINED_BRIEF_SCHEMA.properties as Record<string, any>;
+    expect(intakeProperties.topicSlugs.items).toEqual({ type: "string", minLength: 1, maxLength: 50 });
+    expect(refinedProperties.topicSlugs.items).toEqual({ type: "string", minLength: 1, maxLength: 50 });
+    expect(intakeProperties.domainTerms.items).toEqual({ type: "string", minLength: 1, maxLength: 120 });
+
+    const intakeWithTopic = (topic: string) => ({
+      summary: "Event ticket service.",
+      requirements: [{ description: "Sell tickets.", observableAcceptance: ["The ticket is reserved."] }],
+      materialQuestions: [],
+      researchQueries: ["event tickets"],
+      topicSlugs: [topic],
+    });
+    expect(() => parseIntake(intakeWithTopic(""))).toThrow("topicSlugs[1] must contain 1 to 50 characters.");
+    expect(() => parseIntake(intakeWithTopic("a".repeat(51)))).toThrow("topicSlugs[1] must contain 1 to 50 characters.");
+    expect(parseIntake(intakeWithTopic("a")).topicSlugs).toEqual(["a"]);
+    expect(parseIntake(intakeWithTopic("a".repeat(50))).topicSlugs).toEqual(["a".repeat(50)]);
+    const fiftyCodePointsWithAstralCharacter = `${"a".repeat(49)}😀`;
+    expect([...fiftyCodePointsWithAstralCharacter]).toHaveLength(50);
+    expect(fiftyCodePointsWithAstralCharacter.length).toBe(51);
+    expect(parseIntake(intakeWithTopic(fiftyCodePointsWithAstralCharacter)).topicSlugs).toEqual([fiftyCodePointsWithAstralCharacter]);
+  });
+
+  test("rebuild parsing preserves initial questions, regenerates IDs, and rejects new questions", () => {
+    const initial = parseIntake({
+      summary: "Initial brief.",
+      requirements: [{ description: "Initial requirement.", observableAcceptance: ["Initial acceptance."] }],
+      materialQuestions: [{ question: "Which event?", whyMaterial: "This changes ticketing rules." }],
+      researchQueries: ["event tickets"],
+      domainTerms: ["event ticketing"],
+      topicSlugs: [],
+    });
+    const refinedPayload = {
+      summary: "Clarified brief.",
+      requirements: [{ description: "Sell event tickets.", observableAcceptance: ["The ticket is reserved."] }],
+      outOfScope: ["Resale marketplace."],
+      assumptions: ["The launch event is a single event."],
+      materialQuestions: [],
+      researchQueries: ["event admission"],
+      domainTerms: ["event admission"],
+      topicSlugs: ["event-ticketing"],
+    };
+    const rebuilt = parseRefinedBrief(refinedPayload, initial);
+    expect(rebuilt.summary).toBe("Clarified brief.");
+    expect(rebuilt.materialQuestions).toEqual(initial.materialQuestions);
+    expect(rebuilt.requirements[0]?.id).toBe("R1");
+    expect(rebuilt.requirements[0]?.observableAcceptance[0]?.id).toBe("A1");
+    expect(() => parseRefinedBrief({ ...refinedPayload, materialQuestions: [{ question: "Another question?", whyMaterial: "It changes scope." }] }, initial)).toThrow(ModelOutputError);
   });
 });
 

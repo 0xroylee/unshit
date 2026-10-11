@@ -24,6 +24,8 @@ type JsonSchema = Record<string, unknown>;
 
 const string = { type: "string" } as const;
 const stringArray = { type: "array", items: string } as const;
+const DOMAIN_TERM_ITEM = { minLength: 1, maxLength: 120 } as const;
+const TOPIC_SLUG_ITEM = { minLength: 1, maxLength: 50 } as const;
 
 function object(properties: Record<string, JsonSchema>, required = Object.keys(properties)): JsonSchema {
   return { type: "object", properties, required, additionalProperties: false };
@@ -44,8 +46,22 @@ export const INTAKE_SCHEMA: JsonSchema = object({
     maxItems: 6,
     items: object({ question: string, whyMaterial: string }),
   },
-    researchQueries: { ...stringArray, minItems: 1, maxItems: 3 },
+  researchQueries: { ...stringArray, minItems: 1, maxItems: 3 },
+  domainTerms: { type: "array", minItems: 1, maxItems: 6, items: { ...string, ...DOMAIN_TERM_ITEM } },
+  topicSlugs: { type: "array", maxItems: 4, items: { ...string, ...TOPIC_SLUG_ITEM } },
 });
+
+export const REFINED_BRIEF_SCHEMA: JsonSchema = {
+  ...INTAKE_SCHEMA,
+  properties: {
+    ...(INTAKE_SCHEMA.properties as Record<string, JsonSchema>),
+    materialQuestions: {
+      type: "array",
+      maxItems: 0,
+      items: object({ question: string, whyMaterial: string }),
+    },
+  },
+};
 
 export const REPOSITORY_SELECTION_SCHEMA: JsonSchema = object({
   selected: {
@@ -240,6 +256,24 @@ function asStringArray(value: unknown, label: string, min: number, max: number, 
   return value.map((item, index) => asString(item, `${label}[${index + 1}]`, itemMax));
 }
 
+function asBoundedStringArray(
+  value: unknown,
+  label: string,
+  max: number,
+  itemBounds: { minLength: number; maxLength: number },
+): string[] {
+  if (!Array.isArray(value) || value.length > max) {
+    throw new ModelOutputError(`${label} must contain at most ${max} items.`);
+  }
+  return value.map((item, index) => {
+    const length = typeof item === "string" ? [...item].length : 0;
+    if (typeof item !== "string" || length < itemBounds.minLength || length > itemBounds.maxLength) {
+      throw new ModelOutputError(`${label}[${index + 1}] must contain ${itemBounds.minLength} to ${itemBounds.maxLength} characters.`);
+    }
+    return item;
+  });
+}
+
 function asArray(value: unknown, label: string, min: number, max: number): unknown[] {
   if (!Array.isArray(value) || value.length < min || value.length > max) {
     throw new ModelOutputError(`${label} must contain ${min} to ${max} items.`);
@@ -291,7 +325,15 @@ export function parseIntake(value: unknown): IntakeBrief {
     assumptions: input.assumptions === undefined ? [] : asStringArray(input.assumptions, "assumptions", 0, 12),
     materialQuestions,
     researchQueries: input.researchQueries === undefined ? [] : asStringArray(input.researchQueries, "researchQueries", 1, 3, 300),
+    domainTerms: input.domainTerms === undefined ? [] : asBoundedStringArray(input.domainTerms, "domainTerms", 6, DOMAIN_TERM_ITEM),
+    topicSlugs: input.topicSlugs === undefined ? [] : asBoundedStringArray(input.topicSlugs, "topicSlugs", 4, TOPIC_SLUG_ITEM),
   };
+}
+
+export function parseRefinedBrief(value: unknown, initial: IntakeBrief): IntakeBrief {
+  const parsed = parseIntake(value);
+  if (parsed.materialQuestions.length > 0) throw new ModelOutputError("The brief rebuild may not add material questions.");
+  return { ...parsed, materialQuestions: initial.materialQuestions };
 }
 
 export function stableMaterialQuestionId(question: string, whyMaterial: string): string {

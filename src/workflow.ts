@@ -2,9 +2,12 @@ import type { ModelGateway, ModelSession, ModelTurnResult, JsonRecord } from "./
 import { referencePlanPrompt, type ReferencePlanPhase } from "./instructions.ts";
 import { GitHubResearcher } from "./github.ts";
 import { scanLocalTree, extractExistingCommands } from "./local.ts";
+import { domainMaterialFromBrief } from "./repository-screening.ts";
+import { domainTermsFor, isTestPath, pathRoleHint, rankTreeFiles } from "./file-ranking.ts";
 import {
   FILE_SELECTION_SCHEMA,
   INTAKE_SCHEMA,
+  REFINED_BRIEF_SCHEMA,
   PLAN_SCHEMA,
   REPOSITORY_SELECTION_SCHEMA,
   REVIEW_SCHEMA,
@@ -12,10 +15,12 @@ import {
   createPlanDocument,
   parseFileSelection,
   parseIntake,
+  parseRefinedBrief,
   parseModelJson,
   parsePlan,
   parseRepositorySelection,
   parseReview,
+  selectedRepositorySnapshots,
   stableMaterialQuestionId,
   type ParsedPlanPayload,
 } from "./model-schema.ts";
@@ -27,11 +32,13 @@ import type {
   PlanDocument,
   ProgressEvent,
   RepositoryChoice,
+  RepositoryCandidate,
   ResearchGap,
   ReviewResult,
   RunOutcome,
   RunArtifacts,
   ResolvedAnswer,
+  ResearchSummary,
   ValidationRecord,
   TreeFile,
 } from "./types.ts";
@@ -40,6 +47,8 @@ export type AnswerQuestion = (question: MaterialQuestion) => Promise<string>;
 
 export interface WorkflowArtifactInput {
   brief: IntakeBrief;
+  initialBrief?: IntakeBrief;
+  research?: ResearchSummary;
   resolvedAnswers: ResolvedAnswer[];
   plan: PlanDocument;
   sources: ReturnType<typeof finalSources>;
@@ -87,6 +96,8 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
   const validationIssues: string[] = [];
   const validationHistory: ValidationRecord[] = [];
   let brief: IntakeBrief | undefined;
+  let initialBrief: IntakeBrief | undefined;
+  let research: ResearchSummary | undefined;
   let resolvedAnswerContext: ResolvedAnswer[] = [];
   let planningSession: ModelSession | undefined;
   let checkpointEvidence: LoadedEvidence | undefined;
@@ -102,6 +113,8 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     try {
       savedCheckpointPath = await options.onCheckpoint({
         brief,
+        ...(initialBrief ? { initialBrief } : {}),
+        ...(research ? { research } : {}),
         resolvedAnswers: [...resolvedAnswerContext],
         plan,
         sources: finalSources(checkpointEvidence.sources, checkpointEvidence.excerpts),
@@ -160,6 +173,27 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     }
     progress({ stage: "answer_gate", state: "completed", message: "Material questions are resolved." });
     resolvedAnswerContext = materialAnswerContext(brief, answers.resolved);
+    if (resolvedAnswerContext.length > 0) {
+      initialBrief = brief;
+      try {
+        const refinedValue = await modelJson(
+          planningSession,
+          refineBriefPrompt(options.requirement, brief, resolvedAnswerContext),
+          REFINED_BRIEF_SCHEMA,
+          "intake",
+          options.signal,
+        );
+        brief = parseRefinedBrief(refinedValue, brief);
+        progress({ stage: "intake", state: "completed", message: `Rebuilt the brief from ${resolvedAnswerContext.length} material answers.` });
+      } catch (error) {
+        if (error instanceof NeedsInputError || error instanceof InterruptedWorkflowError || options.signal?.aborted) throw error;
+        gaps.push({
+          kind: "validation",
+          material: true,
+          message: "The brief could not be rebuilt after the material answers; planning used the initial brief with the answers as context.",
+        });
+      }
+    }
 
     throwIfAborted(options.signal);
     progress({ stage: "local_baseline", state: "started", message: "Listing bounded local source files and excluding secrets and generated output." });
@@ -172,25 +206,54 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     progress({ stage: "local_baseline", state: "completed", message: `Indexed ${local.files.length} eligible local files without running project code.` });
 
     throwIfAborted(options.signal);
-    progress({ stage: "repository_search", state: "started", message: "Searching public GitHub, with GitLab fallback, using up to three intake queries." });
+    const domainMaterial = domainMaterialFromBrief(brief);
+    progress({ stage: "repository_search", state: "started", message: "Searching GitHub with host-built, qualified queries and a GitLab fallback." });
     const discovery = await options.researcher.discover(
-      brief.researchQueries,
+      domainMaterial,
       options.signal,
       (message) => progress({ stage: "repository_search", state: "completed", message }),
     );
     gaps.push(...discovery.gaps);
-    progress({ stage: "repository_search", state: "completed", message: `Collected ${discovery.candidates.length} public repository candidates.` });
+    research = discovery.research;
+    progress({ stage: "repository_search", state: "completed", message: `Matched ${discovery.research.matched} unique repositories; ${discovery.candidates.length} passed the metadata bar.` });
+
+    throwIfAborted(options.signal);
+    progress({ stage: "repository_trees", state: discovery.candidates.length > 0 ? "started" : "skipped", message: discovery.candidates.length > 0 ? "Verifying candidate commits, tests, and license evidence before selection." : "No candidate passed the metadata quality bar." });
+    const treeResolution = await options.researcher.resolveShortlist(
+      discovery.candidates,
+      options.signal,
+      (message) => progress({ stage: "repository_trees", state: "completed", message }),
+    );
+    gaps.push(...treeResolution.gaps);
+    research.rateLimited = research.rateLimited || treeResolution.rateLimited;
+    research.treeResolutions = treeResolution.resolutions;
+    research.shortlisted = treeResolution.snapshots.length;
+    research.excluded = discovery.excluded.length + treeResolution.excluded.length;
+    research.trustworthyReferenceFound = treeResolution.snapshots.length > 0;
+    const hostExcluded = [...discovery.excluded, ...treeResolution.excluded];
+    if (treeResolution.snapshots.length === 0) {
+      gaps.push({ kind: "search", message: noTrustworthyReferenceMessage(research), material: true });
+    }
+    progress({ stage: "repository_trees", state: treeResolution.snapshots.length > 0 ? "completed" : "skipped", message: treeResolution.snapshots.length > 0 ? `Verified ${treeResolution.snapshots.length} commit-pinned repositories before model selection.` : "No trustworthy repository passed commit-pinned tree checks." });
 
     let selection: ReturnType<typeof parseRepositorySelection> = { selected: [], rejected: [] };
-    if (discovery.candidates.length > 0) {
-      progress({ stage: "candidate_selection", state: "started", message: "Selecting at most three comparators from host-supplied search results." });
-      const candidateData = discovery.candidates.map((candidate) => ({
-        id: candidate.id,
-        provider: candidate.provider,
-        repository: candidate.fullName,
-        description: candidate.description,
-        defaultBranch: candidate.defaultBranch,
-        lastActivityAt: candidate.lastActivityAt ?? null,
+    const shortlistCandidates = treeResolution.snapshots.map((snapshot) => snapshot.candidate);
+    if (treeResolution.snapshots.length > 0) {
+      progress({ stage: "candidate_selection", state: "started", message: "Selecting at most three comparators from the host-verified shortlist." });
+      const candidateData = treeResolution.snapshots.map((snapshot) => ({
+        id: snapshot.candidate.id,
+        provider: snapshot.candidate.provider,
+        repository: snapshot.candidate.fullName,
+        description: snapshot.candidate.description,
+        defaultBranch: snapshot.candidate.defaultBranch,
+        lastActivityAt: snapshot.candidate.lastActivityAt ?? null,
+        signals: snapshot.candidate.signals ?? null,
+        licenseEvidence: snapshot.candidate.signals?.licenseSpdxId ? "metadata" : snapshot.licensePath ? "tree" : "none",
+        licensePath: snapshot.licensePath ?? null,
+        commitSha: snapshot.commitSha,
+        commitDate: snapshot.commitDate ?? null,
+        treeFileCount: snapshot.files.length,
+        testFileCount: snapshot.testFileCount ?? 0,
       }));
       const selectionValue = await modelJson(
         planningSession,
@@ -199,47 +262,31 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         "research",
         options.signal,
       );
-      selection = parseRepositorySelection(selectionValue, discovery.candidates);
-      progress({ stage: "candidate_selection", state: "completed", message: `Selected ${selection.selected.length} comparators; recorded reasons for every unselected candidate.` });
+      selection = parseRepositorySelection(selectionValue, shortlistCandidates);
+      progress({ stage: "candidate_selection", state: "completed", message: `Selected ${selection.selected.length} comparators from ${shortlistCandidates.length} tree-verified candidates.` });
     } else {
-      gaps.push({ kind: "search", message: "No public GitHub or GitLab candidate was available for comparison.", material: true });
-      progress({ stage: "candidate_selection", state: "skipped", message: "No repository candidates were available." });
+      progress({ stage: "candidate_selection", state: "skipped", message: "No trustworthy repository was available for selection." });
     }
-
-    throwIfAborted(options.signal);
-    progress({ stage: "repository_trees", state: selection.selected.length > 0 ? "started" : "skipped", message: selection.selected.length > 0 ? "Resolving exact commit SHAs and selected repository trees." : "No comparators were selected." });
-    const treeResolution = await options.researcher.resolveSelected(
-      discovery.candidates,
-      selection.selected.map((item) => item.candidateId),
-      options.signal,
-      (message) => progress({ stage: "repository_trees", state: "completed", message }),
-    );
-    gaps.push(...treeResolution.gaps);
-    const selectedIdsWithTrees = new Set(treeResolution.snapshots.map((snapshot) => snapshot.candidate.id));
-    for (const selected of selection.selected) {
-      if (!selectedIdsWithTrees.has(selected.candidateId) && !treeResolution.gaps.some((gap) => gap.message.includes(selected.candidateId))) {
-        const candidate = discovery.candidates.find((entry) => entry.id === selected.candidateId);
-        gaps.push({ kind: "tree", message: `Could not resolve a commit-pinned tree for ${candidate?.fullName ?? selected.candidateId}.`, material: true });
-      }
-    }
-    if (selection.selected.length > 0 && treeResolution.snapshots.length === 0) {
-      gaps.push({ kind: "repository", message: "No selected comparator had a readable commit-pinned tree.", material: true });
-    }
-    if (selection.selected.length === 0) {
+    if (treeResolution.snapshots.length > 0 && selection.selected.length === 0) {
       gaps.push({ kind: "repository", message: "The model selected no comparator repository for deep inspection.", material: true });
     }
-    if (treeResolution.snapshots.length > 0) {
-      progress({ stage: "repository_trees", state: "completed", message: `Resolved exact trees for ${treeResolution.snapshots.length} selected repositories.` });
-    }
+    const selectedSnapshots = selectedRepositorySnapshots(selection.selected, shortlistCandidates, treeResolution.snapshots);
+    const repositoryChoices = buildRepositoryChoices(
+      [...discovery.candidates, ...discovery.excluded.map((entry) => entry.candidate), ...treeResolution.excluded.map((entry) => entry.candidate)],
+      selection,
+      treeResolution.snapshots,
+      hostExcluded,
+    );
+    checkpointRepositoryChoices = repositoryChoices;
 
     throwIfAborted(options.signal);
-    const fileCandidates = candidateFiles(local.files, treeResolution.snapshots);
+    const fileCandidates = candidateFiles(local.files, selectedSnapshots, domainTermsFor(brief, resolvedAnswerContext));
     let fileSelection: ReturnType<typeof parseFileSelection> = [];
     if (fileCandidates.length > 0) {
       progress({ stage: "file_selection", state: "started", message: "Choosing production and test files from actual local and commit-pinned trees." });
       const fileValue = await modelJson(
         planningSession,
-        fileSelectionPrompt(brief, resolvedAnswerContext, fileCandidates, treeResolution.snapshots),
+        fileSelectionPrompt(brief, resolvedAnswerContext, fileCandidates, selectedSnapshots),
         FILE_SELECTION_SCHEMA,
         "research",
         options.signal,
@@ -257,10 +304,11 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     progress({ stage: "source_reads", state: "started", message: "Reading selected files, hashing source bytes, and assigning exact line ranges." });
     const evidence = await loadSelectedEvidence({
       local,
-      repositories: treeResolution.snapshots,
+      repositories: selectedSnapshots,
       modelSelection: fileSelection,
       github: options.researcher,
       relevantText: `${brief.summary}\n${brief.requirements.map((requirement) => requirement.description).join("\n")}`,
+      domainTerms: domainTermsFor(brief, resolvedAnswerContext),
       signal: options.signal,
     });
     checkpointEvidence = evidence;
@@ -283,8 +331,6 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     }));
     const evidenceData = excerptPromptData(evidence.sources, evidence.excerpts);
     const selectedRationales = new Map(selection.selected.map((entry) => [entry.candidateId, entry.rationale]));
-    const repositoryChoices = buildRepositoryChoices(discovery.candidates, selection, treeResolution.snapshots);
-    checkpointRepositoryChoices = repositoryChoices;
     checkpointPlan = blockedDraft(brief, repositoryChoices, ["Plan generation is in progress; this checkpoint contains evidence only."]);
     await saveCheckpoint("evidence");
 
@@ -293,7 +339,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     const rawPlan = await modelJson(planningSession, planPrompt, PLAN_SCHEMA, "planning", options.signal);
     let parsedPlan: ParsedPlanPayload | undefined;
     try {
-      parsedPlan = parsePlan(rawPlan, brief, evidence.excerpts, commands, treeResolution.snapshots, evidence.sources);
+      parsedPlan = parsePlan(rawPlan, brief, evidence.excerpts, commands, selectedSnapshots, evidence.sources);
     } catch (error) {
       const issue = safeValidationMessage(error);
       validationHistory.push({ issue, resolved: false });
@@ -307,7 +353,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
           "planning",
           options.signal,
         );
-        parsedPlan = parsePlan(repaired, brief, evidence.excerpts, commands, treeResolution.snapshots, evidence.sources);
+        parsedPlan = parsePlan(repaired, brief, evidence.excerpts, commands, selectedSnapshots, evidence.sources);
         validationHistory.at(-1)!.resolved = true;
         validationIssues.splice(validationIssues.indexOf(issue), 1);
         progress({ stage: "plan_repair", state: "completed", message: "The repaired plan passed host structure, coverage, dependency, command, and citation checks." });
@@ -327,7 +373,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     } else {
       const draftReviewNotes = gaps.filter((gap) => gap.material).map((gap) => gap.message);
       const initialReadiness = parsedPlan.shouldDraft || draftReviewNotes.length > 0 ? "draft" : "ready";
-      plan = createPlanDocument(parsedPlan, brief, initialReadiness, draftReviewNotes, repositoryChoices, treeResolution.snapshots, selectedRationales);
+      plan = createPlanDocument(parsedPlan, brief, initialReadiness, draftReviewNotes, repositoryChoices, selectedSnapshots, selectedRationales);
     }
     checkpointPlan = plan;
     await saveCheckpoint("plan");
@@ -358,9 +404,9 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
             "planning",
             options.signal,
           );
-          const repairedPayload = parsePlan(repaired, brief, evidence.excerpts, commands, treeResolution.snapshots, evidence.sources);
+          const repairedPayload = parsePlan(repaired, brief, evidence.excerpts, commands, selectedSnapshots, evidence.sources);
           parsedPlan = repairedPayload;
-          plan = createPlanDocument(repairedPayload, brief, "draft", [], repositoryChoices, treeResolution.snapshots, selectedRationales);
+          plan = createPlanDocument(repairedPayload, brief, "draft", [], repositoryChoices, selectedSnapshots, selectedRationales);
           checkpointPlan = plan;
           await saveCheckpoint("plan");
           const secondReview = await independentReview(options, brief, resolvedAnswerContext, plan, evidenceData, options.signal);
@@ -393,10 +439,37 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     let artifacts: RunArtifacts | undefined;
     if (options.onArtifacts) {
       progress({ stage: "save", state: "started", message: "Saving the report, evidence manifest, and source snapshots atomically." });
-      artifacts = await options.onArtifacts({ brief, resolvedAnswers: resolvedAnswerContext, plan, sources, gaps, reviews, validationIssues, validationHistory, evidence, commands });
+      artifacts = await options.onArtifacts({
+        brief,
+        ...(initialBrief ? { initialBrief } : {}),
+        ...(research ? { research } : {}),
+        resolvedAnswers: resolvedAnswerContext,
+        plan,
+        sources,
+        gaps,
+        reviews,
+        validationIssues,
+        validationHistory,
+        evidence,
+        commands,
+      });
       progress({ stage: "save", state: "completed", message: artifacts ? `Saved ${artifacts.reportPath}.` : "No artifact writer was configured." });
     }
-    return { status: "completed", readiness: plan.readiness, brief, resolvedAnswers: resolvedAnswerContext, plan, sources, gaps, reviews, ...(artifacts ? { artifacts } : {}), validationIssues, validationHistory };
+    return {
+      status: "completed",
+      readiness: plan.readiness,
+      brief,
+      ...(initialBrief ? { initialBrief } : {}),
+      ...(research ? { research } : {}),
+      resolvedAnswers: resolvedAnswerContext,
+      plan,
+      sources,
+      gaps,
+      reviews,
+      ...(artifacts ? { artifacts } : {}),
+      validationIssues,
+      validationHistory,
+    };
   } catch (error) {
     if (error instanceof NeedsInputError) {
       const knownBrief = brief ?? emptyBrief(options.requirement);
@@ -488,10 +561,32 @@ function intakePrompt(requirement: string): string {
   return [
     "Extract a bounded software brief from the user's requirement.",
     "Identify only unresolved business decisions that can change users, permissions, workflows, scope, or acceptance. Do not ask technical questions whose answers can be discovered from source later.",
-    "If a question is material, state why. Suggest up to three short public repository search queries, but do not search. The host will not perform any source search until all material questions have answers.",
+    "If a question is material, state why. Suggest up to three short public repository search queries, but do not search. Supply 1–6 English domainTerms of one to three words for repository and file matching, and 0–4 lowercase GitHub topicSlugs. The host will sanitize the material and build all provider queries. The host will not perform any source search until all material questions have answers.",
     "Return only the requested JSON. Host assigns stable requirement, acceptance, and question IDs.",
     "USER REQUIREMENT:",
     requirement,
+  ].join("\n\n");
+}
+
+function refineBriefPrompt(requirement: string, initial: IntakeBrief, answers: ResolvedAnswer[]): string {
+  return [
+    "Rebuild the software brief with every confirmed answer below treated as a binding decision.",
+    "Rewrite the summary, requirements, acceptance criteria, out-of-scope items, assumptions, domainTerms, topicSlugs, and researchQueries to reflect those decisions. The question round is closed: return an empty materialQuestions array. If an answer leaves a decision open, record the remaining choice as an assumption. Host assigns requirement and acceptance IDs.",
+    "Return only the requested JSON.",
+    "USER REQUIREMENT:",
+    requirement,
+    "INITIAL BRIEF:",
+    JSON.stringify({
+      summary: initial.summary,
+      requirements: initial.requirements,
+      outOfScope: initial.outOfScope,
+      assumptions: initial.assumptions,
+      domainTerms: initial.domainTerms,
+      topicSlugs: initial.topicSlugs,
+      researchQueries: initial.researchQueries,
+    }),
+    "CONFIRMED ANSWERS:",
+    JSON.stringify(answers),
   ].join("\n\n");
 }
 
@@ -501,8 +596,8 @@ function repositorySelectionPrompt(
   candidates: Array<Record<string, unknown>>,
 ): string {
   return [
-    "Select zero to three public repository comparators from the host-supplied candidates.",
-    "Use the exact candidate IDs. For each selected repository, state the concrete fit that justifies deep inspection. For every unselected candidate, state why it is not a useful comparator. Do not invent a repository, URL, source path, commit, or maintenance claim. Search metadata only supports discovery; no implementation has been read yet.",
+    "Select zero to three public repository comparators from the host-verified shortlist.",
+    "The host already applied the quality bar (license, stars, activity, age, not archived, not fork) and verified each pinned tree for tests and license evidence. Treat supplied metadata and tree counts as host-verified signals. Use the exact candidate IDs. For each selected repository, state the concrete fit that justifies deep inspection. For every unselected candidate, state why it is not a useful comparator. Do not invent a repository, URL, source path, commit, or maintenance claim. Language differences are acceptable when the patterns transfer.",
     "Return only the requested JSON.",
     "CLARIFIED BRIEF:",
     JSON.stringify({ summary: brief.summary, requirements: brief.requirements, outOfScope: brief.outOfScope, assumptions: brief.assumptions, answers }),
@@ -511,11 +606,11 @@ function repositorySelectionPrompt(
   ].join("\n\n");
 }
 
-function candidateFiles(localFiles: TreeFile[], snapshots: Array<{ candidate: { id: string; provider: string; fullName: string; lastActivityAt?: string }; commitSha: string; commitDate?: string; treeTruncated: boolean; files: TreeFile[] }>): Array<Record<string, unknown>> {
+function candidateFiles(localFiles: TreeFile[], snapshots: Array<{ candidate: { id: string; provider: string; fullName: string; lastActivityAt?: string }; commitSha: string; commitDate?: string; treeTruncated: boolean; files: TreeFile[] }>, terms: ReturnType<typeof domainTermsFor>): Array<Record<string, unknown>> {
   const result: Array<Record<string, unknown>> = [];
-  for (const file of rankFiles(localFiles, 300)) result.push({ fileId: file.id, path: file.path, size: file.size, source: "local project", roleHint: pathRoleHint(file.path) });
+  for (const file of rankTreeFiles(localFiles, terms, 300)) result.push({ fileId: file.id, path: file.path, size: file.size, source: "local project", roleHint: pathRoleHint(file.path) });
   for (const snapshot of snapshots) {
-    const files = rankFiles(snapshot.files, 800);
+    const files = rankTreeFiles(snapshot.files, terms, 800);
     for (const file of files) {
       result.push({
         fileId: file.id,
@@ -572,7 +667,10 @@ function planGenerationPrompt(
     "CLARIFIED BRIEF:",
     JSON.stringify({ summary: brief.summary, requirements: brief.requirements, outOfScope: brief.outOfScope, assumptions: brief.assumptions, answers }),
     "HOST-RECORDED REPOSITORY CHOICES:",
-    JSON.stringify(repositoryChoices),
+    JSON.stringify({
+      modelDecisions: repositoryChoices.filter((choice) => choice.decidedBy === "model"),
+      hostExcludedCount: repositoryChoices.filter((choice) => choice.decidedBy === "host").length,
+    }),
     "HOST-DISCOVERED COMMANDS FROM LOCAL TARGET FILES ONLY:",
     JSON.stringify(commands),
     "HOST-CREATED SOURCE REGISTRY AND UNTRUSTED EXCERPTS:",
@@ -635,76 +733,55 @@ function reviewRepairPrompt(
 }
 
 function buildRepositoryChoices(
-  candidates: RepositoryChoiceCandidate[],
+  candidates: RepositoryCandidate[],
   selection: ReturnType<typeof parseRepositorySelection>,
-  snapshots: Array<{ candidate: { id: string; provider: "github" | "gitlab"; fullName: string; webUrl: string; defaultBranch: string; lastActivityAt?: string }; commitSha: string; commitDate?: string }>,
+  snapshots: Array<{ candidate: RepositoryCandidate; commitSha: string; commitDate?: string; files: TreeFile[]; testFileCount?: number; licensePath?: string }>,
+  hostExcluded: Array<{
+    candidate: RepositoryCandidate;
+    reasons: string[];
+    resolution?: { commitSha: string; commitDate?: string; treeFileCount: number; testFileCount: number; licensePath?: string };
+  }>,
 ): RepositoryChoice[] {
   const selected = new Map(selection.selected.map((entry) => [entry.candidateId, entry.rationale]));
   const rejected = new Map(selection.rejected.map((entry) => [entry.candidateId, entry.rationale]));
   const snapshotById = new Map(snapshots.map((snapshot) => [snapshot.candidate.id, snapshot]));
-  return candidates.map((candidate) => {
+  const hostById = new Map<string, { reasons: string[]; resolution?: { commitSha: string; commitDate?: string; treeFileCount: number; testFileCount: number; licensePath?: string } }>();
+  for (const entry of hostExcluded) hostById.set(entry.candidate.id, entry);
+  const unique = [...new Map(candidates.map((candidate) => [candidate.id, candidate])).values()];
+  return unique.map((candidate) => {
     const snapshot = snapshotById.get(candidate.id);
+    const hostExclusion = hostById.get(candidate.id);
+    const hostReasons = hostExclusion?.reasons;
+    const resolution = hostExclusion?.resolution;
+    const licenseEvidence: RepositoryChoice["licenseEvidence"] = candidate.signals?.licenseSpdxId
+      ? "metadata"
+      : snapshot?.licensePath || resolution?.licensePath
+        ? "tree"
+        : snapshot || resolution || hostReasons?.some((reason) => reason.startsWith("no license:"))
+          ? "none"
+          : undefined;
+    const commitSha = snapshot?.commitSha ?? resolution?.commitSha;
+    const commitDate = snapshot?.commitDate ?? resolution?.commitDate;
+    const treeFileCount = snapshot ? snapshot.files.length : resolution?.treeFileCount;
+    const testFileCount = snapshot ? snapshot.testFileCount ?? 0 : resolution?.testFileCount;
+    const licensePath = snapshot?.licensePath ?? resolution?.licensePath;
     return {
       candidateId: candidate.id,
       provider: candidate.provider,
       repository: candidate.fullName,
-      outcome: selected.has(candidate.id) ? "selected" : "rejected",
-      rationale: selected.get(candidate.id) ?? rejected.get(candidate.id) ?? "Not selected for deep inspection.",
+      outcome: hostReasons ? "rejected" : selected.has(candidate.id) ? "selected" : "rejected",
+      rationale: hostReasons?.join("; ") ?? selected.get(candidate.id) ?? rejected.get(candidate.id) ?? "Not selected for deep inspection.",
+      decidedBy: hostReasons ? "host" : "model",
       webUrl: candidate.webUrl,
       defaultBranch: candidate.defaultBranch,
       ...(candidate.lastActivityAt ? { lastActivityAt: candidate.lastActivityAt } : {}),
-      ...(snapshot ? { commitSha: snapshot.commitSha, ...(snapshot.commitDate ? { commitDate: snapshot.commitDate } : {}) } : {}),
+      ...(commitSha ? { commitSha, ...(commitDate ? { commitDate } : {}) } : {}),
+      ...(candidate.signals ? { signals: candidate.signals } : {}),
+      ...(treeFileCount !== undefined ? { treeFileCount, testFileCount } : {}),
+      ...(licenseEvidence ? { licenseEvidence } : {}),
+      ...(licensePath ? { licensePath } : {}),
     };
   });
-}
-
-type RepositoryChoiceCandidate = {
-  id: string;
-  provider: "github" | "gitlab";
-  fullName: string;
-  webUrl: string;
-  defaultBranch: string;
-  lastActivityAt?: string;
-};
-
-function rankFiles(files: TreeFile[], limit: number): TreeFile[] {
-  return files
-    .filter((file) => isTextSourcePath(file.path))
-    .map((file) => ({ file, score: pathScore(file.path) }))
-    .sort((left, right) => right.score - left.score || left.file.path.localeCompare(right.file.path))
-    .slice(0, limit)
-    .map(({ file }) => file);
-}
-
-function isTextSourcePath(filePath: string): boolean {
-  return /\.(c|cc|cpp|cs|css|go|h|hpp|html?|java|js|jsx|json|kt|md|mjs|php|py|rb|rs|scss|sh|sql|swift|toml|ts|tsx|txt|vue|xml|yaml|yml|zig)$/i.test(filePath)
-    || /(^|\/)(Dockerfile|Makefile|Justfile|Jenkinsfile)$/i.test(filePath);
-}
-
-function pathScore(filePath: string): number {
-  const lower = filePath.toLowerCase();
-  let score = 0;
-  if (isTestPath(lower)) score += 14;
-  if (/(^|\/)(src|lib|app|packages|internal)\//.test(lower)) score += 10;
-  if (/^(package\.json|pyproject\.toml|cargo\.toml|go\.mod|pom\.xml|build\.gradle)/.test(lower)) score += 8;
-  if (/(^|\/)(readme|license|copying|notice)(\.|$)/.test(lower)) score += 5;
-  if (lower.startsWith(".github/workflows/") || lower === ".gitlab-ci.yml") score += 4;
-  if (/(^|\/)(docs|examples|fixtures|testdata|vendor|node_modules)\//.test(lower)) score -= 8;
-  if (/(\.min\.|\.lock$|\.svg$|\.map$|\.snap$)/.test(lower)) score -= 10;
-  return score;
-}
-
-function pathRoleHint(filePath: string): string {
-  if (isTestPath(filePath)) return "likely test";
-  if (/^(package\.json|pyproject\.toml|cargo\.toml|go\.mod|pom\.xml)/i.test(filePath)) return "project manifest";
-  if (filePath.toLowerCase().startsWith(".github/workflows/")) return "CI";
-  if (/(^|\/)(license|copying|notice)/i.test(filePath)) return "license";
-  return "implementation or project text";
-}
-
-function isTestPath(filePath: string): boolean {
-  const lower = filePath.toLowerCase();
-  return /(^|\/)(__tests__|tests?|spec)\//.test(lower) || /\.(test|spec)\.[^.]+$/.test(lower) || lower.endsWith("_test.go");
 }
 
 function parseExcerptMetadata(evidenceData: string): ReturnType<typeof parsePlanExcerptMetadata> {
@@ -745,8 +822,13 @@ function blockedDraft(brief: IntakeBrief, repositoryChoices: RepositoryChoice[],
   };
 }
 
+function noTrustworthyReferenceMessage(research: ResearchSummary): string {
+  const bar = research.qualityBar;
+  return `No trustworthy public reference repository was found: ${research.matched} repositories matched the host-built queries, none passed the quality bar (a license, stars ≥ ${bar.minStars}, pushed within ${bar.maxMonthsSincePush} months, created ≥ ${bar.minAgeDays} days ago, not archived, not a fork, test files present) with a readable commit-pinned tree.`;
+}
+
 function emptyBrief(requirement: string): IntakeBrief {
-  return { summary: requirement, requirements: [], outOfScope: [], assumptions: [], materialQuestions: [], researchQueries: [] };
+  return { summary: requirement, requirements: [], outOfScope: [], assumptions: [], materialQuestions: [], researchQueries: [], domainTerms: [], topicSlugs: [] };
 }
 
 function normalizeQuestionId(question: string, whyMaterial: string): string {

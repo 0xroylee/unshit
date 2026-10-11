@@ -4,7 +4,7 @@
 CLI / JSON caller
        |
        v
-workflow: scope -> sources -> evidence -> plan -> fresh review
+workflow: intake -> answers -> brief rebuild -> search -> tree screen -> selection -> evidence -> plan -> fresh review
     |                |          |                  |
     v                v          v                  v
 Codex App Server   public APIs  snapshots        PlanDoc
@@ -18,11 +18,13 @@ turn / interrupt                                  v
 | 文件 | 职责 |
 | --- | --- |
 | [cli.ts](../src/cli.ts) | 参数、终端澄清、ASCII 进度、JSON/JSONL 和退出码 |
-| [workflow.ts](../src/workflow.ts) | 需求门槛、候选选择、读取、计划生成、独立复核与有界修正 |
+| [workflow.ts](../src/workflow.ts) | 需求门槛、答复后的 brief 重建、候选筛选与选择、读取、计划生成、独立复核与有界修正 |
 | [app-server.ts](../src/app-server.ts) | 原生双向 RPC、活动回合关联、最终文本、取消和进程清理 |
-| [github.ts](../src/github.ts) | GitHub 发现与固定提交读取，GitLab 官方 API 回退 |
+| [github.ts](../src/github.ts) | host-built GitHub 查询、质量门槛、固定提交树验证与 GitLab 官方 API 回退 |
 | [local.ts](../src/local.ts) | 本地文件基线、排除规则、凭证内容过滤、已存在脚本依据 |
-| [evidence.ts](../src/evidence.ts) | 有界读取、源码哈希、行范围、来源 ID 与固定链接 |
+| [repository-screening.ts](../src/repository-screening.ts) | 领域查询材料清理、查询计划、候选信号解析、元数据与树质量判断 |
+| [file-ranking.ts](../src/file-ranking.ts) | 需求词加权、测试与实现文件配额、文本路径和根许可证路径判断 |
+| [evidence.ts](../src/evidence.ts) | 有界读取、共享文件排序、源码哈希、行范围、来源 ID 与固定链接 |
 | [model-schema.ts](../src/model-schema.ts) | 每轮 JSON Schema、结构校验、来源归属、完整覆盖和依赖无环 |
 | [report.ts](../src/report.ts) | 设计、比较、任务、验收、验证与源码对应表的 Markdown 输出 |
 | [storage.ts](../src/storage.ts) | 原子保存报告、证据快照和可核对的补答请求上下文 |
@@ -37,6 +39,10 @@ Codex 管理认证与会话。CLI 在内存中关联 RPC 和当前回合；应�
 已回答的问题以 `resolvedAnswers` 传给候选选择、规划、复核及修正回合，并写入最终结果、报告、manifest 和中断检查点。报告将初始摘要与最终范围分别标注。
 
 已有本地脚本与实施后要创建的命令分开记录。上游测试读取只支持参考判断；CLI 不把它们当作目标应用已执行的测试。
+
+公开仓库搜索由 host 使用 intake 的 `domainTerms` 和 `topicSlugs` 构建三档查询；模型不能直接编写 GitHub 查询语法。GitHub 与 GitLab 返回的星数、fork、归档、许可证、语言、topic 和日期信号写入研究摘要。host 先应用星数、推送日期、创建年龄、归档与 fork 门槛，再读取固定提交的树，确认存在测试文件；若搜索元数据没有 SPDX 许可证，则要求树中有根目录许可证文件。树检查通过后才交给模型选择，筛选原因和未发送查询也保存在 manifest 中。
+
+GitHub 树响应上限为 8 MB，源码响应仍为 1 MB。文件树不再按字母顺序裁剪；GitHub 的 `treeTruncated` 使用提供方返回的截断标志。GitLab 树最多读取 25 页、每页 100 项；若 host 达到页数上限且仍有下一页，也会将该树标为截断。`file-ranking.ts` 被文件候选展示和自动证据挑选共享：它按 brief 与答复的领域词打分，并为测试、实现文件分别保留配额。
 
 ## 功能与固定源码依据
 

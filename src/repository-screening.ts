@@ -1,0 +1,247 @@
+import type {
+  IntakeBrief,
+  QualityBar,
+  RepositoryCandidate,
+  RepositoryQualitySignals,
+  RepositorySnapshot,
+  TreeFile,
+} from "./types.ts";
+import { isRootLicensePath, isTestPath } from "./file-ranking.ts";
+
+export interface DomainMaterial {
+  phrases: string[];
+  topics: string[];
+}
+
+export interface SearchTier {
+  tier: 0 | 1 | 2;
+  minStars: number;
+  maxMonthsSincePush: number;
+}
+
+export interface SearchPlan {
+  github: Array<{ tier: 0 | 1 | 2; query: string }>;
+  gitlab: string[];
+}
+
+export interface QualityJudgment {
+  pass: boolean;
+  reasons: string[];
+  licenseFromMetadata: boolean;
+}
+
+export interface TreeJudgment {
+  testFileCount: number;
+  licensePath: string | null;
+  reasons: string[];
+}
+
+export const DEFAULT_QUALITY_BAR: QualityBar = {
+  minStars: 20,
+  maxMonthsSincePush: 36,
+  minAgeDays: 180,
+  requireTests: true,
+  requireLicense: true,
+};
+
+const DEFAULT_SEARCH_TIERS: SearchTier[] = [
+  { tier: 0, minStars: 200, maxMonthsSincePush: 12 },
+  { tier: 1, minStars: 50, maxMonthsSincePush: 24 },
+  { tier: 2, minStars: 20, maxMonthsSincePush: 36 },
+];
+
+export function domainMaterialFromBrief(brief: IntakeBrief): DomainMaterial {
+  const phrases: string[] = [];
+  const seenPhrases = new Set<string>();
+  for (const raw of brief.domainTerms) {
+    const phrase = sanitizePhrase(raw);
+    if (!phrase || seenPhrases.has(phrase)) continue;
+    seenPhrases.add(phrase);
+    phrases.push(phrase);
+    if (phrases.length === 2) break;
+  }
+  if (phrases.length === 0) {
+    const fallback = sanitizePhrase(brief.researchQueries[0] ?? "") || sanitizePhrase(brief.summary);
+    if (fallback) phrases.push(fallback.split(" ").slice(0, 3).join(" ").slice(0, 40));
+  }
+
+  const topics: string[] = [];
+  const seenTopics = new Set<string>();
+  for (const raw of brief.topicSlugs) {
+    const topic = raw.normalize("NFKC").trim().toLowerCase();
+    if (!/^[a-z0-9-]{1,50}$/.test(topic) || seenTopics.has(topic)) continue;
+    seenTopics.add(topic);
+    topics.push(topic);
+    if (topics.length === 1) break;
+  }
+  return { phrases, topics };
+}
+
+export function planSearches(material: DomainMaterial, now: Date, tiers: SearchTier[] = DEFAULT_SEARCH_TIERS): SearchPlan {
+  const phrases = material.phrases.slice(0, 2);
+  const topics = material.topics.slice(0, 1);
+  const github: SearchPlan["github"] = [];
+  for (const tier of tiers.slice(0, 3)) {
+    const pushedDate = dateMonthsBefore(now, tier.maxMonthsSincePush);
+    const qualifiers = `archived:false fork:false stars:>=${tier.minStars} pushed:>=${pushedDate}`;
+    for (const phrase of phrases) github.push({ tier: tier.tier, query: `${phrase} in:name,description,topics ${qualifiers}` });
+    for (const topic of topics) github.push({ tier: tier.tier, query: `topic:${topic} ${qualifiers}` });
+  }
+  return { github: github.slice(0, 9), gitlab: phrases.slice(0, 2) };
+}
+
+export function candidateFromSearchItem(provider: "github" | "gitlab", item: unknown): Omit<RepositoryCandidate, "id"> | undefined {
+  if (!isRecord(item)) return undefined;
+  const fullName = provider === "github" ? text(item.full_name) : text(item.path_with_namespace);
+  const defaultBranch = text(item.default_branch);
+  if (!isRepositoryName(fullName) || !defaultBranch) return undefined;
+  const signals: RepositoryQualitySignals = provider === "github"
+    ? {
+        stars: nonNegativeNumber(item.stargazers_count),
+        forks: nonNegativeNumber(item.forks_count),
+        archived: booleanOrNull(item.archived),
+        fork: booleanOrNull(item.fork),
+        licenseSpdxId: licenseId(item.license),
+        language: nullableText(item.language),
+        topics: stringList(item.topics),
+        pushedAt: timestamp(item.pushed_at),
+        createdAt: timestamp(item.created_at),
+      }
+    : {
+        stars: nonNegativeNumber(item.star_count),
+        forks: nonNegativeNumber(item.forks_count),
+        archived: null,
+        fork: null,
+        licenseSpdxId: null,
+        language: null,
+        topics: stringList(item.topics),
+        pushedAt: timestamp(item.last_activity_at),
+        createdAt: timestamp(item.created_at),
+      };
+  const projectId = provider === "gitlab" && (typeof item.id === "number" || typeof item.id === "string") ? String(item.id) : "";
+  if (provider === "gitlab" && !/^\d+$/.test(projectId)) return undefined;
+  const activity = signals.pushedAt;
+  return {
+    provider,
+    fullName,
+    description: nullableText(item.description)?.slice(0, 360) ?? "",
+    defaultBranch,
+    webUrl: `https://${provider === "github" ? "github.com" : "gitlab.com"}/${fullName}`,
+    ...(activity ? { lastActivityAt: activity } : {}),
+    ...(provider === "gitlab" ? { providerProjectId: projectId } : {}),
+    signals,
+  };
+}
+
+export function judgeQuality(signals: RepositoryQualitySignals | undefined, bar: QualityBar, now: Date): QualityJudgment {
+  const reasons: string[] = [];
+  const licenseFromMetadata = typeof signals?.licenseSpdxId === "string" && signals.licenseSpdxId.trim().length > 0;
+  if (!signals) {
+    return { pass: false, reasons: ["search metadata unavailable"], licenseFromMetadata };
+  }
+  if (signals.archived === true) reasons.push("archived");
+  if (signals.fork === true) reasons.push("fork of another repository");
+  if (signals.stars === null) reasons.push("star count unavailable");
+  else if (signals.stars < bar.minStars) reasons.push(`stars ${signals.stars} is below the minimum of ${bar.minStars}`);
+  if (signals.pushedAt === null) reasons.push("activity date unavailable");
+  else {
+    const pushed = Date.parse(signals.pushedAt);
+    const cutoff = addUtcMonths(now, -bar.maxMonthsSincePush).getTime();
+    if (!Number.isFinite(pushed) || pushed < cutoff) reasons.push(`no push since ${new Date(cutoff).toISOString().slice(0, 10)}, older than ${bar.maxMonthsSincePush} months`);
+  }
+  if (signals.createdAt === null) {
+    reasons.push("age unknown");
+  } else {
+    const created = Date.parse(signals.createdAt);
+    const ageDays = (now.getTime() - created) / 86_400_000;
+    if (!Number.isFinite(created) || ageDays < bar.minAgeDays) reasons.push(`created ${signals.createdAt.slice(0, 10)}, younger than ${bar.minAgeDays} days`);
+  }
+  return { pass: reasons.every((reason) => reason === "age unknown"), reasons, licenseFromMetadata };
+}
+
+export function judgeTree(snapshot: RepositorySnapshot, bar: QualityBar, licenseFromMetadata: boolean): TreeJudgment {
+  const testFileCount = snapshot.files.filter((file) => isTestPath(file.path)).length;
+  const licensePath = snapshot.files.find((file) => isRootLicensePath(file.path))?.path ?? null;
+  const reasons: string[] = [];
+  if (bar.requireTests && testFileCount === 0) reasons.push(`no test file at ${snapshot.commitSha}`);
+  if (bar.requireLicense && !licenseFromMetadata && !licensePath) {
+    const location = snapshot.treeTruncated ? `the readable part of the truncated tree at ${snapshot.commitSha}` : `the tree at ${snapshot.commitSha}`;
+    const provider = snapshot.candidate.provider === "gitlab" ? "GitLab search metadata has no license field" : "GitHub reported no license";
+    reasons.push(`no license: ${provider} and ${location} has no root LICENSE, LICENCE, UNLICENSE or COPYING file`);
+  }
+  return { testFileCount, licensePath, reasons };
+}
+
+export function orderCandidates(candidates: RepositoryCandidate[], material: DomainMaterial): RepositoryCandidate[] {
+  const words = material.phrases.flatMap((phrase) => phrase.split(" ")).filter(Boolean);
+  const score = (candidate: RepositoryCandidate): number => {
+    const text = `${candidate.fullName} ${candidate.description} ${candidate.signals?.topics.join(" ") ?? ""}`.normalize("NFKC").toLowerCase();
+    return words.reduce((count, word) => count + Number(text.includes(word)), 0);
+  };
+  return [...candidates].sort((left, right) => score(right) - score(left)
+    || (right.signals?.stars ?? -1) - (left.signals?.stars ?? -1)
+    || left.fullName.localeCompare(right.fullName));
+}
+
+function sanitizePhrase(value: string): string {
+  const trimmed = value.normalize("NFKC").trim().toLowerCase();
+  const words = trimmed
+    .replace(/[^\p{L}\p{N} -]/gu, "")
+    .split(/\s+/)
+    .map((word) => word.replace(/^-+/, ""))
+    .filter(Boolean);
+  return words.slice(0, 3).join(" ").slice(0, 40).trim();
+}
+
+function dateMonthsBefore(now: Date, months: number): string {
+  return addUtcMonths(now, -months).toISOString().slice(0, 10);
+}
+
+function addUtcMonths(date: Date, delta: number): Date {
+  const result = new Date(date);
+  const day = result.getUTCDate();
+  result.setUTCDate(1);
+  result.setUTCMonth(result.getUTCMonth() + delta);
+  const finalDay = new Date(Date.UTC(result.getUTCFullYear(), result.getUTCMonth() + 1, 0)).getUTCDate();
+  result.setUTCDate(Math.min(day, finalDay));
+  return result;
+}
+
+function licenseId(value: unknown): string | null {
+  if (!isRecord(value) || typeof value.spdx_id !== "string" || !value.spdx_id.trim()) return null;
+  return value.spdx_id.trim();
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string").map((entry) => entry.slice(0, 100)).slice(0, 100) : [];
+}
+
+function nullableText(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function text(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function nonNegativeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function booleanOrNull(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function timestamp(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+function isRepositoryName(value: string): boolean {
+  return /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

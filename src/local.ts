@@ -15,6 +15,36 @@ const SKIP_DIRECTORIES = new Set([
 const SECRET_FILE = /^(?:id_rsa|id_ed25519|credentials?(?:[.-].*)?|secrets?(?:[.-].*)?)$|\.(?:pem|key|p12|pfx|crt|cer|der|jks|keystore)$/i;
 const TEXT_FILE = /\.(c|cc|cpp|cs|css|csv|go|h|hpp|html?|java|js|jsx|json|kt|md|mjs|php|py|rb|rs|scss|sh|sql|swift|toml|ts|tsx|txt|vue|xml|yaml|yml|zig)$/i;
 
+export type LocalReadReason = "unsafe_path" | "escaped_path" | "size_limit" | "invalid_utf8" | "secret_content";
+
+const LOCAL_READ_REASONS = new WeakMap<object, LocalReadReason>();
+
+const LOCAL_READ_ERROR_MESSAGES: Record<LocalReadReason, string> = {
+  unsafe_path: "The selected local path is not allowed.",
+  escaped_path: "The selected local path escaped the project directory.",
+  size_limit: "source exceeded the 256 KB local-file limit",
+  invalid_utf8: "the content is not valid UTF-8 text",
+  secret_content: "source was excluded by the local secret-content filter",
+};
+
+export function localReadFailureText(error: unknown): string | undefined {
+  const reason = LOCAL_READ_REASONS.get(error as object);
+  if (reason === undefined) return undefined;
+  if (typeof reason !== "string" || !Object.hasOwn(LOCAL_READ_ERROR_MESSAGES, reason)) return undefined;
+  return LOCAL_READ_ERROR_MESSAGES[reason as LocalReadReason];
+}
+
+export class LocalReadError extends Error {
+  readonly reason: LocalReadReason;
+
+  constructor(reason: LocalReadReason) {
+    super(LOCAL_READ_ERROR_MESSAGES[reason]);
+    this.name = "LocalReadError";
+    this.reason = reason;
+    LOCAL_READ_REASONS.set(this, reason);
+  }
+}
+
 export async function scanLocalTree(rootPath: string, options: { maxFiles?: number } = {}): Promise<LocalIndex> {
   const root = path.resolve(rootPath);
   const limit = options.maxFiles ?? 480;
@@ -66,14 +96,19 @@ export async function scanLocalTree(rootPath: string, options: { maxFiles?: numb
 }
 
 export async function readLocalSource(root: string, file: TreeFile): Promise<Uint8Array> {
-  if (!isSafeLocalFile(file.path)) throw new Error("The selected local path is not allowed.");
+  if (!isSafeLocalFile(file.path)) throw new LocalReadError("unsafe_path");
   const absolute = path.resolve(root, file.path);
   const relative = path.relative(root, absolute);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("The selected local path escaped the project directory.");
+  if (relative.startsWith("..") || path.isAbsolute(relative)) throw new LocalReadError("escaped_path");
   const bytes = await readFile(absolute);
-  if (bytes.byteLength > 256_000) throw new Error("source exceeded the 256 KB local-file limit");
-  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  if (containsLikelySecret(text)) throw new Error("source was excluded by the local secret-content filter");
+  if (bytes.byteLength > 256_000) throw new LocalReadError("size_limit");
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new LocalReadError("invalid_utf8");
+  }
+  if (containsLikelySecret(text)) throw new LocalReadError("secret_content");
   return bytes;
 }
 

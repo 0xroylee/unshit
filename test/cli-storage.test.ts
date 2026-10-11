@@ -6,7 +6,7 @@ import { formatJsonlResult, parseCliArguments, readAnswerFile } from "../src/cli
 import { sourceLocation } from "../src/evidence.ts";
 import { parseIntake, stableMaterialQuestionId } from "../src/model-schema.ts";
 import { writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts } from "../src/storage.ts";
-import type { EvidenceSource, PlanDocument, RunOutcome } from "../src/types.ts";
+import type { EvidenceSource, PlanDocument, ResearchSummary, RunOutcome } from "../src/types.ts";
 
 const brief = parseIntake({
   summary: "Build a small API.",
@@ -59,6 +59,56 @@ describe("answers and script output", () => {
       expect(JSON.parse(lines[0]!).type).toBe("result");
     }
   });
+
+  test("serializes the initial brief and repository research in the JSON result", () => {
+    const initialBrief = { ...brief, summary: "Before material answers." };
+    const research: ResearchSummary = {
+      queries: [],
+      searchRequests: { github: 1, gitlab: 0, budget: 9 },
+      treeResolutions: 1,
+      qualityBar: { minStars: 20, maxMonthsSincePush: 36, minAgeDays: 180, requireTests: true, requireLicense: true },
+      matched: 2,
+      passedMetadataBar: 1,
+      shortlisted: 1,
+      excluded: 1,
+      rateLimited: false,
+      trustworthyReferenceFound: true,
+    };
+    const outcome: RunOutcome = {
+      status: "completed",
+      readiness: "draft",
+      brief,
+      initialBrief,
+      research,
+      resolvedAnswers: [],
+      plan: {
+        title: "Ticketing plan",
+        summary: "Build a ticketing service.",
+        requirements: brief.requirements,
+        tasks: [],
+        decisions: [],
+        design: {
+          architecture: "Draft.",
+          modules: [],
+          dataModel: { entities: [], notApplicableReason: "Draft." },
+          invariants: { items: [], notApplicableReason: "Draft." },
+          accessControl: { boundaries: [], notApplicableReason: "Draft." },
+        },
+        repositoryChoices: [],
+        referenceComparisons: [],
+        risks: [],
+        readiness: "draft",
+        readinessNotes: [],
+      },
+      sources: [],
+      gaps: [],
+      reviews: [],
+      validationIssues: [],
+      validationHistory: [],
+    };
+    const record = JSON.parse(formatJsonlResult(outcome)) as { result: RunOutcome };
+    expect(record.result).toMatchObject({ initialBrief: { summary: "Before material answers." }, research: { matched: 2 } });
+  });
 });
 
 describe("partial evidence persistence", () => {
@@ -98,8 +148,23 @@ describe("partial evidence persistence", () => {
     };
     try {
       const resolvedAnswers = [{ questionId: "Q-123456abcdef", question: "Who can approve a refund?", whyMaterial: "This establishes access rules.", answer: "Only named refund managers." }];
+      const initialBrief = { ...brief, summary: "Initial API brief." };
+      const research: ResearchSummary = {
+        queries: [],
+        searchRequests: { github: 0, gitlab: 0, budget: 9 },
+        treeResolutions: 0,
+        qualityBar: { minStars: 20, maxMonthsSincePush: 36, minAgeDays: 180, requireTests: true, requireLicense: true },
+        matched: 0,
+        passedMetadataBar: 0,
+        shortlisted: 0,
+        excluded: 0,
+        rateLimited: false,
+        trustworthyReferenceFound: false,
+      };
       const input = {
         brief,
+        initialBrief,
+        research,
         resolvedAnswers,
         plan,
         sources: [{ id: "S1", kind: "local" as const, path: "src/app.ts", location: "src/app.ts", snapshotPath: source.snapshotPath, sha256, lineCount: 1, byteCount: bytes.byteLength, roles: ["production" as const], excerpts: [] }],
@@ -119,6 +184,8 @@ describe("partial evidence persistence", () => {
       const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, any>;
       expect(manifest.checkpointStage).toBe("interrupted");
       expect(manifest.plan.title).toBe("Saved draft plan");
+      expect(manifest.initialBrief).toEqual(initialBrief);
+      expect(manifest.research).toEqual(research);
       expect(manifest.resolvedAnswers).toEqual(resolvedAnswers);
       expect(manifest.referencePolicySha256).toMatch(/^[a-f0-9]{64}$/);
       expect(await readFile(path.join(path.dirname(manifestPath), source.snapshotPath), "utf8")).toBe("export const version = 1;\n");
@@ -127,6 +194,8 @@ describe("partial evidence persistence", () => {
       const finalManifest = JSON.parse(await readFile(artifacts.manifestPath, "utf8")) as Record<string, any>;
       const savedReport = await readFile(artifacts.reportPath, "utf8");
       expect(finalManifest.resolvedAnswers).toEqual(resolvedAnswers);
+      expect(finalManifest.initialBrief).toEqual(initialBrief);
+      expect(finalManifest.research).toEqual(research);
       expect(savedReport).toContain("Who can approve a refund?");
       expect(savedReport).toContain("Only named refund managers.");
     } finally {
