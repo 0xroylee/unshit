@@ -11,6 +11,7 @@ import { isRootLicensePath, isTestPath } from "./file-ranking.ts";
 export interface DomainMaterial {
   phrases: string[];
   topics: string[];
+  codePatterns?: string[];
 }
 
 export interface SearchTier {
@@ -44,6 +45,8 @@ export const DEFAULT_QUALITY_BAR: QualityBar = {
   requireLicense: true,
 };
 
+const CODE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{2,39}$/;
+
 const DEFAULT_SEARCH_TIERS: SearchTier[] = [
   { tier: 0, minStars: 200, maxMonthsSincePush: 12 },
   { tier: 1, minStars: 50, maxMonthsSincePush: 24 },
@@ -74,7 +77,17 @@ export function domainMaterialFromBrief(brief: IntakeBrief): DomainMaterial {
     topics.push(topic);
     if (topics.length === 1) break;
   }
-  return { phrases, topics };
+  const codePatterns: string[] = [];
+  const seenPatterns = new Set<string>();
+  for (const raw of brief.codePatterns ?? []) {
+    const pattern = raw.normalize("NFKC").trim();
+    const key = pattern.toLowerCase();
+    if (!CODE_PATTERN.test(pattern) || seenPatterns.has(key)) continue;
+    seenPatterns.add(key);
+    codePatterns.push(pattern);
+    if (codePatterns.length === 4) break;
+  }
+  return { phrases, topics, ...(codePatterns.length > 0 ? { codePatterns } : {}) };
 }
 
 export function planSearches(material: DomainMaterial, now: Date, tiers: SearchTier[] = DEFAULT_SEARCH_TIERS): SearchPlan {
@@ -176,7 +189,8 @@ export function orderCandidates(candidates: RepositoryCandidate[], material: Dom
   const words = material.phrases.flatMap((phrase) => phrase.split(" ")).filter(Boolean);
   const score = (candidate: RepositoryCandidate): number => {
     const text = `${candidate.fullName} ${candidate.description} ${candidate.signals?.topics.join(" ") ?? ""}`.normalize("NFKC").toLowerCase();
-    return words.reduce((count, word) => count + Number(text.includes(word)), 0);
+    const termMatches = words.reduce((count, word) => count + Number(text.includes(word)), 0);
+    return termMatches + new Set((candidate.codeMatches ?? []).map((match) => match.pattern)).size;
   };
   return [...candidates].sort((left, right) => score(right) - score(left)
     || (right.signals?.stars ?? -1) - (left.signals?.stars ?? -1)

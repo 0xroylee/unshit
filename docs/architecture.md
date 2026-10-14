@@ -20,7 +20,8 @@ turn / interrupt                                  v
 | [cli.ts](../src/cli.ts) | 参数、终端澄清、ASCII 进度、JSON/JSONL 和退出码 |
 | [workflow.ts](../src/workflow.ts) | 需求门槛、答复后的 brief 重建、候选筛选与选择、读取、计划生成、独立复核与有界修正 |
 | [app-server.ts](../src/app-server.ts) | 原生双向 RPC、活动回合关联、最终文本、取消和进程清理 |
-| [github.ts](../src/github.ts) | host-built GitHub 查询、质量门槛、固定提交树验证与 GitLab 官方 API 回退 |
+| [github.ts](../src/github.ts) | host-built GitHub 查询、Grep 代码搜索、质量门槛、固定提交树验证与 GitLab 官方 API 回退 |
+| [code-search.ts](../src/code-search.ts) | Grep 请求体、响应解析、按仓库聚合命中、批量 GitHub 元数据查询条件 |
 | [local.ts](../src/local.ts) | 本地文件基线、排除规则、凭证内容过滤、已存在脚本依据 |
 | [repository-screening.ts](../src/repository-screening.ts) | 领域查询材料清理、查询计划、候选信号解析、元数据与树质量判断 |
 | [file-ranking.ts](../src/file-ranking.ts) | 需求词加权、测试与实现文件配额、文本路径和根许可证路径判断 |
@@ -43,6 +44,8 @@ Codex 管理认证与会话。CLI 在内存中关联 RPC 和当前回合；应�
 公开仓库搜索由 host 使用 intake 的 `domainTerms` 和 `topicSlugs` 构建三档查询；模型不能直接编写 GitHub 查询语法。GitHub 与 GitLab 返回的星数、fork、归档、许可证、语言、topic 和日期信号写入研究摘要。host 先应用星数、推送日期、创建年龄、归档与 fork 门槛，再读取固定提交的树，确认存在测试文件；若搜索元数据没有 SPDX 许可证，则要求树中有根目录许可证文件。树检查通过后才交给模型选择，筛选原因和未发送查询也保存在 manifest 中。
 
 GitHub 树响应上限为 8 MB，源码响应仍为 1 MB。文件树不再按字母顺序裁剪；GitHub 的 `treeTruncated` 使用提供方返回的截断标志。GitLab 树最多读取 25 页、每页 100 项；若 host 达到页数上限且仍有下一页，也会将该树标为截断。`file-ranking.ts` 被文件候选展示和自动证据挑选共享：它按 brief 与答复的领域词打分，并为测试、实现文件分别保留配额。
+
+代码搜索同样由 host 执行，模型线程的 MCP 仍全部关闭。host 向 `https://mcp.grep.app` 发送 JSON-RPC `tools/call`，调用 `searchGitHub`，请求不带任何凭证。该服务无会话，响应为 SSE；每次最多 10 条结果，链接指向分支而不是提交，也没有星数和日期。发现阶段最多搜 3 个 pattern，按命中的不同 pattern 数排序，忽略示例和文档路径，最多把 4 个新仓库合并为一次 `repo:` GitHub 搜索，再交给 `collectEntries` 的同一门槛。树验证通过后，每个仓库最多再搜 2 个发现阶段未命中的 pattern。`repo` 参数是部分匹配，所以 host 只保留仓库名完全一致、且路径存在于固定提交树的命中，写入 `RepositorySnapshot.codeMatches`。文件挑选和证据读取优先使用这些文件，摘录窗口对准 pattern 所在行。查询记录写入 `research.codeSearch`，随 manifest 保存。`research.md` 没有修改，规则包摘要不变。
 
 ## 功能与固定源码依据
 

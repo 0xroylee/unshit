@@ -31,7 +31,7 @@ function localIndex(): LocalIndex {
   return { root: "/tmp/unshit-empty-target", files: [], gaps: [] };
 }
 
-function researcher(options: { failPaths?: Set<string>; failures?: Map<string, unknown> } = {}): { fake: GitHubResearcher; fetched: string[] } {
+function researcher(options: { failPaths?: Set<string>; failures?: Map<string, unknown>; content?: Map<string, string> } = {}): { fake: GitHubResearcher; fetched: string[] } {
   const fetched: string[] = [];
   const fake = {
     fetchSource: async (_repo: RepositorySnapshot, filePath: string, signal?: AbortSignal) => {
@@ -39,7 +39,7 @@ function researcher(options: { failPaths?: Set<string>; failures?: Map<string, u
       fetched.push(filePath);
       if (options.failures?.has(filePath)) throw options.failures.get(filePath);
       if (options.failPaths?.has(filePath)) throw new Error("fixture outage");
-      const content = new Map([
+      const content = options.content?.get(filePath) ?? new Map([
         ["src/index.ts", "export function makeRefund() { return { status: 'pending' }; }\n"],
         ["tests/index.test.ts", "import { test, expect } from 'vitest';\ntest('records a refund', () => expect(true).toBe(true));\n"],
         ["package.json", "{\n  \"scripts\": {\n    \"test\": \"vitest run\"\n  }\n}\n"],
@@ -290,5 +290,230 @@ describe("bounded source evidence", () => {
     expect(fetched).not.toContain("NOTICE");
     expect(evidence.sources.find((source) => source.path === "src/ticket.ts")?.roles).toContain("production");
     expect(evidence.sources.find((source) => source.path === "tests/ticket.test.ts")?.roles).toContain("test");
+  });
+
+  test("prefers code-matched production and test files over the path ranking", async () => {
+    const paths = ["src/aaa-ticket.ts", "src/refund_service.ts", "tests/aaa-ticket.test.ts", "tests/refund.test.ts", "LICENSE", "package.json"];
+    const files: TreeFile[] = paths.map((filePath, index) => ({ id: `C1M${index + 1}`, path: filePath, size: 20 }));
+    const repo: RepositorySnapshot = {
+      ...repository(),
+      files,
+      codeMatches: [
+        { fileId: "C1M2", path: "src/refund_service.ts", patterns: ["refund_amount"] },
+        { fileId: "C1M4", path: "tests/refund.test.ts", patterns: ["RefundStatus"] },
+      ],
+    };
+    const { fake, fetched } = researcher();
+    const evidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [repo],
+      modelSelection: [],
+      github: fake,
+      relevantText: "ticket purchase",
+      domainTerms: [{ term: "ticket", weight: 3 }],
+    });
+    expect(fetched).toContain("src/refund_service.ts");
+    expect(fetched).toContain("tests/refund.test.ts");
+    expect(fetched).not.toContain("src/aaa-ticket.ts");
+    expect(fetched).not.toContain("tests/aaa-ticket.test.ts");
+    expect(evidence.sources.find((source) => source.path === "src/refund_service.ts")?.roles).toContain("production");
+  });
+
+  test("centers the second excerpt on the line that contains a code-search pattern", async () => {
+    const lines = Array.from({ length: 300 }, (_, index) => `const filler${index} = ${index};`);
+    lines[199] = "class OrderRefund { approve() { return true; } }";
+    const repo: RepositorySnapshot = {
+      ...repository(),
+      codeMatches: [{ fileId: "C1F1", path: "src/index.ts", patterns: ["OrderRefund"] }],
+    };
+    const { fake } = researcher({ content: new Map([["src/index.ts", `${lines.join("\n")}\n`]]) });
+    const evidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [repo],
+      modelSelection: [{ fileId: "C1F1", role: "production", rationale: "entry point" }],
+      github: fake,
+      relevantText: "unrelated words only",
+    });
+    const source = evidence.sources.find((entry) => entry.path === "src/index.ts")!;
+    const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
+    expect(ranges.some((range) => range.startLine <= 200 && range.endLine >= 200)).toBe(true);
+  });
+
+  test("keeps the model's production pick ahead of a code match", async () => {
+    const paths = ["src/chosen.ts", "src/matched.ts", "tests/index.test.ts", "LICENSE", "package.json"];
+    const files: TreeFile[] = paths.map((filePath, index) => ({ id: `C1P${index + 1}`, path: filePath, size: 20 }));
+    const repo: RepositorySnapshot = {
+      ...repository(),
+      files,
+      codeMatches: [{ fileId: "C1P2", path: "src/matched.ts", patterns: ["OrderRefund"] }],
+    };
+    const { fake, fetched } = researcher();
+    const evidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [repo],
+      modelSelection: [{ fileId: "C1P1", role: "production", rationale: "The model picked this handler." }],
+      github: fake,
+      relevantText: "refund",
+    });
+    expect(evidence.sources.find((source) => source.path === "src/chosen.ts")?.roles).toContain("production");
+    expect(fetched).not.toContain("src/matched.ts");
+  });
+
+  test("keeps the model's test pick ahead of a code match", async () => {
+    const paths = ["src/index.ts", "tests/model-picked.test.ts", "tests/code-matched.test.ts", "LICENSE", "package.json"];
+    const files: TreeFile[] = paths.map((filePath, index) => ({ id: `C1TP${index + 1}`, path: filePath, size: 20 }));
+    const repo: RepositorySnapshot = {
+      ...repository(),
+      files,
+      codeMatches: [{ fileId: "C1TP3", path: "tests/code-matched.test.ts", patterns: ["OrderRefund"] }],
+    };
+    const { fake, fetched } = researcher();
+
+    const evidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [repo],
+      modelSelection: [{ fileId: "C1TP2", role: "test", rationale: "The model picked this important scenario." }],
+      github: fake,
+      relevantText: "refund",
+    });
+
+    expect(evidence.sources.find((source) => source.path === "tests/model-picked.test.ts")?.roles).toContain("test");
+    expect(fetched).toContain("tests/model-picked.test.ts");
+    expect(fetched).not.toContain("tests/code-matched.test.ts");
+  });
+
+  test("keeps two 90-line windows and the total excerpt budget around an anchor", async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    lines[299] = "export class OrderRefund { approve() { return true; } }";
+    const repo: RepositorySnapshot = {
+      ...repository(),
+      codeMatches: [{ fileId: "C1F1", path: "src/index.ts", patterns: ["OrderRefund"] }],
+    };
+    const { fake } = researcher({ content: new Map([["src/index.ts", `${lines.join("\n")}\n`]]) });
+    const evidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [repo],
+      modelSelection: [{ fileId: "C1F1", role: "production", rationale: "entry point" }],
+      github: fake,
+      relevantText: "unrelated words only",
+    });
+    const source = evidence.sources.find((entry) => entry.path === "src/index.ts")!;
+    const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
+
+    expect(ranges.map((range) => [range.startLine, range.endLine])).toEqual([[1, 90], [270, 359]]);
+    expect(ranges.filter((range) => range.startLine <= 300 && range.endLine >= 300)).toHaveLength(1);
+
+    const sourcePaths = Array.from({ length: 19 }, (_, index) => `src/anchor-${index}.ts`);
+    const budgetFiles: TreeFile[] = [
+      ...sourcePaths.map((filePath, index) => ({ id: `C1B${index + 1}`, path: filePath, size: 70_000 })),
+      { id: "C1BT", path: "tests/anchor.test.ts", size: 70_000 },
+      { id: "C1BM", path: "package.json", size: 20 },
+      { id: "C1BL", path: "LICENSE", size: 20 },
+      { id: "C1BC", path: ".github/workflows/check.yml", size: 20 },
+      { id: "C1BG", path: "vitest.config.ts", size: 20 },
+    ];
+    const budgetRepo: RepositorySnapshot = {
+      ...repository(),
+      files: budgetFiles,
+      codeMatches: [
+        ...sourcePaths.map((filePath, index) => ({ fileId: `C1B${index + 1}`, path: filePath, patterns: ["AnchorToken"] })),
+        { fileId: "C1BT", path: "tests/anchor.test.ts", patterns: ["AnchorToken"] },
+      ],
+    };
+    const largeContent = (index: number): string => {
+      const longLines = Array.from({ length: 300 }, (_, line) => `const filler${line} = ${"x".repeat(180)};`);
+      longLines[199] = `export const AnchorToken${index} = "${"x".repeat(180)}";`;
+      return `${longLines.join("\n")}\n`;
+    };
+    const budgetContent = new Map<string, string>(sourcePaths.map((filePath, index) => [filePath, largeContent(index)]));
+    budgetContent.set("tests/anchor.test.ts", largeContent(19));
+    const budgetReader = researcher({ content: budgetContent });
+    const modelSelection = [
+      ...sourcePaths.map((filePath, index) => ({ fileId: `C1B${index + 1}`, role: "production" as const, rationale: `Selected source ${index}.` })),
+      { fileId: "C1BT", role: "test" as const, rationale: "Selected code-matched test." },
+    ];
+    const budgetEvidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [budgetRepo],
+      modelSelection,
+      github: budgetReader.fake,
+      relevantText: "unrelated words only",
+    });
+    const excerptCharacters = budgetEvidence.excerpts.reduce((sum, excerpt) => sum + excerpt.text.length, 0);
+
+    expect(budgetReader.fetched).toHaveLength(24);
+    expect(excerptCharacters).toBeLessThanOrEqual(260_000);
+  });
+
+  test("centers the second excerpt on a definition line rather than an earlier mention", async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    lines[119] = "import { OrderRefund } from './models';";
+    lines[299] = "export class OrderRefund { approve() { return true; } }";
+    const repo: RepositorySnapshot = {
+      ...repository(),
+      codeMatches: [{ fileId: "C1F1", path: "src/index.ts", patterns: ["OrderRefund"] }],
+    };
+    const { fake } = researcher({ content: new Map([["src/index.ts", `${lines.join("\n")}\n`]]) });
+    const evidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [repo],
+      modelSelection: [{ fileId: "C1F1", role: "production", rationale: "entry point" }],
+      github: fake,
+      relevantText: "unrelated words only",
+    });
+    const source = evidence.sources.find((entry) => entry.path === "src/index.ts")!;
+    const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
+    expect(ranges.some((range) => range.startLine <= 300 && range.endLine >= 300)).toBe(true);
+    expect(ranges.some((range) => range.startLine <= 120 && range.endLine >= 120)).toBe(false);
+  });
+
+  test("uses code-search anchors only for the matched file", async () => {
+    const lines = Array.from({ length: 300 }, (_, index) => `const filler${index} = ${index};`);
+    lines[199] = "class OrderRefund { approve() { return true; } }";
+    const repo: RepositorySnapshot = {
+      ...repository(),
+      codeMatches: [{ fileId: "C1F2", path: "tests/index.test.ts", patterns: ["OrderRefund"] }],
+    };
+    const { fake } = researcher({ content: new Map([["src/index.ts", `${lines.join("\n")}\n`]]) });
+    const evidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [repo],
+      modelSelection: [{ fileId: "C1F1", role: "production", rationale: "entry point" }],
+      github: fake,
+      relevantText: "unrelated words only",
+    });
+    const source = evidence.sources.find((entry) => entry.path === "src/index.ts")!;
+    const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
+    expect(ranges.some((range) => range.startLine <= 200 && range.endLine >= 200)).toBe(false);
+  });
+
+  test("does not give remote anchors to local files", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "unshit-local-anchor-"));
+    try {
+      await mkdir(path.join(root, "src"), { recursive: true });
+      const lines = Array.from({ length: 300 }, (_, index) => `const localFiller${index} = ${index};`);
+      lines[199] = "export class OrderRefund { approve() { return true; } }";
+      await writeFile(path.join(root, "src", "local.ts"), `${lines.join("\n")}\n`);
+      const localFile: TreeFile = { id: "L-anchor", path: "src/local.ts", size: 100 };
+      const local: LocalIndex = { root, files: [localFile], gaps: [] };
+      const repo: RepositorySnapshot = {
+        ...repository(),
+        codeMatches: [{ fileId: "C1F2", path: "tests/index.test.ts", patterns: ["OrderRefund"] }],
+      };
+      const evidence = await loadSelectedEvidence({
+        local,
+        repositories: [repo],
+        modelSelection: [{ fileId: localFile.id, role: "production", rationale: "Local entry point." }],
+        github: researcher().fake,
+        relevantText: "unrelated words only",
+      });
+      const source = evidence.sources.find((entry) => entry.path === "src/local.ts")!;
+      const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
+
+      expect(source.kind).toBe("local");
+      expect(ranges.some((range) => range.startLine <= 200 && range.endLine >= 200)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

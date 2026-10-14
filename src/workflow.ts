@@ -3,7 +3,8 @@ import { referencePlanPrompt, type ReferencePlanPhase } from "./instructions.ts"
 import { GitHubResearcher } from "./github.ts";
 import { scanLocalTree, extractExistingCommands } from "./local.ts";
 import { domainMaterialFromBrief } from "./repository-screening.ts";
-import { domainTermsFor, isTestPath, pathRoleHint, rankTreeFiles } from "./file-ranking.ts";
+import { domainTermsFor, isTestPath, isTextSourcePath, pathRoleHint, rankTreeFiles } from "./file-ranking.ts";
+import { mergeCodeSearchSummaries } from "./code-search.ts";
 import {
   FILE_SELECTION_SCHEMA,
   INTAKE_SCHEMA,
@@ -27,12 +28,14 @@ import {
 import { excerptPromptData, finalSources, loadSelectedEvidence } from "./evidence.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import type {
+  CodeMatch,
   IntakeBrief,
   MaterialQuestion,
   PlanDocument,
   ProgressEvent,
   RepositoryChoice,
   RepositoryCandidate,
+  RepositorySnapshot,
   ResearchGap,
   ReviewResult,
   RunOutcome,
@@ -223,8 +226,10 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       discovery.candidates,
       options.signal,
       (message) => progress({ stage: "repository_trees", state: "completed", message }),
+      domainMaterial.codePatterns ?? [],
     );
     gaps.push(...treeResolution.gaps);
+    if (treeResolution.codeSearch) research.codeSearch = mergeCodeSearchSummaries(research.codeSearch, treeResolution.codeSearch);
     research.rateLimited = research.rateLimited || treeResolution.rateLimited;
     research.treeResolutions = treeResolution.resolutions;
     research.shortlisted = treeResolution.snapshots.length;
@@ -254,6 +259,8 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         commitDate: snapshot.commitDate ?? null,
         treeFileCount: snapshot.files.length,
         testFileCount: snapshot.testFileCount ?? 0,
+        codeMatchedFiles: snapshot.codeMatches?.length ?? 0,
+        codePatterns: [...new Set((snapshot.codeMatches ?? []).flatMap((match) => match.patterns))],
       }));
       const selectionValue = await modelJson(
         planningSession,
@@ -561,7 +568,7 @@ function intakePrompt(requirement: string): string {
   return [
     "Extract a bounded software brief from the user's requirement.",
     "Identify only unresolved business decisions that can change users, permissions, workflows, scope, or acceptance. Do not ask technical questions whose answers can be discovered from source later.",
-    "If a question is material, state why. Suggest up to three short public repository search queries, but do not search. Supply 1–6 English domainTerms of one to three words for repository and file matching, and 0–4 lowercase GitHub topicSlugs. The host will sanitize the material and build all provider queries. The host will not perform any source search until all material questions have answers.",
+    "If a question is material, state why. Suggest up to three short public repository search queries, but do not search. Supply 1–6 English domainTerms of one to three words for repository and file matching, and 0–4 lowercase GitHub topicSlugs. Supply 1–4 codePatterns: identifiers or lowercase words that source files implementing the core workflow would literally contain, such as OrderRefund, refund_amount, or checkin. Use only letters, digits, and underscores, and put the most distinctive pattern first. The host will sanitize the material and build all provider queries. The host will not perform any source search until all material questions have answers.",
     "Return only the requested JSON. Host assigns stable requirement, acceptance, and question IDs.",
     "USER REQUIREMENT:",
     requirement,
@@ -571,7 +578,7 @@ function intakePrompt(requirement: string): string {
 function refineBriefPrompt(requirement: string, initial: IntakeBrief, answers: ResolvedAnswer[]): string {
   return [
     "Rebuild the software brief with every confirmed answer below treated as a binding decision.",
-    "Rewrite the summary, requirements, acceptance criteria, out-of-scope items, assumptions, domainTerms, topicSlugs, and researchQueries to reflect those decisions. The question round is closed: return an empty materialQuestions array. If an answer leaves a decision open, record the remaining choice as an assumption. Host assigns requirement and acceptance IDs.",
+    "Rewrite the summary, requirements, acceptance criteria, out-of-scope items, assumptions, domainTerms, topicSlugs, codePatterns, and researchQueries to reflect those decisions. The question round is closed: return an empty materialQuestions array. If an answer leaves a decision open, record the remaining choice as an assumption. Host assigns requirement and acceptance IDs.",
     "Return only the requested JSON.",
     "USER REQUIREMENT:",
     requirement,
@@ -583,6 +590,7 @@ function refineBriefPrompt(requirement: string, initial: IntakeBrief, answers: R
       assumptions: initial.assumptions,
       domainTerms: initial.domainTerms,
       topicSlugs: initial.topicSlugs,
+      codePatterns: initial.codePatterns ?? [],
       researchQueries: initial.researchQueries,
     }),
     "CONFIRMED ANSWERS:",
@@ -598,6 +606,7 @@ function repositorySelectionPrompt(
   return [
     "Select zero to three public repository comparators from the host-verified shortlist.",
     "The host already applied the quality bar (license, stars, activity, age, not archived, not fork) and verified each pinned tree for tests and license evidence. Treat supplied metadata and tree counts as host-verified signals. Use the exact candidate IDs. For each selected repository, state the concrete fit that justifies deep inspection. For every unselected candidate, state why it is not a useful comparator. Do not invent a repository, URL, source path, commit, or maintenance claim. Language differences are acceptable when the patterns transfer.",
+    "codeMatchedFiles counts pinned-tree files where the host's literal code search found the brief's code patterns, and codePatterns lists those patterns. Use them as relevance hints, not as evidence.",
     "Return only the requested JSON.",
     "CLARIFIED BRIEF:",
     JSON.stringify({ summary: brief.summary, requirements: brief.requirements, outOfScope: brief.outOfScope, assumptions: brief.assumptions, answers }),
@@ -606,12 +615,19 @@ function repositorySelectionPrompt(
   ].join("\n\n");
 }
 
-function candidateFiles(localFiles: TreeFile[], snapshots: Array<{ candidate: { id: string; provider: string; fullName: string; lastActivityAt?: string }; commitSha: string; commitDate?: string; treeTruncated: boolean; files: TreeFile[] }>, terms: ReturnType<typeof domainTermsFor>): Array<Record<string, unknown>> {
+function candidateFiles(localFiles: TreeFile[], snapshots: RepositorySnapshot[], terms: ReturnType<typeof domainTermsFor>): Array<Record<string, unknown>> {
   const result: Array<Record<string, unknown>> = [];
   for (const file of rankTreeFiles(localFiles, terms, 300)) result.push({ fileId: file.id, path: file.path, size: file.size, source: "local project", roleHint: pathRoleHint(file.path) });
   for (const snapshot of snapshots) {
-    const files = rankTreeFiles(snapshot.files, terms, 800);
+    const filesById = new Map(snapshot.files.map((file) => [file.id, file]));
+    const patternsById = new Map((snapshot.codeMatches ?? []).map((match) => [match.fileId, match.patterns]));
+    const codeMatched = (snapshot.codeMatches ?? []).flatMap((match) => {
+      const file = filesById.get(match.fileId);
+      return file && isTextSourcePath(file.path) ? [file] : [];
+    });
+    const files = [...new Map([...codeMatched, ...rankTreeFiles(snapshot.files, terms, 800)].map((file) => [file.id, file])).values()].slice(0, 800);
     for (const file of files) {
+      const patterns = patternsById.get(file.id);
       result.push({
         fileId: file.id,
         path: file.path,
@@ -621,6 +637,7 @@ function candidateFiles(localFiles: TreeFile[], snapshots: Array<{ candidate: { 
         commitDate: snapshot.commitDate ?? null,
         lastActivityAt: snapshot.candidate.lastActivityAt ?? null,
         roleHint: pathRoleHint(file.path),
+        ...(patterns ? { codeMatch: patterns.join(", ") } : {}),
       });
     }
   }
@@ -636,6 +653,7 @@ function fileSelectionPrompt(
   return [
     "Choose up to fifteen local or remote production and test files that can answer specific design questions in the brief.",
     "Use only supplied file IDs and choose role production or test. Select relevant implementation and tests. The host separately reads a bounded project manifest, license, and CI file when present. A remote file ID resolves only to the exact SHA shown in the repository tree. Never invent paths or claim to have read files.",
+    "A codeMatch value lists literal patterns that the host's code search found at that path in Grep's index of the default branch. The path exists in the pinned tree, but the file is not evidence until the host reads it at the pinned commit.",
     "Return only the requested JSON.",
     "CLARIFIED BRIEF:",
     JSON.stringify({ summary: brief.summary, requirements: brief.requirements, answers }),
@@ -735,7 +753,7 @@ function reviewRepairPrompt(
 function buildRepositoryChoices(
   candidates: RepositoryCandidate[],
   selection: ReturnType<typeof parseRepositorySelection>,
-  snapshots: Array<{ candidate: RepositoryCandidate; commitSha: string; commitDate?: string; files: TreeFile[]; testFileCount?: number; licensePath?: string }>,
+  snapshots: Array<{ candidate: RepositoryCandidate; commitSha: string; commitDate?: string; files: TreeFile[]; testFileCount?: number; licensePath?: string; codeMatches?: CodeMatch[] }>,
   hostExcluded: Array<{
     candidate: RepositoryCandidate;
     reasons: string[];
@@ -765,6 +783,10 @@ function buildRepositoryChoices(
     const treeFileCount = snapshot ? snapshot.files.length : resolution?.treeFileCount;
     const testFileCount = snapshot ? snapshot.testFileCount ?? 0 : resolution?.testFileCount;
     const licensePath = snapshot?.licensePath ?? resolution?.licensePath;
+    const codePatterns = [...new Set([
+      ...(candidate.codeMatches ?? []).map((match) => match.pattern),
+      ...(snapshot?.codeMatches ?? []).flatMap((match) => match.patterns),
+    ])];
     return {
       candidateId: candidate.id,
       provider: candidate.provider,
@@ -780,6 +802,7 @@ function buildRepositoryChoices(
       ...(treeFileCount !== undefined ? { treeFileCount, testFileCount } : {}),
       ...(licenseEvidence ? { licenseEvidence } : {}),
       ...(licensePath ? { licensePath } : {}),
+      ...(codePatterns.length > 0 ? { codeMatches: codePatterns } : {}),
     };
   });
 }

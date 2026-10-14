@@ -1,4 +1,7 @@
 import type {
+  CodeMatch,
+  CodeSearchQueryRecord,
+  CodeSearchSummary,
   QualityBar,
   RepositoryCandidate,
   RepositorySnapshot,
@@ -18,6 +21,18 @@ import {
   type DomainMaterial,
   type SearchTier,
 } from "./repository-screening.ts";
+import {
+  GREP_ENDPOINT,
+  emptyCodeSearchSummary,
+  grepRequestBody,
+  isGitHubRepositoryName,
+  parseGrepResponse,
+  rankCodeSearchRepositories,
+  repositoryMetadataQuery,
+  type CodeSearchHit,
+  type CodeSearchQuery,
+} from "./code-search.ts";
+import { isDemoPath } from "./file-ranking.ts";
 
 export type FetchFunction = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -44,6 +59,7 @@ export interface ShortlistResolution {
   resolutions: number;
   gaps: Array<{ kind: "tree" | "search"; message: string; material: boolean }>;
   rateLimited: boolean;
+  codeSearch?: CodeSearchSummary;
 }
 
 interface ByteResponse {
@@ -61,6 +77,13 @@ export class GitHubResearcher {
   private readonly minimumPassing: number;
   private readonly shortlistSize: number;
   private readonly maxTreeResolutions: number;
+  private readonly codeSearchEnabled: boolean;
+  private readonly maxCodeSearchRequests: number;
+  private readonly maxCodeSearchCandidates: number;
+  // One researcher serves one run, so these counters hold the run-wide Grep budget.
+  private codeSearchRequests = 0;
+  private codeSearchStopped = false;
+  private nextCodeSearchId = 1;
 
   constructor(
     private readonly options: {
@@ -76,6 +99,9 @@ export class GitHubResearcher {
       minimumPassing?: number;
       shortlistSize?: number;
       maxTreeResolutions?: number;
+      codeSearch?: boolean;
+      maxCodeSearchRequests?: number;
+      maxCodeSearchCandidates?: number;
     } = {},
   ) {
     this.qualityBar = { ...DEFAULT_QUALITY_BAR, ...options.qualityBar };
@@ -86,6 +112,9 @@ export class GitHubResearcher {
     this.minimumPassing = options.minimumPassing ?? 4;
     this.shortlistSize = options.shortlistSize ?? 6;
     this.maxTreeResolutions = options.maxTreeResolutions ?? 8;
+    this.codeSearchEnabled = options.codeSearch ?? false;
+    this.maxCodeSearchRequests = options.maxCodeSearchRequests ?? 12;
+    this.maxCodeSearchCandidates = options.maxCodeSearchCandidates ?? 4;
   }
 
   async discover(
@@ -157,6 +186,11 @@ export class GitHubResearcher {
       }
     }
 
+    const codePatterns = material.codePatterns ?? [];
+    const codeSearch = this.codeSearchEnabled && codePatterns.length > 0 && !signal?.aborted
+      ? await this.discoverByCode(codePatterns, { candidates, excluded, byKey, gaps }, githubRateLimited, signal, onProgress)
+      : undefined;
+
     if (!signal?.aborted && candidates.length === 0 && plan.gitlab.length > 0) {
       for (const phrase of plan.gitlab.slice(0, 2)) {
         if (signal?.aborted) break;
@@ -223,6 +257,7 @@ export class GitHubResearcher {
       excluded: excluded.length,
       rateLimited,
       trustworthyReferenceFound: false,
+      ...(codeSearch ? { codeSearch } : {}),
     };
     return { candidates: result, excluded, gaps, research };
   }
@@ -231,11 +266,13 @@ export class GitHubResearcher {
     candidates: RepositoryCandidate[],
     signal?: AbortSignal,
     onProgress?: (message: string) => void,
+    codePatterns: string[] = [],
   ): Promise<ShortlistResolution> {
     const snapshots: RepositorySnapshot[] = [];
     const excluded: ShortlistResolution["excluded"] = [];
     const gaps: ShortlistResolution["gaps"] = [];
     const attempted = new Set<string>();
+    const location = emptyCodeSearchSummary(this.maxCodeSearchRequests);
     let resolutions = 0;
     let stoppedForRateLimit = false;
     let stoppedForRequestBudget = false;
@@ -276,6 +313,10 @@ export class GitHubResearcher {
         }
         snapshots.push(snapshot);
         onProgress?.(`Verified the commit-pinned tree for ${candidate.fullName} (${tree.testFileCount} test files).`);
+        if (this.codeSearchEnabled && codePatterns.length > 0 && candidate.provider === "github" && !signal?.aborted) {
+          const codeMatches = await this.locateCode(snapshot, codePatterns, location, gaps, signal);
+          if (codeMatches.length > 0) snapshot.codeMatches = codeMatches;
+        }
       } catch (error) {
         if (signal?.aborted) break;
         const failure = requestFailureOf(error, { provider: candidate.provider, endpoint: "tree" });
@@ -320,7 +361,14 @@ export class GitHubResearcher {
             : `Passed the quality bar but was outside the shortlist of ${this.shortlistSize} tree-verified candidates.`],
       });
     }
-    return { snapshots, excluded, resolutions, gaps, rateLimited: stoppedForRateLimit };
+    return {
+      snapshots,
+      excluded,
+      resolutions,
+      gaps,
+      rateLimited: stoppedForRateLimit,
+      ...(location.queries.length > 0 ? { codeSearch: location } : {}),
+    };
   }
 
   async fetchSource(repository: RepositorySnapshot, path: string, signal?: AbortSignal): Promise<Uint8Array> {
@@ -339,6 +387,138 @@ export class GitHubResearcher {
     const url = new URL(`https://gitlab.com/api/v4/projects/${encodeURIComponent(projectId)}/repository/files/${encodeURIComponent(path)}/raw`);
     url.searchParams.set("ref", repository.commitSha);
     return (await this.requestBytes(url, { provider: "gitlab", endpoint: "source" }, signal)).bytes;
+  }
+
+  private async codeSearchQuery(
+    query: CodeSearchQuery,
+    purpose: CodeSearchQueryRecord["purpose"],
+    summary: CodeSearchSummary,
+    gaps: Array<{ kind: "search" | "tree"; message: string; material: boolean }>,
+    signal?: AbortSignal,
+  ): Promise<CodeSearchHit[]> {
+    const record: CodeSearchQueryRecord = {
+      provider: "grep",
+      purpose,
+      query: query.query,
+      ...(query.repo ? { repository: query.repo } : {}),
+      status: "skipped",
+      resultCount: 0,
+    };
+    summary.queries.push(record);
+    if (this.codeSearchStopped || signal?.aborted) return [];
+    const target: RequestTarget = { provider: "grep", endpoint: "search" };
+    try {
+      const response = await this.requestBytes(GREP_ENDPOINT, target, signal, 1_000_000, () => {
+        if (this.codeSearchRequests >= this.maxCodeSearchRequests) return false;
+        this.codeSearchRequests += 1;
+        summary.requests += 1;
+        return true;
+      }, { body: grepRequestBody(this.nextCodeSearchId++, query) });
+      const hits = parseGrepResponse(new TextDecoder().decode(response.bytes), response.headers.get("content-type"));
+      if (!hits) throw new ProviderRequestError({ ...target, category: "invalid_response", attempts: response.attempts, retryRefused: false });
+      record.status = "ok";
+      record.resultCount = hits.length;
+      return hits;
+    } catch (error) {
+      if (signal?.aborted) return [];
+      const failure = requestFailureOf(error, target);
+      if (failure.category === "request_budget") return [];
+      this.codeSearchStopped = true;
+      record.status = failure.category === "rate_limit" ? "rate_limited" : "failed";
+      record.failure = failure;
+      gaps.push({ kind: "search", message: `${describeRequestFailure(failure)}; code search stopped for this run.`, material: false });
+      return [];
+    }
+  }
+
+  private async discoverByCode(
+    patterns: string[],
+    state: {
+      candidates: RepositoryCandidate[];
+      excluded: CandidateDiscovery["excluded"];
+      byKey: Map<string, RepositoryCandidate>;
+      gaps: CandidateDiscovery["gaps"];
+    },
+    githubRateLimited: boolean,
+    signal?: AbortSignal,
+    onProgress?: (message: string) => void,
+  ): Promise<CodeSearchSummary> {
+    const summary = emptyCodeSearchSummary(this.maxCodeSearchRequests);
+    const hits: Array<{ pattern: string; hit: CodeSearchHit }> = [];
+    for (const pattern of patterns.slice(0, 3)) {
+      if (signal?.aborted) break;
+      for (const hit of await this.codeSearchQuery({ query: pattern }, "discovery", summary, state.gaps, signal)) {
+        if (isGitHubRepositoryName(hit.repository) && isSafeTreePath(hit.path)) hits.push({ pattern, hit });
+      }
+    }
+    const ranked = rankCodeSearchRepositories(hits);
+    summary.repositoriesMatched = ranked.length;
+    if (summary.queries.some((query) => query.status === "ok")) {
+      onProgress?.(`Code search matched ${ranked.length} repositories outside example and documentation paths.`);
+    }
+    const unseen: string[] = [];
+    for (const entry of ranked) {
+      const existing = state.byKey.get(`github:${entry.repository.toLowerCase()}`);
+      if (existing) existing.codeMatches = entry.matches;
+      else if (unseen.length < this.maxCodeSearchCandidates) unseen.push(entry.repository);
+    }
+    if (unseen.length === 0 || signal?.aborted) return summary;
+    const lookup = repositoryMetadataQuery(unseen);
+    if (lookup.included.length === 0) return summary;
+    if (githubRateLimited) {
+      state.gaps.push({ kind: "search", message: `GitHub search was rate limited, so ${lookup.included.length} code-search repositories were not screened.`, material: false });
+      return summary;
+    }
+    try {
+      const url = new URL("https://api.github.com/search/repositories");
+      url.searchParams.set("q", lookup.query);
+      url.searchParams.set("per_page", String(this.perPage));
+      const result = await this.apiJson(url, { provider: "github", endpoint: "search" }, signal, 1_000_000, () => {
+        if (summary.metadataRequests >= 2) return false;
+        summary.metadataRequests += 1;
+        return true;
+      });
+      const items = isRecord(result.value) && Array.isArray(result.value.items) ? result.value.items : [];
+      summary.repositoriesScreened = this.collectEntries("github", items, lookup.query, state.candidates, state.excluded, state.byKey);
+      for (const entry of ranked) {
+        const candidate = state.byKey.get(`github:${entry.repository.toLowerCase()}`);
+        if (candidate && !candidate.codeMatches) candidate.codeMatches = entry.matches;
+      }
+    } catch (error) {
+      if (signal?.aborted) return summary;
+      const failure = requestFailureOf(error, { provider: "github", endpoint: "search" });
+      state.gaps.push({ kind: "search", message: `${describeRequestFailure(failure)} (code-search repository metadata).`, material: false });
+    }
+    return summary;
+  }
+
+  private async locateCode(
+    snapshot: RepositorySnapshot,
+    patterns: string[],
+    summary: CodeSearchSummary,
+    gaps: ShortlistResolution["gaps"],
+    signal?: AbortSignal,
+  ): Promise<CodeMatch[]> {
+    const filesByPath = new Map(snapshot.files.map((file) => [file.path, file]));
+    const matches = new Map<string, CodeMatch>();
+    const add = (path: string, pattern: string): void => {
+      const file = filesByPath.get(path);
+      if (!file || isDemoPath(path)) return;
+      const match = matches.get(file.id) ?? { fileId: file.id, path, patterns: [] };
+      if (!match.patterns.includes(pattern)) match.patterns.push(pattern);
+      matches.set(file.id, match);
+    };
+    const discovered = snapshot.candidate.codeMatches ?? [];
+    for (const match of discovered) add(match.path, match.pattern);
+    const covered = new Set(discovered.map((match) => match.pattern));
+    // Grep's repo filter is a partial match, so keep only hits from this exact repository.
+    const repository = snapshot.candidate.fullName.toLowerCase();
+    for (const pattern of patterns.filter((entry) => !covered.has(entry)).slice(0, 2)) {
+      if (signal?.aborted) break;
+      const hits = await this.codeSearchQuery({ query: pattern, repo: snapshot.candidate.fullName }, "location", summary, gaps, signal);
+      for (const hit of hits) if (hit.repository.toLowerCase() === repository) add(hit.path, pattern);
+    }
+    return [...matches.values()].slice(0, 20);
   }
 
   private collectEntries(
@@ -480,7 +660,14 @@ export class GitHubResearcher {
     return { value, headers: response.headers, attempts: response.attempts };
   }
 
-  private async requestBytes(url: string | URL, target: RequestTarget, signal?: AbortSignal, maxBytes = 1_000_000, requestAllowance?: () => boolean): Promise<ByteResponse> {
+  private async requestBytes(
+    url: string | URL,
+    target: RequestTarget,
+    signal?: AbortSignal,
+    maxBytes = 1_000_000,
+    requestAllowance?: () => boolean,
+    post?: { body: string },
+  ): Promise<ByteResponse> {
     const fetcher = this.options.fetch ?? fetch;
     const timeoutMs = this.options.timeoutMs ?? 8_000;
     let parsedUrl: URL;
@@ -505,10 +692,14 @@ export class GitHubResearcher {
       signal?.addEventListener("abort", onAbort, { once: true });
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const headers: Record<string, string> = { "User-Agent": "unshit/0.1", Accept: "application/json, text/plain, */*" };
+        const headers: Record<string, string> = {
+          "User-Agent": "unshit/0.1",
+          Accept: post ? "application/json, text/event-stream" : "application/json, text/plain, */*",
+          ...(post ? { "Content-Type": "application/json" } : {}),
+        };
         if (target.provider === "github" && parsedUrl.origin === "https://api.github.com" && this.options.githubToken) headers.Authorization = `Bearer ${this.options.githubToken}`;
         if (target.provider === "gitlab" && parsedUrl.origin === "https://gitlab.com" && parsedUrl.pathname.startsWith("/api/v4/") && this.options.gitlabToken) headers["PRIVATE-TOKEN"] = this.options.gitlabToken;
-        const response = await fetcher(parsedUrl, { headers, signal: controller.signal, redirect: "error" });
+        const response = await fetcher(parsedUrl, { ...(post ? { method: "POST", body: post.body } : {}), headers, signal: controller.signal, redirect: "error" });
         if (!isResponseLike(response)) {
           throw new ProviderRequestError({ ...target, category: "invalid_response", attempts, retryRefused: false });
         }
@@ -518,6 +709,9 @@ export class GitHubResearcher {
         }
         if ((status === 403 || status === 429)
           && (response.headers.get("x-ratelimit-remaining") === "0" || response.headers.has("retry-after"))) {
+          throw new ProviderRequestError({ ...target, category: "rate_limit", attempts, retryRefused: false });
+        }
+        if (target.provider === "grep" && status === 429) {
           throw new ProviderRequestError({ ...target, category: "rate_limit", attempts, retryRefused: false });
         }
         if (!response.ok) {

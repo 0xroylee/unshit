@@ -11,7 +11,7 @@ const INTERNAL_FALLBACK: RequestFailure = Object.freeze({
   retryRefused: false,
 });
 
-const PROVIDERS = ["github", "gitlab"] as const;
+const PROVIDERS = ["github", "gitlab", "grep"] as const;
 const ENDPOINTS = ["search", "commit", "tree", "source"] as const;
 const CATEGORIES = [
   "http_status",
@@ -68,7 +68,7 @@ function internalFailure(target: RequestTarget): RequestFailure {
 export function describeRequestFailure(failure: RequestFailure): string {
   try {
     const safeFailure = normalizeFailure(failure);
-    const provider = safeFailure.provider === "github" ? "GitHub" : "GitLab";
+    const provider = safeFailure.provider === "github" ? "GitHub" : safeFailure.provider === "gitlab" ? "GitLab" : "Grep";
     const label = `${provider} ${safeFailure.endpoint} request${safeFailure.page === undefined ? "" : ` (page ${safeFailure.page})`}`;
     const retry = safeFailure.attempts === 2 ? " after one retry" : "";
     const retryRefused = safeFailure.retryRefused

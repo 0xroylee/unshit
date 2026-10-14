@@ -92,6 +92,22 @@ describe("host-built repository screening", () => {
     expect(queries.flatMap((query) => query.split(/\s+/)).every((word) => !word.startsWith("-"))).toBe(true);
   });
 
+  test("keeps up to four identifier-shaped code patterns and drops search syntax", () => {
+    const material = domainMaterialFromBrief({
+      ...brief(),
+      codePatterns: ["OrderRefund", "orderrefund", "stars:>5", "refund amount", "check_in", "x", "TicketType", "seat_map", "refund_line"],
+    });
+    expect(material.codePatterns).toEqual(["OrderRefund", "check_in", "TicketType", "seat_map"]);
+    expect("codePatterns" in domainMaterialFromBrief(brief())).toBe(false);
+    expect("codePatterns" in domainMaterialFromBrief({ ...brief(), codePatterns: ["stars:>5", "a b"] })).toBe(false);
+
+    const normalized = domainMaterialFromBrief({
+      ...brief(),
+      codePatterns: ["  OrderRefund  ", "ＯrderRefund", "refund_amount", "a".repeat(41), "check_in", "TicketType", "seat_map"],
+    });
+    expect(normalized.codePatterns).toEqual(["OrderRefund", "refund_amount", "check_in", "TicketType"]);
+  });
+
   test("normalizes leading hyphens per word, keeps interior hyphens, and is idempotent", () => {
     const cases: Array<[string, string[]]> = [
       [" -ticket", ["ticket"]],
@@ -204,5 +220,40 @@ describe("host-built repository screening", () => {
       candidate("C3", "org/ticketing-alt", "Event ticketing", 200),
     ], { phrases: ["event ticketing", "ticket sales"], topics: [] });
     expect(ordered.map((entry) => entry.id)).toEqual(["C2", "C3", "C1"]);
+  });
+
+  test("adds distinct code-search patterns to the brief-term score", () => {
+    const candidate = (id: string, fullName: string, stars: number, codeMatches?: RepositoryCandidate["codeMatches"]): RepositoryCandidate => ({
+      id,
+      provider: "github",
+      fullName,
+      description: "Event ticket sales",
+      defaultBranch: "main",
+      webUrl: `https://github.com/${fullName}`,
+      signals: signals({ stars }),
+      ...(codeMatches ? { codeMatches } : {}),
+    });
+    const ordered = orderCandidates([
+      candidate("C1", "org/popular", 900),
+      candidate("C2", "org/implementer", 100, [
+        { pattern: "OrderRefund", path: "src/refund.py" },
+        { pattern: "OrderRefund", path: "src/refund_line.py" },
+        { pattern: "TicketType", path: "src/tickets.py" },
+      ]),
+    ], { phrases: ["ticket sales"], topics: [] });
+    expect(ordered.map((entry) => entry.id)).toEqual(["C2", "C1"]);
+
+    const tied = orderCandidates([
+      candidate("C3", "org/distinct", 500, [
+        { pattern: "OrderRefund", path: "src/refund.py" },
+        { pattern: "TicketType", path: "src/tickets.py" },
+      ]),
+      candidate("C4", "org/duplicates", 100, [
+        { pattern: "OrderRefund", path: "src/refund.py" },
+        { pattern: "OrderRefund", path: "src/refund_line.py" },
+        { pattern: "TicketType", path: "src/tickets.py" },
+      ]),
+    ], { phrases: ["ticket sales"], topics: [] });
+    expect(tied.map((entry) => entry.id)).toEqual(["C3", "C4"]);
   });
 });

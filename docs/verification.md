@@ -2,6 +2,23 @@
 
 验证日期：2026-10-10。环境：macOS arm64，Bun 1.3.8，Codex CLI 0.160.0。以下记录区分平台接入试验、CLI 实际执行与测试夹具。
 
+## Grep 代码搜索
+
+### 接口探测（2026-10-13）
+
+| 检查 | 结果 |
+| --- | --- |
+| 无会话调用 | `initialize`、`tools/list`、`tools/call` 均直接返回，响应为 `text/event-stream`，没有 `Mcp-Session-Id` |
+| 工具与参数 | 只有 `searchGitHub`：`query` 必填；`repo`、`path` 为部分匹配；另有 `language`、`matchCase`、`matchWholeWords`、`useRegexp` |
+| 返回内容 | 每次最多 10 条；每条含仓库、路径、指向分支的链接、许可证和带行号片段；不含星数、日期、归档或 fork |
+| 仓库内定位 | `alfio-event/alf.io` 搜 `refund`、`osTicket/osTicket` 搜 `class Ticket`、`saleor/saleor` 搜 `refund` 均命中核心实现文件 |
+| 索引覆盖 | 限定 `pretix/pretix` 搜 `class OrderRefund` 无结果，而 `src/pretix/base/models/orders.py` 第 2130 行定义了该类 |
+| 批量元数据 | 一次 GitHub 搜索 `repo:alfio-event/alf.io repo:osTicket/osTicket repo:saleor/saleor repo:pretix/pretix` 返回 4 个仓库 |
+
+以上为设计阶段的一次手动探测，不属于自动化验证；原始响应保存在仓库之外，其中没有 `tools/list` 输出和批量 GitHub 搜索的响应体。
+
+本次运行未执行搜索 smoke。
+
 ## 模块化更新验证
 
 `reference-plan` 入口由 95 行、13108 字节缩为 34 行、2905 字节。详细内容分到 intake、research、design、plan、review 五个模块。入口保留工作范围和路由，CLI 每轮只新增当前阶段的模块内容；此前回合仍由 Codex 的原生历史保留。

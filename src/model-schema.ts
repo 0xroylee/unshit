@@ -26,6 +26,7 @@ const string = { type: "string" } as const;
 const stringArray = { type: "array", items: string } as const;
 const DOMAIN_TERM_ITEM = { minLength: 1, maxLength: 120 } as const;
 const TOPIC_SLUG_ITEM = { minLength: 1, maxLength: 50 } as const;
+const CODE_PATTERN_ITEM = { minLength: 3, maxLength: 40 } as const;
 
 function object(properties: Record<string, JsonSchema>, required = Object.keys(properties)): JsonSchema {
   return { type: "object", properties, required, additionalProperties: false };
@@ -49,6 +50,7 @@ export const INTAKE_SCHEMA: JsonSchema = object({
   researchQueries: { ...stringArray, minItems: 1, maxItems: 3 },
   domainTerms: { type: "array", minItems: 1, maxItems: 6, items: { ...string, ...DOMAIN_TERM_ITEM } },
   topicSlugs: { type: "array", maxItems: 4, items: { ...string, ...TOPIC_SLUG_ITEM } },
+  codePatterns: { type: "array", minItems: 1, maxItems: 4, items: { ...string, ...CODE_PATTERN_ITEM } },
 });
 
 export const REFINED_BRIEF_SCHEMA: JsonSchema = {
@@ -327,6 +329,7 @@ export function parseIntake(value: unknown): IntakeBrief {
     researchQueries: input.researchQueries === undefined ? [] : asStringArray(input.researchQueries, "researchQueries", 1, 3, 300),
     domainTerms: input.domainTerms === undefined ? [] : asBoundedStringArray(input.domainTerms, "domainTerms", 6, DOMAIN_TERM_ITEM),
     topicSlugs: input.topicSlugs === undefined ? [] : asBoundedStringArray(input.topicSlugs, "topicSlugs", 4, TOPIC_SLUG_ITEM),
+    ...(input.codePatterns === undefined ? {} : { codePatterns: asBoundedStringArray(input.codePatterns, "codePatterns", 4, CODE_PATTERN_ITEM) }),
   };
 }
 

@@ -111,6 +111,14 @@ export function isRootLicensePath(filePath: string): boolean {
   return /^((un)?licen[sc]e(-[a-z0-9.]+)?|copying)(\.(txt|md|rst))?$/i.test(path.posix.basename(filePath));
 }
 
+export function isDemoPath(filePath: string): boolean {
+  try {
+    return typeof filePath === "string" && /(^|\/)(samples?|examples?|demos?|docs?|tutorials?)\//i.test(filePath.normalize("NFKC"));
+  } catch {
+    return false;
+  }
+}
+
 function normalizePathTerm(value: string): string {
   return value.normalize("NFKC").toLowerCase().replace(/[-_.]/g, "");
 }

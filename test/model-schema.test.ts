@@ -165,6 +165,33 @@ describe("material question identities", () => {
     })).toThrow("must contain 1 to 120 characters");
   });
 
+  test("advertises and enforces code pattern bounds without adding the field when it is absent", () => {
+    const intakeProperties = INTAKE_SCHEMA.properties as Record<string, any>;
+    expect(INTAKE_SCHEMA.required as string[]).toContain("codePatterns");
+    expect(intakeProperties.codePatterns).toEqual({ type: "array", minItems: 1, maxItems: 4, items: { type: "string", minLength: 3, maxLength: 40 } });
+    expect((REFINED_BRIEF_SCHEMA.properties as Record<string, any>).codePatterns).toEqual(intakeProperties.codePatterns);
+    const base = {
+      summary: "Event tickets.",
+      requirements: [{ description: "Refund tickets.", observableAcceptance: ["A refund is recorded."] }],
+      materialQuestions: [],
+      researchQueries: ["event ticketing"],
+    };
+    expect(parseIntake({ ...base, codePatterns: ["OrderRefund", "refund_amount"] }).codePatterns).toEqual(["OrderRefund", "refund_amount"]);
+    expect("codePatterns" in parseIntake(base)).toBe(false);
+    expect(() => parseIntake({ ...base, codePatterns: ["aaa", "bbb", "ccc", "ddd", "eee"] })).toThrow("codePatterns must contain at most 4 items.");
+    expect(() => parseIntake({ ...base, codePatterns: ["ab"] })).toThrow("codePatterns[1] must contain 3 to 40 characters.");
+
+    const initial = parseIntake(base);
+    const validBoundary = "a".repeat(40);
+    const invalidBoundary = "a".repeat(41);
+    expect(parseIntake({ ...base, codePatterns: [validBoundary] }).codePatterns).toEqual([validBoundary]);
+    expect(parseRefinedBrief({ ...base, codePatterns: [validBoundary] }, initial).codePatterns).toEqual([validBoundary]);
+    expect(parseIntake({ ...base, codePatterns: [] }).codePatterns).toEqual([]);
+    expect(parseRefinedBrief({ ...base, codePatterns: [] }, initial).codePatterns).toEqual([]);
+    expect(() => parseIntake({ ...base, codePatterns: [invalidBoundary] })).toThrow("codePatterns[1] must contain 3 to 40 characters.");
+    expect(() => parseRefinedBrief({ ...base, codePatterns: [invalidBoundary] }, initial)).toThrow("codePatterns[1] must contain 3 to 40 characters.");
+  });
+
   test("advertises and enforces the same topic slug bounds", () => {
     const intakeProperties = INTAKE_SCHEMA.properties as Record<string, any>;
     const refinedProperties = REFINED_BRIEF_SCHEMA.properties as Record<string, any>;
