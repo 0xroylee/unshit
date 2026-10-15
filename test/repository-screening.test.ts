@@ -4,6 +4,7 @@ import {
   DEFAULT_QUALITY_BAR,
   candidateFromSearchItem,
   domainMaterialFromBrief,
+  identifiedLicenseId,
   judgeQuality,
   judgeTree,
   orderCandidates,
@@ -177,7 +178,7 @@ describe("host-built repository screening", () => {
     expect(seatwiseJudgment.pass).toBe(false);
     expect(seatwiseJudgment.reasons).toEqual(expect.arrayContaining(["stars 0 is below the minimum of 20", expect.stringContaining("younger than 180 days")]));
 
-    for (const licenseSpdxId of ["NOASSERTION", "MIT", "GPL-3.0-only"]) {
+    for (const licenseSpdxId of ["MIT", "GPL-3.0-only"]) {
       const judgment = judgeQuality(signals({ licenseSpdxId }), DEFAULT_QUALITY_BAR, NOW);
       expect(judgment.pass).toBe(true);
       expect(judgment.licenseFromMetadata).toBe(true);
@@ -204,6 +205,24 @@ describe("host-built repository screening", () => {
     expect(judgeTree(snapshot(["tests/ticket.test.ts"]), { ...bar, requireLicense: false }, false).reasons).toEqual([]);
   });
 
+  test("does not count NOASSERTION as identified license metadata", () => {
+    expect(identifiedLicenseId(signals({ licenseSpdxId: "NOASSERTION" }))).toBeUndefined();
+    expect(identifiedLicenseId(signals({ licenseSpdxId: " MIT " }))).toBe("MIT");
+    expect(identifiedLicenseId(signals({ licenseSpdxId: null }))).toBeUndefined();
+    expect(judgeQuality(signals({ licenseSpdxId: "NOASSERTION" }), DEFAULT_QUALITY_BAR, NOW)).toMatchObject({ pass: true, licenseFromMetadata: false });
+  });
+
+  test("requires a root license file for NOASSERTION and picks the standard name", () => {
+    const unidentified = { ...snapshot([]).candidate, signals: signals({ licenseSpdxId: "NOASSERTION" }) };
+    const { licenseFromMetadata } = judgeQuality(unidentified.signals, DEFAULT_QUALITY_BAR, NOW);
+
+    expect(judgeTree(snapshot(["tests/ticket.test.ts"], { candidate: unidentified }), DEFAULT_QUALITY_BAR, licenseFromMetadata).reasons).toEqual([
+      `no license: GitHub could not identify the license (NOASSERTION) and the tree at ${"a".repeat(40)} has no root LICENSE, LICENCE, UNLICENSE or COPYING file`,
+    ]);
+    expect(judgeTree(snapshot(["tests/ticket.test.ts", "LICENSE-adaic.org.txt", "LICENSE.txt"], { candidate: unidentified }), DEFAULT_QUALITY_BAR, licenseFromMetadata))
+      .toMatchObject({ licensePath: "LICENSE.txt", reasons: [] });
+  });
+
   test("orders candidate repositories by brief-term matches, then stars and name", () => {
     const candidate = (id: string, fullName: string, description: string, stars: number): RepositoryCandidate => ({
       id,
@@ -220,6 +239,53 @@ describe("host-built repository screening", () => {
       candidate("C3", "org/ticketing-alt", "Event ticketing", 200),
     ], { phrases: ["event ticketing", "ticket sales"], topics: [] });
     expect(ordered.map((entry) => entry.id)).toEqual(["C2", "C3", "C1"]);
+  });
+
+  test("matches brief words as whole words and plain plurals", () => {
+    const candidate = (id: string, fullName: string, description: string, stars: number): RepositoryCandidate => ({
+      id,
+      provider: "github",
+      fullName,
+      description,
+      defaultBranch: "main",
+      webUrl: `https://github.com/${fullName}`,
+      signals: signals({ stars, topics: [] }),
+    });
+    const wholeWords = orderCandidates([
+      candidate("C1", "acme/guardrails", "LLM guardrails", 9_000),
+      candidate("C2", "org/rail-planner", "Rail timetables", 100),
+    ], { phrases: ["rail"], topics: [] });
+    expect(wholeWords.map((entry) => entry.id)).toEqual(["C2", "C1"]);
+
+    const plurals = orderCandidates([
+      candidate("C3", "acme/payments", "Payment processing", 9_000),
+      candidate("C4", "org/desk", "Handles refunds", 100),
+    ], { phrases: ["refund"], topics: [] });
+    expect(plurals.map((entry) => entry.id)).toEqual(["C4", "C3"]);
+  });
+
+  test("weights generic words and plain-word code patterns below specific ones", () => {
+    const candidate = (id: string, description: string, stars: number, patterns: string[] = []): RepositoryCandidate => ({
+      id,
+      provider: "github",
+      fullName: `org/${id}`,
+      description,
+      defaultBranch: "main",
+      webUrl: `https://github.com/org/${id}`,
+      signals: signals({ stars, topics: [] }),
+      ...(patterns.length > 0 ? { codeMatches: patterns.map((pattern) => ({ pattern, path: `src/${pattern}.ts` })) } : {}),
+    });
+    const byWords = orderCandidates([
+      candidate("monorepo", "Reference code for everything", 390_000),
+      candidate("provenance-kit", "Evidence provenance tracking", 900),
+    ], { phrases: ["reference code", "evidence provenance"], topics: [] });
+    expect(byWords.map((entry) => entry.id)).toEqual(["provenance-kit", "monorepo"]);
+
+    const byPatterns = orderCandidates([
+      candidate("plain", "", 390_000, ["evidence", "commit"]),
+      candidate("identifiers", "", 900, ["ProvenanceRecord", "commit_sha"]),
+    ], { phrases: [], topics: [] });
+    expect(byPatterns.map((entry) => entry.id)).toEqual(["identifiers", "plain"]);
   });
 
   test("adds distinct code-search patterns to the brief-term score", () => {

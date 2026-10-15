@@ -81,6 +81,17 @@ GitLab 读取使用[官方单提交接口](https://docs.gitlab.com/api/commits/#
 
 最终统一验证通过 deliver-code 的验证证据收集器执行，包含工作区内容摘要、命令时间、退出码与输出，防止把修改前的结果作为最终验证。首版的 `verification-evidence.json` 与 `verification-outcome.json` 保存在本地 `.scratch/deliver-code/unshit-v1/`。
 
+## 自审修正验证（2026-10-15）
+
+| 检查 | 结果 |
+| --- | --- |
+| `bun run check` | 260 项通过，0 失败，1439 次 expect |
+| 变异测试 | `run-mutants.ts` 对 99 个变异逐一运行，99 个 KILLED |
+| `bun run build` 与 `./dist/unshit --help` | 帮助列出 `--turn-timeout <seconds>` 和超时退出码 124 |
+| 本地读取 | `src/local.ts`、`test/local.test.ts`、`test/github.test.ts`、`test/workflow.test.ts` 均可读取，疑似凭证值已遮蔽，分别遮蔽 2、24、8、2 个值 |
+
+这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求。真实的自审重跑另行安排。
+
 ## 未执行的环境
 
 Linux 原生运行尚未验证。读取上游源码和测试文件不代表执行了上游测试，也不代表已验证目标业务系统。

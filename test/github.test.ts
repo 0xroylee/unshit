@@ -545,6 +545,11 @@ describe("GitHub and GitLab repository research", () => {
     });
   }
 
+  test("reports how many candidates one shortlist resolution tries", () => {
+    expect(new GitHubResearcher().treeResolutionLimit).toBe(8);
+    expect(new GitHubResearcher({ maxTreeResolutions: 3 }).treeResolutionLimit).toBe(3);
+  });
+
   test("uses GitLab as fallback and parses signals before requiring a pinned root license", async () => {
     const urls: URL[] = [];
     const researcher = new GitHubResearcher({
@@ -937,6 +942,17 @@ describe("GitHub and GitLab repository research", () => {
     expect(urls.filter((url) => url.pathname.includes("/commits/") || url.pathname.includes("/git/trees/")).length).toBeLessThanOrEqual(16);
   });
 
+  test("excludes a NOASSERTION repository whose pinned tree has no root license file", async () => {
+    const unidentified = candidate("unidentified", { signals: signals({ licenseSpdxId: "NOASSERTION" }) });
+    const { fetch } = treeFetch({ noLicense: new Set(["repo-unidentified"]) });
+    const researcher = new GitHubResearcher({ fetch, now: () => NOW, shortlistSize: 1, maxTreeResolutions: 1 });
+
+    const result = await researcher.resolveShortlist([unidentified]);
+
+    expect(result.snapshots).toEqual([]);
+    expect(result.excluded[0]?.reasons[0]).toContain("no license: GitHub could not identify the license (NOASSERTION)");
+  });
+
   test("accepts a root LICENSE.md when GitHub did not report license metadata", async () => {
     const licenseCandidate = candidate("licensed", { signals: signals({ licenseSpdxId: null }) });
     const { fetch } = treeFetch({ licensePath: "LICENSE.md" });
@@ -1076,9 +1092,31 @@ describe("GitHub and GitLab repository research", () => {
     }
     expect(thrown).toBeInstanceOf(ProviderRequestError);
     if (!(thrown instanceof ProviderRequestError)) throw new Error("oversized source failure was not typed");
-    expect(thrown.failure).toMatchObject({ provider: "github", endpoint: "source", category: "size_limit", limitBytes: 1_000_000, attempts: 2 });
-    expect(thrown.message).toContain("1 MB source limit");
-    expect(urls.filter((url) => url.origin === "https://raw.githubusercontent.com" && url.pathname.endsWith("/src/large.ts"))).toHaveLength(2);
+    expect(thrown.failure).toMatchObject({ provider: "github", endpoint: "source", category: "size_limit", limitBytes: 1_000_000, attempts: 1 });
+    expect(thrown.message).toBe("GitHub source request failed: response exceeded the 1 MB source limit");
+    expect(urls.filter((url) => url.origin === "https://raw.githubusercontent.com" && url.pathname.endsWith("/src/large.ts"))).toHaveLength(1);
+  });
+
+  test("does not retry a tree response over the 8 MB limit and moves on to the next candidate", async () => {
+    const coreUrls: URL[] = [];
+    const researcher = new GitHubResearcher({
+      now: () => NOW,
+      fetch: async (input) => {
+        const url = requestUrl(input);
+        if (url.pathname.includes("/commits/") || url.pathname.includes("/git/trees/")) coreUrls.push(url);
+        if (url.pathname.endsWith("/commits/main")) return json({ sha: COMMIT });
+        if (url.pathname.includes("/repos/org/repo-huge/git/trees/")) return new Response("x".repeat(8_000_001), { status: 200 });
+        if (url.pathname.includes("/git/trees/")) return json(treeFor("repo-small"));
+        return new Response("unexpected request", { status: 404 });
+      },
+    });
+
+    const result = await researcher.resolveShortlist([candidate("huge"), candidate("small")]);
+
+    expect(coreUrls.filter((url) => url.pathname.includes("/repos/org/repo-huge/git/trees/"))).toHaveLength(1);
+    expect(coreUrls).toHaveLength(4);
+    expect(result.gaps).toContainEqual({ kind: "tree", message: "Could not read a commit-pinned file tree for org/repo-huge; GitHub tree request failed: response exceeded the 8 MB tree limit.", material: false });
+    expect(result.snapshots.map((snapshot) => snapshot.candidate.id)).toEqual(["small"]);
   });
 
   test("reports provider status after a failed commit resolution", async () => {
@@ -1414,9 +1452,9 @@ describe("Grep code search", () => {
 
     const resolution = await researcher.resolveShortlist([candidate("large-grep")], undefined, undefined, ["OrderRefund"]);
 
-    expect(grepCalls).toHaveLength(2);
+    expect(grepCalls).toHaveLength(1);
     expect(resolution.codeSearch?.queries[0]?.status).toBe("failed");
-    expect(resolution.codeSearch?.queries[0]?.failure).toMatchObject({ provider: "grep", category: "size_limit", limitBytes: 1_000_000, attempts: 2 });
+    expect(resolution.codeSearch?.queries[0]?.failure).toMatchObject({ provider: "grep", category: "size_limit", limitBytes: 1_000_000, attempts: 1 });
   });
 
   test("keeps redirect rejection, the timeout and cancellation on Grep requests", async () => {

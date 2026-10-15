@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, test } from "bun:test";
 import { parseIntake } from "../src/model-schema.ts";
-import { domainTermsFor, isDemoPath, isRootLicensePath, isTestPath, rankTreeFiles, scorePath } from "../src/file-ranking.ts";
+import { chooseRootLicensePath, domainTermsFor, isDemoPath, isRootLicensePath, isTestPath, rankTreeFiles, scorePath } from "../src/file-ranking.ts";
 import type { ResolvedAnswer, TreeFile } from "../src/types.ts";
 
 const terms = [
@@ -95,6 +95,13 @@ describe("domain-ranked repository file lists", () => {
     for (const path of ["NOTICE", "docs/LICENSE", "LICENSES/LICENSE-MIT.txt", "LICENSES/"]) {
       expect(isRootLicensePath(path)).toBe(false);
     }
+  });
+
+  test("prefers a standard root license name over an ancillary LICENSE-<suffix> file", () => {
+    expect(chooseRootLicensePath(["LICENSE-adaic.org.txt", "LICENSE.txt", "src/index.ts"])).toBe("LICENSE.txt");
+    expect(chooseRootLicensePath(["COPYING", "LICENSE-MIT"])).toBe("COPYING");
+    expect(chooseRootLicensePath(["LICENSE-APACHE", "LICENSE-MIT"])).toBe("LICENSE-APACHE");
+    expect(chooseRootLicensePath(["docs/LICENSE", "NOTICE"])).toBeUndefined();
   });
 
   test("recognizes example, sample, demo, tutorial and documentation paths", () => {

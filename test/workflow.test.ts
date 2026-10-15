@@ -106,35 +106,67 @@ function noReferencesPlan() {
   return output;
 }
 
+type TurnKind = "refined" | "intake" | "ranking" | "selection" | "files" | "plan" | "review";
+
+function turnKind(schema: JsonRecord): TurnKind {
+  const properties = schema.properties as Record<string, unknown>;
+  if ((properties.materialQuestions as { maxItems?: number } | undefined)?.maxItems === 0) return "refined";
+  if ("requirements" in properties) return "intake";
+  if ("ranked" in properties) return "ranking";
+  if ("selected" in properties) return "selection";
+  if ("files" in properties) return "files";
+  if ("tasks" in properties) return "plan";
+  if ("findings" in properties) return "review";
+  throw new Error("Unexpected model schema.");
+}
+
+function timedOutTurn(): ModelTurnResult {
+  return { status: "timed_out", limit: "idle", limitMs: 600_000, message: "Codex reported no activity on the turn for 10 minutes." };
+}
+
 function gateway(options: {
   intake: unknown;
   refined?: unknown;
   plans?: unknown[];
   reviews?: unknown[];
   selection?: unknown;
+  ranking?: unknown;
   fileSelection?: unknown;
   onPrompt?: (prompt: string, schema: JsonRecord) => void;
+  // Returns a scripted turn result for the given turn kind and its 1-based occurrence, or undefined for the default.
+  turnResult?: (kind: TurnKind, occurrence: number) => ModelTurnResult | undefined;
+  // Like the native client after an unacknowledged interrupt: a session that timed out fails every later turn.
+  disposeOnTimeout?: boolean;
 }): ModelGateway {
   let sessions = 0;
   let planIndex = 0;
   let reviewIndex = 0;
+  const occurrences = new Map<TurnKind, number>();
   return {
     createSession(): ModelSession {
       const sessionIndex = sessions++;
+      let disposed = false;
       return {
         async turn(prompt: string, schema: JsonRecord): Promise<ModelTurnResult> {
           options.onPrompt?.(prompt, schema);
-          const properties = schema.properties as Record<string, unknown>;
+          if (disposed) return { status: "failed", message: "Codex App Server session cannot be reused after connection termination." };
+          const kind = turnKind(schema);
+          const occurrence = (occurrences.get(kind) ?? 0) + 1;
+          occurrences.set(kind, occurrence);
+          const scripted = options.turnResult?.(kind, occurrence);
+          if (scripted) {
+            if (scripted.status === "timed_out" && options.disposeOnTimeout) disposed = true;
+            return scripted;
+          }
           let result: unknown;
-          if ((properties.materialQuestions as { maxItems?: number } | undefined)?.maxItems === 0) {
-            result = options.refined ?? { ...(options.intake as Record<string, unknown>), materialQuestions: [] };
-          } else if ("requirements" in properties) result = options.intake;
-          else if ("selected" in properties) result = options.selection ?? { selected: [{ candidateId: "C1", rationale: "The repository implements refund requests." }], rejected: [] };
-          else if ("files" in properties) result = options.fileSelection ?? { files: [{ fileId: "C1F1", role: "production", rationale: "Main request handler." }] };
-          else if ("tasks" in properties) result = options.plans?.[planIndex++] ?? validPlan();
-          else if ("findings" in properties) result = options.reviews?.[reviewIndex++] ?? { findings: [] };
-          else throw new Error("Unexpected model schema.");
-          if (sessionIndex > 0 && "findings" in properties && result === undefined) result = { findings: [] };
+          if (kind === "refined") result = options.refined ?? { ...(options.intake as Record<string, unknown>), materialQuestions: [] };
+          else if (kind === "intake") result = options.intake;
+          else if (kind === "ranking") result = options.ranking ?? { ranked: [] };
+          else if (kind === "selection") result = options.selection ?? { selected: [{ candidateId: "C1", rationale: "The repository implements refund requests." }], rejected: [] };
+          else if (kind === "files") result = options.fileSelection ?? { files: [{ fileId: "C1F1", role: "production", rationale: "Main request handler." }] };
+          else if (kind === "plan") result = options.plans?.[planIndex++] ?? validPlan();
+          else result = options.reviews?.[reviewIndex++] ?? { findings: [] };
+          if (sessionIndex > 0 && kind === "review" && result === undefined) result = { findings: [] };
           return { status: "completed", text: JSON.stringify(result), threadId: `thread-${sessionIndex + 1}`, turnId: `turn-${planIndex + reviewIndex + 1}` };
         },
         async close(): Promise<void> {},
@@ -147,6 +179,7 @@ function researcher(options: {
   candidates?: RepositoryCandidate[];
   snapshots?: RepositorySnapshot[];
   failReads?: boolean;
+  failPaths?: string[];
   sourceFailure?: unknown;
   sourceFailurePath?: string;
   discoveryExcluded?: Array<{ candidate: RepositoryCandidate; reasons: string[] }>;
@@ -160,10 +193,12 @@ function researcher(options: {
   shortlistCodeSearch?: CodeSearchSummary;
   discoveryCodeSearch?: CodeSearchSummary;
   discoveryGaps?: Array<{ kind: "search"; message: string; material: boolean }>;
-} = {}): { value: GitHubResearcher; searches: number; materials: DomainMaterial[]; shortlistPatterns: string[][] } {
+  treeResolutionLimit?: number;
+} = {}): { value: GitHubResearcher; searches: number; materials: DomainMaterial[]; shortlistPatterns: string[][]; shortlistInputs: string[][] } {
   let searches = 0;
   const materials: DomainMaterial[] = [];
   const shortlistPatterns: string[][] = [];
+  const shortlistInputs: string[][] = [];
   const snapshots = options.snapshots ?? [repositorySnapshot()];
   const candidates = options.candidates ?? snapshots.map((snapshot) => snapshot.candidate);
   const content = new Map<string, string>([
@@ -175,6 +210,7 @@ function researcher(options: {
     ["vitest.config.ts", "export default {};\n"],
   ]);
   const value = {
+    treeResolutionLimit: options.treeResolutionLimit ?? 8,
     async discover(material: DomainMaterial) {
       searches += 1;
       materials.push(material);
@@ -190,6 +226,7 @@ function researcher(options: {
           matched: candidates.length + (options.discoveryExcluded?.length ?? 0),
           passedMetadataBar: candidates.length,
           shortlisted: 0,
+          selected: 0,
           excluded: options.discoveryExcluded?.length ?? 0,
           rateLimited: false,
           trustworthyReferenceFound: false,
@@ -197,7 +234,8 @@ function researcher(options: {
         },
       };
     },
-    async resolveShortlist(_candidates: unknown, _signal?: unknown, _onProgress?: unknown, codePatterns: string[] = []) {
+    async resolveShortlist(candidatesToCheck: RepositoryCandidate[], _signal?: unknown, _onProgress?: unknown, codePatterns: string[] = []) {
+      shortlistInputs.push(candidatesToCheck.map((candidate) => candidate.id));
       shortlistPatterns.push(codePatterns);
       const excluded = options.shortlistExcluded ?? [];
       return {
@@ -213,11 +251,11 @@ function researcher(options: {
       if (options.sourceFailure !== undefined && (!options.sourceFailurePath || filePath === options.sourceFailurePath)) {
         throw options.sourceFailure;
       }
-      if (options.failReads) throw new Error("fixture source outage");
+      if (options.failReads || options.failPaths?.includes(filePath)) throw new Error("fixture source outage");
       return new TextEncoder().encode(content.get(filePath) ?? `export const path = '${filePath}';\n`);
     },
   } as unknown as GitHubResearcher;
-  return { value, get searches() { return searches; }, materials, shortlistPatterns };
+  return { value, get searches() { return searches; }, materials, shortlistPatterns, shortlistInputs };
 }
 
 function providerFailureWithThrowingGetter(marker: string): ProviderRequestError {
@@ -303,6 +341,434 @@ const readFailureExtractionCases = [
     create: valueWithThrowingPrototypeLookup,
   },
 ] as const;
+
+describe("candidate ranking before tree checks", () => {
+  function manyCandidates(count: number): RepositoryCandidate[] {
+    return Array.from({ length: count }, (_, index) => ({ ...repositorySnapshot().candidate, id: `C${index + 1}`, fullName: `org/refunds-${index + 1}` }));
+  }
+
+  test("ranks metadata-passing repositories with the model before tree checks when they exceed the tree budget", async () => {
+    const cwd = await tempDirectory();
+    const refs = researcher({ candidates: manyCandidates(9), treeResolutionLimit: 8 });
+    const prompts: string[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), ranking: { ranked: ["C9", "C3"] }, onPrompt: (prompt) => prompts.push(prompt) }),
+        researcher: refs.value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      expect(refs.shortlistInputs).toEqual([["C9", "C3", "C1", "C2", "C4", "C5", "C6", "C7", "C8"]]);
+      const rankingPrompt = prompts.find((prompt) => prompt.startsWith("Rank up to twelve repositories"));
+      expect(rankingPrompt).toContain("The host checks at most 8 trees");
+      expect(rankingPrompt).toContain("\"repository\":\"org/refunds-9\"");
+      expectPhaseModules(rankingPrompt!, "research");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("skips the ranking turn when the candidates fit the tree budget", async () => {
+    const cwd = await tempDirectory();
+    const refs = researcher({ candidates: manyCandidates(8), treeResolutionLimit: 8 });
+    const prompts: string[] = [];
+    try {
+      await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), onPrompt: (prompt) => prompts.push(prompt) }),
+        researcher: refs.value,
+      });
+
+      expect(prompts.some((prompt) => prompt.startsWith("Rank up to twelve repositories"))).toBe(false);
+      expect(refs.shortlistInputs).toEqual([["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"]]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the host order and records a non-material gap when the model ranking is invalid", async () => {
+    const cwd = await tempDirectory();
+    const refs = researcher({ candidates: manyCandidates(9), treeResolutionLimit: 8 });
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), ranking: { ranked: ["C99"] } }),
+        researcher: refs.value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      expect(refs.shortlistInputs).toEqual([["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"]]);
+      if (outcome.status === "completed") {
+        expect(outcome.gaps).toContainEqual({ kind: "repository", material: false, message: "The model ranking of metadata-passing repositories failed, so tree checks used the host keyword order." });
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("falls back to the host order when the ranking turn times out", async () => {
+    const cwd = await tempDirectory();
+    const refs = researcher({ candidates: manyCandidates(9), treeResolutionLimit: 8 });
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), turnResult: (kind) => (kind === "ranking" ? timedOutTurn() : undefined) }),
+        researcher: refs.value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.gaps).toContainEqual({
+          kind: "repository",
+          material: false,
+          message: "The model ranking of metadata-passing repositories failed, so tree checks used the host keyword order. The candidate ranking turn timed out. Codex reported no activity on the turn for 10 minutes.",
+        });
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("continues with a new planning session after a ranking timeout disposes the session", async () => {
+    const cwd = await tempDirectory();
+    const refs = researcher({ candidates: manyCandidates(9), treeResolutionLimit: 8 });
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), disposeOnTimeout: true, turnResult: (kind) => (kind === "ranking" ? timedOutTurn() : undefined) }),
+        researcher: refs.value,
+      });
+
+      expect(outcome.status).toBe("completed");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("trustworthy reference flag", () => {
+  test("keeps trustworthyReferenceFound false when the model selects no comparator", async () => {
+    const cwd = await tempDirectory();
+    let report = "";
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          plans: [noReferencesPlan()],
+          selection: { selected: [], rejected: [{ candidateId: "C1", rationale: "It does not implement refund requests." }] },
+        }),
+        researcher: researcher().value,
+        onArtifacts: async (details) => {
+          report = renderReport(details);
+          return undefined;
+        },
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") expect(outcome.research).toMatchObject({ shortlisted: 1, selected: 0, trustworthyReferenceFound: false });
+      expect(report).toContain("tree-verified shortlist 1; selected 0;");
+      expect(report).toContain("No selected reference repository supplied production or test source to this plan.");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps trustworthyReferenceFound false when a selected comparator supplied only license and manifest source", async () => {
+    const cwd = await tempDirectory();
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake() }),
+        researcher: researcher({ failPaths: ["src/index.ts", "tests/index.test.ts"] }).value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.research).toMatchObject({ selected: 1, trustworthyReferenceFound: false });
+        expect(outcome.sources.some((source) => source.repository === "org/refunds" && source.roles.includes("license"))).toBe(true);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("sets trustworthyReferenceFound when a selected comparator supplied production source", async () => {
+    const cwd = await tempDirectory();
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake() }),
+        researcher: researcher().value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") expect(outcome.research).toMatchObject({ shortlisted: 1, selected: 1, trustworthyReferenceFound: true });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("model turn timeouts", () => {
+  test("reports a plan-turn timeout as timed_out with its stage and limit and saves a timed_out checkpoint", async () => {
+    const cwd = await tempDirectory();
+    const checkpoints: Array<[string, string]> = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), turnResult: (kind) => (kind === "plan" ? timedOutTurn() : undefined) }),
+        researcher: researcher().value,
+        onCheckpoint: async (input, stage) => {
+          checkpoints.push([stage, input.plan.title]);
+          return `/tmp/unshit-checkpoints/${stage}.json`;
+        },
+      });
+
+      expect(outcome).toEqual({
+        status: "timed_out",
+        message: "The plan turn timed out. Codex reported no activity on the turn for 10 minutes.",
+        stage: "plan",
+        limit: "idle",
+        limitSeconds: 600,
+        checkpointPath: "/tmp/unshit-checkpoints/timed_out.json",
+      });
+      expect(checkpoints).toEqual([
+        ["evidence", "Evidence checkpoint before plan generation"],
+        ["timed_out", "Draft checkpoint after a model turn timed out"],
+      ]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the validated plan as Draft when the review repair turn times out", async () => {
+    const cwd = await tempDirectory();
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          reviews: [{ findings: [{ severity: "material", description: "The approval rule is missing.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Add the approval rule." }] }],
+          turnResult: (kind, occurrence) => (kind === "plan" && occurrence === 2 ? timedOutTurn() : undefined),
+        }),
+        researcher: researcher().value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.readiness).toBe("draft");
+        expect(outcome.plan.tasks).toHaveLength(1);
+        expect(outcome.plan.readinessNotes).toContain("The review repair turn timed out. Codex reported no activity on the turn for 10 minutes.");
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("treats a plan-repair timeout like a failed repair", async () => {
+    const cwd = await tempDirectory();
+    const invalid = validPlan();
+    invalid.tasks[0]!.requirementIds = ["R99"];
+    let failedIssues: string[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), plans: [invalid], turnResult: (kind, occurrence) => (kind === "plan" && occurrence === 2 ? timedOutTurn() : undefined) }),
+        researcher: researcher().value,
+        onCheckpoint: async (input, stage) => {
+          if (stage === "failed") failedIssues = input.validationIssues;
+          return undefined;
+        },
+      });
+
+      expect(outcome.status).toBe("error");
+      if (outcome.status === "error") expect(outcome.message).toContain("did not produce a usable task map");
+      expect(failedIssues).toContain("The plan repair turn timed out. Codex reported no activity on the turn for 10 minutes.");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("plans from the initial brief when the brief rebuild turn times out", async () => {
+    const cwd = await tempDirectory();
+    const question = { question: "Who may approve a refund?", whyMaterial: "This defines the refund authorization boundary." };
+    const questionId = parseIntake(baseIntake([question])).materialQuestions[0]!.id;
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build refunds.",
+        answers: { [questionId]: "Only named refund managers." },
+        modelGateway: gateway({ intake: baseIntake([question]), turnResult: (kind) => (kind === "refined" ? timedOutTurn() : undefined) }),
+        researcher: researcher().value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.gaps).toContainEqual({
+          kind: "validation",
+          material: true,
+          message: "The brief could not be rebuilt after the material answers; planning used the initial brief with the answers as context. The brief rebuild turn timed out. Codex reported no activity on the turn for 10 minutes.",
+        });
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("continues with a new planning session after a brief-rebuild timeout disposes the session", async () => {
+    const cwd = await tempDirectory();
+    const question = { question: "Who may approve a refund?", whyMaterial: "This defines the refund authorization boundary." };
+    const questionId = parseIntake(baseIntake([question])).materialQuestions[0]!.id;
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build refunds.",
+        answers: { [questionId]: "Only named refund managers." },
+        modelGateway: gateway({ intake: baseIntake([question]), disposeOnTimeout: true, turnResult: (kind) => (kind === "refined" ? timedOutTurn() : undefined) }),
+        researcher: researcher().value,
+      });
+
+      expect(outcome.status).toBe("completed");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("saves a timed_out checkpoint when intake, candidate selection or file selection times out", async () => {
+    for (const timedOutKind of ["intake", "selection", "files"] as const) {
+      const cwd = await tempDirectory();
+      const checkpoints: Array<{ stage: string; title: string; sources: number; summary: string }> = [];
+      try {
+        const outcome = await runWorkflow({
+          cwd,
+          requirement: "Build a refund request service.",
+          modelGateway: gateway({ intake: baseIntake(), turnResult: (kind) => (kind === timedOutKind ? timedOutTurn() : undefined) }),
+          researcher: researcher().value,
+          onCheckpoint: async (input, stage) => {
+            checkpoints.push({ stage, title: input.plan.title, sources: input.sources.length, summary: input.brief.summary });
+            return `/tmp/unshit-checkpoints/${timedOutKind}.json`;
+          },
+        });
+
+        expect(outcome).toMatchObject({ status: "timed_out", checkpointPath: `/tmp/unshit-checkpoints/${timedOutKind}.json` });
+        expect(checkpoints).toEqual([{
+          stage: "timed_out",
+          title: "Draft checkpoint after a model turn timed out",
+          sources: 0,
+          summary: timedOutKind === "intake" ? "Build a refund request service." : "Build a small refund request service.",
+        }]);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+describe("checkpoint placeholders", () => {
+  test("titles each checkpoint for its own stage when the plan turn is interrupted", async () => {
+    const cwd = await tempDirectory();
+    const checkpoints: Array<{ stage: string; title: string; architecture: string; notes: string[] }> = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          turnResult: (kind) => (kind === "plan" ? { status: "interrupted", message: "The run was interrupted." } : undefined),
+        }),
+        researcher: researcher().value,
+        onCheckpoint: async (input, stage) => {
+          checkpoints.push({ stage, title: input.plan.title, architecture: input.plan.design.architecture, notes: input.plan.readinessNotes });
+          return undefined;
+        },
+      });
+
+      expect(outcome.status).toBe("interrupted");
+      expect(checkpoints).toEqual([
+        {
+          stage: "evidence",
+          title: "Evidence checkpoint before plan generation",
+          architecture: "Not generated yet; plan generation had not finished when this checkpoint was saved.",
+          notes: ["Plan generation is in progress; this checkpoint contains evidence only."],
+        },
+        {
+          stage: "interrupted",
+          title: "Draft checkpoint after an interrupted run",
+          architecture: "Not generated; the run was interrupted first.",
+          notes: ["The run was interrupted before planning and review completed; saved material remains Draft."],
+        },
+      ]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("saves a mid-run input request as a needs_input checkpoint", async () => {
+    const cwd = await tempDirectory();
+    const checkpoints: Array<{ stage: string; title: string }> = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          turnResult: (kind) => (kind === "plan" ? { status: "needs_input", questions: [{ id: "Q1", question: "Which currency do refunds use?" }] } : undefined),
+        }),
+        researcher: researcher().value,
+        onCheckpoint: async (input, stage) => {
+          checkpoints.push({ stage, title: input.plan.title });
+          return undefined;
+        },
+      });
+
+      expect(outcome.status).toBe("needs_input");
+      expect(checkpoints.at(-1)).toEqual({ stage: "needs_input", title: "Draft checkpoint while waiting for input" });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the validation title when plan validation and its repair both fail", async () => {
+    const cwd = await tempDirectory();
+    const invalid = validPlan();
+    invalid.tasks[0]!.requirementIds = ["R99"];
+    const checkpoints: Array<[string, string]> = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), plans: [invalid, invalid] }),
+        researcher: researcher().value,
+        onCheckpoint: async (input, stage) => {
+          checkpoints.push([stage, input.plan.title]);
+          return undefined;
+        },
+      });
+
+      expect(outcome.status).toBe("error");
+      expect(checkpoints).toEqual([
+        ["evidence", "Evidence checkpoint before plan generation"],
+        ["plan", "Draft plan blocked by validation"],
+        ["failed", "Draft plan blocked by validation"],
+      ]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("workflow gates and readiness", () => {
   for (const fixture of readFailureExtractionCases) {
@@ -871,6 +1337,31 @@ describe("workflow gates and readiness", () => {
         expect(outcome.gaps.find((gap) => gap.message.includes("first commit-pinned tree"))).toMatchObject({ material: false });
         expect(outcome.readiness).toBe("ready");
       }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("records tree license evidence for a NOASSERTION comparator in the selection data and the repository choice", async () => {
+    const cwd = await tempDirectory();
+    const snapshot = repositorySnapshot();
+    snapshot.candidate.signals = { stars: 300, forks: 10, archived: false, fork: false, licenseSpdxId: "NOASSERTION", language: "Java", topics: [], pushedAt: "2026-06-01T00:00:00.000Z", createdAt: "2015-01-01T00:00:00.000Z" };
+    snapshot.licensePath = "LICENSE";
+    const prompts: string[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), onPrompt: (prompt) => prompts.push(prompt) }),
+        researcher: researcher({ snapshots: [snapshot] }).value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.plan.repositoryChoices[0]).toMatchObject({ candidateId: "C1", licenseEvidence: "tree", licensePath: "LICENSE" });
+      }
+      const selectionPrompt = prompts.find((prompt) => prompt.startsWith("Select zero to three public repository"));
+      expect(selectionPrompt).toContain("\"licenseEvidence\":\"tree\"");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

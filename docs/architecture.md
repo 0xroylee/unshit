@@ -18,13 +18,13 @@ turn / interrupt                                  v
 | 文件 | 职责 |
 | --- | --- |
 | [cli.ts](../src/cli.ts) | 参数、终端澄清、ASCII 进度、JSON/JSONL 和退出码 |
-| [workflow.ts](../src/workflow.ts) | 需求门槛、答复后的 brief 重建、候选筛选与选择、读取、计划生成、独立复核与有界修正 |
-| [app-server.ts](../src/app-server.ts) | 原生双向 RPC、活动回合关联、最终文本、取消和进程清理 |
+| [workflow.ts](../src/workflow.ts) | 需求门槛、答复后的 brief 重建、候选预排序、筛选与选择、读取、计划生成、独立复核与有界修正、超时结果与检查点 |
+| [app-server.ts](../src/app-server.ts) | 原生双向 RPC、活动回合关联、最终文本、取消、空闲与总时长超时、失败原因和进程清理 |
 | [github.ts](../src/github.ts) | host-built GitHub 查询、Grep 代码搜索、质量门槛、固定提交树验证与 GitLab 官方 API 回退 |
 | [code-search.ts](../src/code-search.ts) | Grep 请求体、响应解析、按仓库聚合命中、批量 GitHub 元数据查询条件 |
-| [local.ts](../src/local.ts) | 本地文件基线、排除规则、凭证内容过滤、已存在脚本依据 |
-| [repository-screening.ts](../src/repository-screening.ts) | 领域查询材料清理、查询计划、候选信号解析、元数据与树质量判断 |
-| [file-ranking.ts](../src/file-ranking.ts) | 需求词加权、测试与实现文件配额、文本路径和根许可证路径判断 |
+| [local.ts](../src/local.ts) | 本地文件基线、排除规则、凭证值遮蔽与私钥文件排除、已存在脚本依据 |
+| [repository-screening.ts](../src/repository-screening.ts) | 领域查询材料清理、查询计划、候选信号解析、整词候选排序、元数据与树质量判断 |
+| [file-ranking.ts](../src/file-ranking.ts) | 需求词加权、测试与实现文件配额、文本路径和根许可证路径判断、许可证文件选择 |
 | [evidence.ts](../src/evidence.ts) | 有界读取、共享文件排序、源码哈希、行范围、来源 ID 与固定链接 |
 | [model-schema.ts](../src/model-schema.ts) | 每轮 JSON Schema、结构校验、来源归属、完整覆盖和依赖无环 |
 | [report.ts](../src/report.ts) | 设计、比较、任务、验收、验证与源码对应表的 Markdown 输出 |
@@ -41,7 +41,13 @@ Codex 管理认证与会话。CLI 在内存中关联 RPC 和当前回合；应�
 
 已有本地脚本与实施后要创建的命令分开记录。上游测试读取只支持参考判断；CLI 不把它们当作目标应用已执行的测试。
 
-公开仓库搜索由 host 使用 intake 的 `domainTerms` 和 `topicSlugs` 构建三档查询；模型不能直接编写 GitHub 查询语法。GitHub 与 GitLab 返回的星数、fork、归档、许可证、语言、topic 和日期信号写入研究摘要。host 先应用星数、推送日期、创建年龄、归档与 fork 门槛，再读取固定提交的树，确认存在测试文件；若搜索元数据没有 SPDX 许可证，则要求树中有根目录许可证文件。树检查通过后才交给模型选择，筛选原因和未发送查询也保存在 manifest 中。
+每个 Codex 回合有两个时限。thread 上连续 10 分钟没有任何通知算空闲超时；session 就绪、回合请求发出之后，超过空闲时限的 3 倍算总时长超时。`--turn-timeout` 设置空闲时限。超时后 host 发送 `turn/interrupt`；即使 Codex 以 `interrupted` 结束该回合，结果仍是 `timed_out`，不当作用户取消，CLI 退出码为 124。brief 重建、候选排序、计划修正和复核修正超时后走各自原有的失败处理。失败的回合会读取 `turn.error`，没有时读取该回合最后一条 `error` 通知，去掉链接和 token 后最多保留 300 个字符。
+
+检查点按实际原因保存：`evidence`、`plan`、`interrupted`、`timed_out`、`failed`、`needs_input`。还没有计划时，占位计划的标题和说明对应这个原因；只有未通过 host 验证的计划才标为 `Draft plan blocked by validation`。
+
+通过元数据门槛的候选多于 `GitHubResearcher.treeResolutionLimit` 时，workflow 先按 research 阶段的规则请模型排序，再按这个顺序检查文件树；排序失败、超时或返回未知 ID 时退回 host 排序，并记录非重大缺口。`research.trustworthyReferenceFound` 在读取源码之后计算。
+
+公开仓库搜索由 host 使用 intake 的 `domainTerms` 和 `topicSlugs` 构建三档查询；模型不能直接编写 GitHub 查询语法。GitHub 与 GitLab 返回的星数、fork、归档、许可证、语言、topic 和日期信号写入研究摘要。host 先应用星数、推送日期、创建年龄、归档与 fork 门槛，再读取固定提交的树，确认存在测试文件；若搜索元数据没有可识别的 SPDX 许可证，包括 GitHub 无法识别时返回的 `NOASSERTION`，则要求树中有根目录许可证文件；同时有多个时优先标准文件名，`LICENSE-*` 只作备选，证据读取使用同一个文件。树检查通过后才交给模型选择，筛选原因和未发送查询也保存在 manifest 中。
 
 GitHub 树响应上限为 8 MB，源码响应仍为 1 MB。文件树不再按字母顺序裁剪；GitHub 的 `treeTruncated` 使用提供方返回的截断标志。GitLab 树最多读取 25 页、每页 100 项；若 host 达到页数上限且仍有下一页，也会将该树标为截断。`file-ranking.ts` 被文件候选展示和自动证据挑选共享：它按 brief 与答复的领域词打分，并为测试、实现文件分别保留配额。
 

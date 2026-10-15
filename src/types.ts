@@ -131,9 +131,13 @@ export interface ResearchSummary {
   qualityBar: QualityBar;
   matched: number;
   passedMetadataBar: number;
+  // Repositories that passed the commit-pinned tree checks.
   shortlisted: number;
+  // Comparators the model selected from the tree-verified shortlist.
+  selected: number;
   excluded: number;
   rateLimited: boolean;
+  // True only when a selected comparator supplied production or test source excerpts to the plan.
   trustworthyReferenceFound: boolean;
   codeSearch?: CodeSearchSummary;
 }
@@ -345,6 +349,8 @@ export interface ResearchGap {
   material: boolean;
 }
 
+export type CheckpointStage = "evidence" | "plan" | "interrupted" | "timed_out" | "failed" | "needs_input";
+
 export interface ProgressEvent {
   stage: string;
   state: "started" | "completed" | "skipped" | "warning";
@@ -385,4 +391,5 @@ export type RunOutcome =
   | { status: "needs_input"; questions: MaterialQuestion[]; brief: IntakeBrief; answersFile?: string; checkpointPath?: string }
   | { status: "completed"; readiness: Readiness; brief: IntakeBrief; initialBrief?: IntakeBrief; research?: ResearchSummary; resolvedAnswers: ResolvedAnswer[]; plan: PlanDocument; sources: FinalSource[]; gaps: ResearchGap[]; reviews: ReviewResult[]; artifacts?: RunArtifacts; validationIssues: string[]; validationHistory: ValidationRecord[] }
   | { status: "interrupted"; message: string; checkpointPath?: string }
+  | { status: "timed_out"; message: string; stage: string; limit: "idle" | "total"; limitSeconds: number; checkpointPath?: string }
   | { status: "error"; message: string; checkpointPath?: string };

@@ -8,7 +8,7 @@
 unshit "build an event ticketing system for a single team"
 ```
 
-只有一个主要命令。提供 `--cwd`、`--out`、`--answers`、`--json`、`--jsonl` 和可选模型设置；正常调用继承本机模型配置。进度用 ASCII 显示真实阶段，引用在计划中内联。默认保存计划、证据 manifest 和源码快照。缺少重大业务答案时，交互模式询问，非交互模式返回结构化 `needs_input`，不开始参考检索。
+只有一个主要命令。提供 `--cwd`、`--out`、`--answers`、`--json`、`--jsonl`、`--turn-timeout` 和可选模型设置；正常调用继承本机模型配置。进度用 ASCII 显示真实阶段，引用在计划中内联。默认保存计划、证据 manifest 和源码快照。缺少重大业务答案时，交互模式询问，非交互模式返回结构化 `needs_input`，不开始参考检索。
 
 不增加独立 resume/refs/export 命令，不引入 SQLite、后台服务、插件框架或完整作业恢复协议。不发布 npm 包、GitHub Issues、提交或部署。
 

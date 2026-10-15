@@ -65,6 +65,10 @@ export const REFINED_BRIEF_SCHEMA: JsonSchema = {
   },
 };
 
+export const CANDIDATE_RANKING_SCHEMA: JsonSchema = object({
+  ranked: { type: "array", maxItems: 12, items: string },
+});
+
 export const REPOSITORY_SELECTION_SCHEMA: JsonSchema = object({
   selected: {
     type: "array",
@@ -373,6 +377,19 @@ export function parseRepositorySelection(
   }
   if (ids.size !== allowed.size) throw new ModelOutputError("Every searched repository candidate needs a selected or rejected reason.");
   return { selected, rejected };
+}
+
+export function parseCandidateRanking(value: unknown, candidates: RepositoryCandidate[]): string[] {
+  const result = asObject(value, "Candidate ranking");
+  const ranked = asArray(result.ranked, "ranked", 0, 12).map((id, index) => asString(id, `ranked[${index + 1}]`, 80));
+  const allowed = new Set(candidates.map((candidate) => candidate.id));
+  const seen = new Set<string>();
+  for (const id of ranked) {
+    if (!allowed.has(id)) throw new ModelOutputError(`Unknown repository candidate ID: ${id}.`);
+    if (seen.has(id)) throw new ModelOutputError(`Repository candidate appears more than once: ${id}.`);
+    seen.add(id);
+  }
+  return ranked;
 }
 
 const FILE_ROLES = new Set<SelectedFileRole>(["production", "test", "manifest", "ci", "license", "config"]);
