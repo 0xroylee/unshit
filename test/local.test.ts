@@ -50,6 +50,23 @@ describe("bounded local baseline", () => {
     expect(redactLikelySecrets('const label = "a plain sentence with no secret";\n')).toEqual({ text: 'const label = "a plain sentence with no secret";\n', count: 0 });
   });
 
+  test("leaves a later value alone when a credential-named word has no separator of its own", () => {
+    const text = 'const tokenizer = createTokenizer();\nconst label = "a plain sentence of words";\nconst API_KEY = "MARKER_VALUE_0123456789";\n';
+    expect(redactLikelySecrets(text)).toEqual({
+      text: 'const tokenizer = createTokenizer();\nconst label = "a plain sentence of words";\nconst API_KEY = "[redacted by unshit]";\n',
+      count: 1,
+    });
+  });
+
+  test("redacts a file with an 80,000-character run of key characters in under a second", () => {
+    // The run holds no credential name. The search must not take time that grows with the square of the run's length.
+    const run = "z".repeat(80_000);
+    const started = performance.now();
+    const result = redactLikelySecrets(`const filler = "${run}";\nconst apiKey = "MARKER_VALUE_0123456789";\n`);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(result).toEqual({ text: `const filler = "${run}";\nconst apiKey = "[redacted by unshit]";\n`, count: 1 });
+  });
+
   test("redacts a whole quoted value with other quotes, escaped quotes or no closing quote", () => {
     const mixed = redactLikelySecrets(`{"token": "MARKER_VALUE_0123456789'MARKER_TAIL_0123456789"}\n`);
     expect(mixed).toEqual({ text: '{"token": "[redacted by unshit]"}\n', count: 1 });

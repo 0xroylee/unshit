@@ -16,8 +16,11 @@ const SECRET_FILE = /^(?:id_rsa|id_ed25519|credentials?(?:[.-].*)?|secrets?(?:[.
 const TEXT_FILE = /\.(c|cc|cpp|cs|css|csv|go|h|hpp|html?|java|js|jsx|json|kt|md|mjs|php|py|rb|rs|scss|sh|sql|swift|toml|ts|tsx|txt|vue|xml|yaml|yml|zig)$/i;
 const PRIVATE_KEY_BLOCK = /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/;
 const TOKEN_VALUE = /\b(?:sk-[A-Za-z0-9]{24,}|gh[pousr]_[A-Za-z0-9_]{24,}|AKIA[0-9A-Z]{16})\b/g;
-// A credential-named key, its separator and the opening quote of its value.
-const CREDENTIAL_KEY = /["']?[a-z0-9_-]*(?:api[_-]?key|access[_-]?token|auth(?:orization)?|bearer|client[_-]?secret|password|private[_-]?key|secret|token)[a-z0-9_-]*["']?\s*[:=]\s*(["'])/gi;
+// A credential-named key is a run of these characters that holds one of the credential names. After the run come an
+// optional quote, a `:` or `=` with optional whitespace around it, and the opening quote of the value.
+const KEY_CHARACTERS = /[a-z0-9_-]+/gi;
+const CREDENTIAL_NAME = /api[_-]?key|access[_-]?token|auth(?:orization)?|bearer|client[_-]?secret|password|private[_-]?key|secret|token/i;
+const KEY_SEPARATOR = /["']?\s*[:=]\s*(["'])/y;
 
 // After a JSON string, optional whitespace and a colon mark the string as a member name.
 const MEMBER_NAME_END = /\s*:/y;
@@ -151,22 +154,35 @@ function redactCredentialAssignments(text: string): { text: string; count: numbe
   let output = "";
   let cursor = 0;
   let count = 0;
-  CREDENTIAL_KEY.lastIndex = 0;
-  for (let match = CREDENTIAL_KEY.exec(text); match; match = CREDENTIAL_KEY.exec(text)) {
-    const quote = match[1]!;
-    const start = match.index + match[0].length;
+  let from = 0;
+  for (let key = nextCredentialKey(text, 0); key; key = nextCredentialKey(text, from)) {
+    const start = key.valueStart;
     const limit = valueLimit(start);
     let end = start;
-    while (end < limit && text[end] !== quote && text[end] !== "\n" && text[end] !== "\r") {
+    while (end < limit && text[end] !== key.quote && text[end] !== "\n" && text[end] !== "\r") {
       end += text[end] === "\\" && end + 1 < limit && text[end + 1] !== "\n" && text[end + 1] !== "\r" ? 2 : 1;
     }
-    CREDENTIAL_KEY.lastIndex = end;
+    from = end;
     if (end - start < 12) continue;
     output += `${text.slice(cursor, start)}${REDACTED_VALUE}`;
     cursor = end;
     count += 1;
   }
   return { text: output + text.slice(cursor), count };
+}
+
+// The first credential-named key whose run of key characters starts at or after `from` (a run that `from` splits
+// counts from `from`): where its value starts, and the value's quote. Each run is tested once, so the search time
+// grows linearly with the length of the text.
+function nextCredentialKey(text: string, from: number): { valueStart: number; quote: string } | undefined {
+  KEY_CHARACTERS.lastIndex = from;
+  for (let run = KEY_CHARACTERS.exec(text); run; run = KEY_CHARACTERS.exec(text)) {
+    if (!CREDENTIAL_NAME.test(run[0])) continue;
+    KEY_SEPARATOR.lastIndex = run.index + run[0].length;
+    const separator = KEY_SEPARATOR.exec(text);
+    if (separator) return { valueStart: separator.index + separator[0].length, quote: separator[1]! };
+  }
+  return undefined;
 }
 
 // For valid JSON: the closing quote of the JSON string that holds a position, or the position itself outside
