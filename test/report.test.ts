@@ -100,6 +100,7 @@ test("renders failed queries with host failure descriptions and GitLab report ci
     matched: 2,
     passedMetadataBar: 1,
     shortlisted: 1,
+    selected: 1,
     excluded: 1,
     rateLimited: false,
     trustworthyReferenceFound: true,

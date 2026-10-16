@@ -65,6 +65,10 @@ export const REFINED_BRIEF_SCHEMA: JsonSchema = {
   },
 };
 
+export const CANDIDATE_RANKING_SCHEMA: JsonSchema = object({
+  ranked: { type: "array", maxItems: 12, items: string },
+});
+
 export const REPOSITORY_SELECTION_SCHEMA: JsonSchema = object({
   selected: {
     type: "array",
@@ -375,11 +379,26 @@ export function parseRepositorySelection(
   return { selected, rejected };
 }
 
+export function parseCandidateRanking(value: unknown, candidates: RepositoryCandidate[]): string[] {
+  const result = asObject(value, "Candidate ranking");
+  const ranked = asArray(result.ranked, "ranked", 0, 12).map((id, index) => asString(id, `ranked[${index + 1}]`, 80));
+  const allowed = new Set(candidates.map((candidate) => candidate.id));
+  const seen = new Set<string>();
+  for (const id of ranked) {
+    if (!allowed.has(id)) throw new ModelOutputError(`Unknown repository candidate ID: ${id}.`);
+    if (seen.has(id)) throw new ModelOutputError(`Repository candidate appears more than once: ${id}.`);
+    seen.add(id);
+  }
+  return ranked;
+}
+
 const FILE_ROLES = new Set<SelectedFileRole>(["production", "test", "manifest", "ci", "license", "config"]);
 
-export function parseFileSelection(value: unknown, allowedFiles: TreeFileLike[]): SelectedFile[] {
+// A file ID that was not offered, or that repeats an earlier choice, is left out and counted, so one bad ID cannot end
+// the run.
+export function parseFileSelection(value: unknown, allowedFiles: TreeFileLike[]): { files: SelectedFile[]; ignored: number } {
   const result = asObject(value, "File selection");
-  const files = asArray(result.files, "files", 0, 15).map((value, index) => {
+  const chosen = asArray(result.files, "files", 0, 15).map((value, index) => {
     const item = asObject(value, `files[${index + 1}]`);
     const role = asString(item.role, `files[${index + 1}].role`, 20) as SelectedFileRole;
     if (!FILE_ROLES.has(role)) throw new ModelOutputError(`Unsupported file role: ${role}.`);
@@ -391,12 +410,13 @@ export function parseFileSelection(value: unknown, allowedFiles: TreeFileLike[])
   });
   const allowed = new Set(allowedFiles.map((file) => file.id));
   const ids = new Set<string>();
-  for (const file of files) {
-    if (!allowed.has(file.fileId)) throw new ModelOutputError(`Unknown file ID: ${file.fileId}.`);
-    if (ids.has(file.fileId)) throw new ModelOutputError(`File selected twice: ${file.fileId}.`);
+  const files: SelectedFile[] = [];
+  for (const file of chosen) {
+    if (!allowed.has(file.fileId) || ids.has(file.fileId)) continue;
     ids.add(file.fileId);
+    files.push(file);
   }
-  return files;
+  return { files, ignored: chosen.length - files.length };
 }
 
 interface TreeFileLike { id: string; }

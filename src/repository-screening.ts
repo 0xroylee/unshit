@@ -6,7 +6,7 @@ import type {
   RepositorySnapshot,
   TreeFile,
 } from "./types.ts";
-import { isRootLicensePath, isTestPath } from "./file-ranking.ts";
+import { chooseRootLicensePath, isTestPath } from "./file-ranking.ts";
 
 export interface DomainMaterial {
   phrases: string[];
@@ -46,6 +46,13 @@ export const DEFAULT_QUALITY_BAR: QualityBar = {
 };
 
 const CODE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{2,39}$/;
+
+// Words that appear across many unrelated repositories. A match on one says little about fit.
+const GENERIC_WORDS = new Set([
+  "api", "app", "application", "apps", "based", "code", "data", "framework", "library", "management",
+  "manager", "open", "platform", "project", "reference", "service", "simple", "software", "source",
+  "system", "tool", "tools", "web",
+]);
 
 const DEFAULT_SEARCH_TIERS: SearchTier[] = [
   { tier: 0, minStars: 200, maxMonthsSincePush: 12 },
@@ -146,9 +153,15 @@ export function candidateFromSearchItem(provider: "github" | "gitlab", item: unk
   };
 }
 
+// GitHub reports NOASSERTION when it found a license file but could not identify the license.
+export function identifiedLicenseId(signals: RepositoryQualitySignals | undefined): string | undefined {
+  const id = signals?.licenseSpdxId?.trim();
+  return id && id.toUpperCase() !== "NOASSERTION" ? id : undefined;
+}
+
 export function judgeQuality(signals: RepositoryQualitySignals | undefined, bar: QualityBar, now: Date): QualityJudgment {
   const reasons: string[] = [];
-  const licenseFromMetadata = typeof signals?.licenseSpdxId === "string" && signals.licenseSpdxId.trim().length > 0;
+  const licenseFromMetadata = identifiedLicenseId(signals) !== undefined;
   if (!signals) {
     return { pass: false, reasons: ["search metadata unavailable"], licenseFromMetadata };
   }
@@ -174,27 +187,48 @@ export function judgeQuality(signals: RepositoryQualitySignals | undefined, bar:
 
 export function judgeTree(snapshot: RepositorySnapshot, bar: QualityBar, licenseFromMetadata: boolean): TreeJudgment {
   const testFileCount = snapshot.files.filter((file) => isTestPath(file.path)).length;
-  const licensePath = snapshot.files.find((file) => isRootLicensePath(file.path))?.path ?? null;
+  const licensePath = chooseRootLicensePath(snapshot.files.map((file) => file.path)) ?? null;
   const reasons: string[] = [];
   if (bar.requireTests && testFileCount === 0) reasons.push(`no test file at ${snapshot.commitSha}`);
   if (bar.requireLicense && !licenseFromMetadata && !licensePath) {
     const location = snapshot.treeTruncated ? `the readable part of the truncated tree at ${snapshot.commitSha}` : `the tree at ${snapshot.commitSha}`;
-    const provider = snapshot.candidate.provider === "gitlab" ? "GitLab search metadata has no license field" : "GitHub reported no license";
+    const provider = snapshot.candidate.provider === "gitlab"
+      ? "GitLab search metadata has no license field"
+      : snapshot.candidate.signals?.licenseSpdxId?.trim().toUpperCase() === "NOASSERTION"
+        ? "GitHub could not identify the license (NOASSERTION)"
+        : "GitHub reported no license";
     reasons.push(`no license: ${provider} and ${location} has no root LICENSE, LICENCE, UNLICENSE or COPYING file`);
   }
   return { testFileCount, licensePath, reasons };
 }
 
 export function orderCandidates(candidates: RepositoryCandidate[], material: DomainMaterial): RepositoryCandidate[] {
-  const words = material.phrases.flatMap((phrase) => phrase.split(" ")).filter(Boolean);
+  const words = [...new Set(material.phrases.flatMap(wordTokens))];
   const score = (candidate: RepositoryCandidate): number => {
-    const text = `${candidate.fullName} ${candidate.description} ${candidate.signals?.topics.join(" ") ?? ""}`.normalize("NFKC").toLowerCase();
-    const termMatches = words.reduce((count, word) => count + Number(text.includes(word)), 0);
-    return termMatches + new Set((candidate.codeMatches ?? []).map((match) => match.pattern)).size;
+    const tokens = new Set(wordTokens(`${candidate.fullName} ${candidate.description} ${candidate.signals?.topics.join(" ") ?? ""}`));
+    const termScore = words.reduce((sum, word) => sum + (matchesWord(tokens, word) ? (GENERIC_WORDS.has(word) ? 0.25 : 1) : 0), 0);
+    const patterns = new Set((candidate.codeMatches ?? []).map((match) => match.pattern));
+    const patternScore = [...patterns].reduce((sum, pattern) => sum + (isIdentifierPattern(pattern) ? 1 : 0.5), 0);
+    return termScore + patternScore;
   };
-  return [...candidates].sort((left, right) => score(right) - score(left)
+  const scores = new Map(candidates.map((candidate) => [candidate.id, score(candidate)]));
+  return [...candidates].sort((left, right) => scores.get(right.id)! - scores.get(left.id)!
     || (right.signals?.stars ?? -1) - (left.signals?.stars ?? -1)
     || left.fullName.localeCompare(right.fullName));
+}
+
+function wordTokens(text: string): string[] {
+  return text.normalize("NFKC").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((token) => token.length >= 3);
+}
+
+// A plain plural still matches: "refund" matches "refunds", but "code" does not match "codeguy".
+function matchesWord(tokens: Set<string>, word: string): boolean {
+  return tokens.has(word) || tokens.has(`${word}s`) || tokens.has(`${word}es`);
+}
+
+// OrderRefund and refund_amount name code; refund and evidence are ordinary words.
+function isIdentifierPattern(pattern: string): boolean {
+  return pattern.includes("_") || /[a-z0-9][A-Z]/.test(pattern);
 }
 
 function sanitizePhrase(value: string): string {

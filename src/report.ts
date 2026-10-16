@@ -107,7 +107,7 @@ export function renderReport(input: ReportInput): string {
     const research = input.research;
     const bar = research.qualityBar;
     lines.push("## Reference research", "", `Quality bar: ${bar.requireLicense ? "license required" : "license optional"}; at least ${bar.minStars} stars; pushed within ${bar.maxMonthsSincePush} months; created at least ${bar.minAgeDays} days ago; not archived; not a fork${bar.requireTests ? "; test files required" : ""}.`);
-    lines.push(`Search requests: GitHub ${research.searchRequests.github}/${research.searchRequests.budget}; GitLab ${research.searchRequests.gitlab}. Matched ${research.matched}; passed metadata bar ${research.passedMetadataBar}; tree-verified shortlist ${research.shortlisted}; host exclusions ${research.excluded}; tree resolutions ${research.treeResolutions}; rate limited ${research.rateLimited ? "yes" : "no"}.`);
+    lines.push(`Search requests: GitHub ${research.searchRequests.github}/${research.searchRequests.budget}; GitLab ${research.searchRequests.gitlab}. Matched ${research.matched}; passed metadata bar ${research.passedMetadataBar}; tree-verified shortlist ${research.shortlisted}; selected ${research.selected}; host exclusions ${research.excluded}; tree resolutions ${research.treeResolutions}; rate limited ${research.rateLimited ? "yes" : "no"}.`);
     if (research.queries.length > 0) {
       lines.push("Queries:");
       for (const query of research.queries) {
@@ -127,7 +127,7 @@ export function renderReport(input: ReportInput): string {
     }
     if (!research.trustworthyReferenceFound) {
       const noTrustGap = input.gaps.find((gap) => gap.message.startsWith("No trustworthy public reference repository was found"));
-      lines.push(noTrustGap?.message ?? "No trustworthy public reference repository was found.");
+      lines.push(noTrustGap?.message ?? "No selected reference repository supplied production or test source to this plan.");
     }
     lines.push("");
   }

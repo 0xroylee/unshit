@@ -17,15 +17,22 @@ export interface AppServerClientOptions {
   effort?: string;
   spawn?: AppServerSpawner;
   requestTimeoutMs?: number;
-  turnTimeoutMs?: number;
+  turnIdleTimeoutMs?: number;
+  turnTotalTimeoutMs?: number;
   turnStartTimeoutMs?: number;
   interruptGraceMs?: number;
 }
 
 export interface ModelTurnOptions {
   signal?: AbortSignal;
-  timeoutMs?: number;
 }
+
+// A turn times out after this long without any notification on its thread.
+export const DEFAULT_TURN_IDLE_TIMEOUT_MS = 600_000;
+// A turn may run at most this many idle limits in total, even while Codex keeps reporting activity.
+export const TURN_TOTAL_TIMEOUT_FACTOR = 3;
+
+export type TurnTimeoutLimit = "idle" | "total";
 
 export interface ServerInputQuestion {
   id: string;
@@ -35,6 +42,7 @@ export interface ServerInputQuestion {
 export type ModelTurnResult =
   | { status: "completed"; text: string; threadId: string; turnId: string }
   | { status: "interrupted"; message: string; threadId?: string; turnId?: string }
+  | { status: "timed_out"; message: string; limit: TurnTimeoutLimit; limitMs: number; threadId?: string; turnId?: string }
   | { status: "needs_input"; questions: ServerInputQuestion[]; threadId?: string; turnId?: string }
   | { status: "failed"; message: string; threadId?: string; turnId?: string };
 
@@ -70,6 +78,9 @@ class RequestAbortedError extends Error {
     this.name = "RequestAbortedError";
   }
 }
+
+// Codex answered a request with a JSON-RPC error. Its reason outranks a disconnect that follows the answer.
+class RequestRejectedError extends Error {}
 
 class TurnControl {
   reason: CancelReason | undefined;
@@ -133,7 +144,7 @@ class NotificationBuffer {
 }
 
 export class AppServerClient {
-  private readonly options: Required<Pick<AppServerClientOptions, "requestTimeoutMs" | "turnTimeoutMs" | "turnStartTimeoutMs" | "interruptGraceMs">> & AppServerClientOptions;
+  private readonly options: Required<Pick<AppServerClientOptions, "requestTimeoutMs" | "turnIdleTimeoutMs" | "turnTotalTimeoutMs" | "turnStartTimeoutMs" | "interruptGraceMs">> & AppServerClientOptions;
   private process: SubprocessLike | undefined;
   private readerTask: Promise<void> | undefined;
   private reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -149,13 +160,19 @@ export class AppServerClient {
   private terminationPromise: Promise<void> | undefined;
 
   constructor(options: AppServerClientOptions = {}) {
+    const turnIdleTimeoutMs = options.turnIdleTimeoutMs ?? DEFAULT_TURN_IDLE_TIMEOUT_MS;
     this.options = {
       requestTimeoutMs: options.requestTimeoutMs ?? 20_000,
-      turnTimeoutMs: options.turnTimeoutMs ?? 150_000,
       turnStartTimeoutMs: options.turnStartTimeoutMs ?? 20_000,
       interruptGraceMs: options.interruptGraceMs ?? 5_000,
       ...options,
+      turnIdleTimeoutMs,
+      turnTotalTimeoutMs: options.turnTotalTimeoutMs ?? TURN_TOTAL_TIMEOUT_FACTOR * turnIdleTimeoutMs,
     };
+  }
+
+  get turnLimits(): { idleMs: number; totalMs: number } {
+    return { idleMs: this.options.turnIdleTimeoutMs, totalMs: this.options.turnTotalTimeoutMs };
   }
 
   async start(signal?: AbortSignal): Promise<void> {
@@ -223,7 +240,11 @@ export class AppServerClient {
 
     const threadId = this.threadId;
     const buffer = new NotificationBuffer();
+    const turnStartedAt = Date.now();
+    let lastActivityAt = turnStartedAt;
     const unsubscribe = this.subscribe((notification) => {
+      // Any notification on this thread is activity: reasoning, message deltas, token counts, retries.
+      if (notificationThreadId(notification) === threadId) lastActivityAt = Date.now();
       if (isTurnNotification(notification)) buffer.push(notification);
     });
     const control = new TurnControl();
@@ -235,6 +256,7 @@ export class AppServerClient {
     let started = false;
     let finish: Notification | undefined;
     let turnStartRequested = false;
+    let timedOut: TurnTimeoutLimit | undefined;
     const activeTurn = { threadId, control, started: false } as { threadId: string; turnId?: string; control: TurnControl; started: boolean };
     this.currentTurn = activeTurn;
     try {
@@ -252,6 +274,12 @@ export class AppServerClient {
         startRequest.then((response) => ({ kind: "response" as const, response })),
         control.canceled.then((reason) => ({ kind: "cancelled" as const, reason })),
       ]);
+      if (startOutcome.kind === "cancelled" && startOutcome.reason.kind === "transport_failure") {
+        // Codex can answer with an error and then close the connection. A disconnect settles every pending request, so
+        // waiting is brief, and the answer wins over the disconnect.
+        const answer = await startRequest.then(() => undefined, (error: unknown) => error);
+        if (answer instanceof RequestRejectedError) throw answer;
+      }
       if (startOutcome.kind === "cancelled") {
         const belongsToActiveTurn = (notification: Notification): boolean => {
           const notificationId = notificationTurnId(notification);
@@ -320,19 +348,19 @@ export class AppServerClient {
 
       if (!finish && started) {
         this.currentTurn.started = true;
-        const completedOrCanceled = await Promise.race([
-          this.waitForCompletion(buffer, isForTurn, turnOptions.timeoutMs ?? this.options.turnTimeoutMs).then((notification) => ({ kind: "completed" as const, notification })),
+        const ended = await Promise.race([
+          this.waitForTurnEnd(buffer, isForTurn, () => lastActivityAt, turnStartedAt).then((outcome) => ({ kind: "ended" as const, outcome })),
           control.canceled.then((reason) => ({ kind: "cancelled" as const, reason })),
         ]);
-        if (completedOrCanceled.kind === "cancelled") {
+        if (ended.kind === "cancelled") {
           await this.interrupt(threadId, turnId);
           finish = await this.waitForCompletion(buffer, isForTurn, this.options.interruptGraceMs);
+        } else if ("notification" in ended.outcome) {
+          finish = ended.outcome.notification;
         } else {
-          finish = completedOrCanceled.notification;
-          if (!finish) {
-            await this.interrupt(threadId, turnId);
-            finish = await this.waitForCompletion(buffer, isForTurn, this.options.interruptGraceMs);
-          }
+          timedOut = ended.outcome.limit;
+          await this.interrupt(threadId, turnId);
+          finish = await this.waitForCompletion(buffer, isForTurn, this.options.interruptGraceMs);
         }
       }
 
@@ -340,8 +368,8 @@ export class AppServerClient {
       if (control.reason?.kind === "needs_input") return { status: "needs_input", questions: control.reason.questions, threadId, turnId };
       if (control.reason?.kind === "tool_forbidden") return { status: "failed", message: control.reason.message, threadId, turnId };
       if (control.reason?.kind === "signal") return this.cancelResult(control.reason, threadId, turnId);
-      if (control.reason?.kind === "transport_failure") return { status: "failed", message: control.reason.message, threadId, turnId };
-      if (!finish) return { status: "failed", message: "Codex App Server did not complete the active turn before the timeout.", threadId, turnId };
+      if (control.reason?.kind === "transport_failure") return timedOut ? this.timeoutResult(timedOut, threadId, turnId) : { status: "failed", message: control.reason.message, threadId, turnId };
+      if (!finish) return timedOut ? this.timeoutResult(timedOut, threadId, turnId) : { status: "failed", message: "Codex App Server did not complete the active turn before the timeout.", threadId, turnId };
 
       const completedTurn = asRecord(asRecord(finish.params, "turn/completed params").turn, "completed turn");
       const completedId = typeof completedTurn.id === "string" ? completedTurn.id : "";
@@ -350,7 +378,10 @@ export class AppServerClient {
         return { status: "failed", message: "Codex App Server completion did not match the active turn.", threadId, turnId };
       }
       if (status !== "completed") {
-        return { status: status === "interrupted" ? "interrupted" : "failed", message: `Codex turn ended with status ${String(status)}.`, threadId, turnId };
+        if (timedOut) return this.timeoutResult(timedOut, threadId, turnId);
+        if (status === "interrupted") return { status: "interrupted", message: "Codex turn ended with status interrupted.", threadId, turnId };
+        const detail = turnFailureDetail(completedTurn, buffer, threadId, turnId);
+        return { status: "failed", message: `Codex turn ended with status ${String(status)}${detail ? `: ${detail}` : "."}`, threadId, turnId };
       }
       const text = authoritativeFinalText(completedTurn, buffer, threadId, turnId);
       if (!text) return { status: "failed", message: "Codex completed without an authoritative final assistant message.", threadId, turnId };
@@ -360,7 +391,7 @@ export class AppServerClient {
       if (control.reason?.kind === "needs_input") return { status: "needs_input", questions: control.reason.questions, threadId, ...(turnId ?? activeTurn.turnId ? { turnId: turnId ?? activeTurn.turnId } : {}) };
       if (control.reason?.kind === "tool_forbidden") return { status: "failed", message: control.reason.message, threadId, ...(turnId ? { turnId } : {}) };
       if (control.reason?.kind === "signal") return this.cancelResult(control.reason, threadId, turnId);
-      if (control.reason?.kind === "transport_failure") return { status: "failed", message: control.reason.message, threadId, ...(turnId ? { turnId } : {}) };
+      if (control.reason?.kind === "transport_failure" && !(error instanceof RequestRejectedError)) return timedOut ? this.timeoutResult(timedOut, threadId, turnId) : { status: "failed", message: control.reason.message, threadId, ...(turnId ? { turnId } : {}) };
       return { status: "failed", message: safeError(error), threadId, ...(turnId ? { turnId } : {}) };
     } finally {
       this.currentTurn = undefined;
@@ -437,7 +468,7 @@ export class AppServerClient {
       if (!pending) return;
       this.pending.delete(key);
       clearTimeout(pending.timeout);
-      if (message.error) pending.reject(new Error(`Codex App Server request ${pending.method} failed.`));
+      if (message.error) pending.reject(new RequestRejectedError(requestFailureText(pending.method, message.error)));
       else pending.resolve(message.result);
     }
   }
@@ -553,6 +584,24 @@ export class AppServerClient {
     return isNotification(result) ? result : undefined;
   }
 
+  // Resolves with turn/completed or with the limit that ran out first. Activity resets only the idle limit.
+  private async waitForTurnEnd(
+    buffer: NotificationBuffer,
+    isForTurn: (notification: Notification) => boolean,
+    lastActivityAt: () => number,
+    turnStartedAt: number,
+  ): Promise<{ notification: Notification } | { limit: TurnTimeoutLimit }> {
+    for (;;) {
+      const now = Date.now();
+      const totalLeft = turnStartedAt + this.options.turnTotalTimeoutMs - now;
+      if (totalLeft <= 0) return { limit: "total" };
+      const idleLeft = lastActivityAt() + this.options.turnIdleTimeoutMs - now;
+      if (idleLeft <= 0) return { limit: "idle" };
+      const notification = await this.waitForCompletion(buffer, isForTurn, Math.min(idleLeft, totalLeft));
+      if (notification) return { notification };
+    }
+  }
+
   private async interrupt(threadId: string, turnId: string): Promise<void> {
     try {
       await this.request("turn/interrupt", { threadId, turnId }, Math.min(this.options.requestTimeoutMs, this.options.interruptGraceMs));
@@ -566,6 +615,14 @@ export class AppServerClient {
     if (reason.kind === "tool_forbidden") return { status: "failed", message: reason.message, threadId, ...(turnId ? { turnId } : {}) };
     if (reason.kind === "transport_failure") return { status: "failed", message: reason.message, threadId, ...(turnId ? { turnId } : {}) };
     return { status: "interrupted", message: reason.message, threadId, ...(turnId ? { turnId } : {}) };
+  }
+
+  private timeoutResult(limit: TurnTimeoutLimit, threadId: string, turnId?: string): ModelTurnResult {
+    const limitMs = limit === "idle" ? this.options.turnIdleTimeoutMs : this.options.turnTotalTimeoutMs;
+    const message = limit === "idle"
+      ? `Codex reported no activity on the turn for ${formatDuration(limitMs)}.`
+      : `The turn reached its total limit of ${formatDuration(limitMs)}.`;
+    return { status: "timed_out", message, limit, limitMs, threadId, ...(turnId ? { turnId } : {}) };
   }
 
   private failAll(error: Error): void {
@@ -672,7 +729,47 @@ function keyList(value: unknown): string[] {
 }
 
 function isTurnNotification(notification: Notification): boolean {
-  return notification.method === "turn/started" || notification.method === "turn/completed" || notification.method === "item/started" || notification.method === "item/completed";
+  return notification.method === "turn/started" || notification.method === "turn/completed" || notification.method === "item/started" || notification.method === "item/completed" || notification.method === "error";
+}
+
+// The failed turn's own error comes first; otherwise the last error notification Codex sent for this turn.
+function turnFailureDetail(completedTurn: JsonRecord, buffer: NotificationBuffer, threadId: string, turnId: string): string | undefined {
+  const fromTurn = describeTurnError(completedTurn.error);
+  if (fromTurn) return fromTurn;
+  const notification = buffer.find((entry) => entry.method === "error" && notificationThreadId(entry) === threadId && notificationTurnId(entry) === turnId);
+  return notification ? describeTurnError(notification.params.error) : undefined;
+}
+
+function describeTurnError(value: unknown): string | undefined {
+  if (!isRecord(value) || typeof value.message !== "string" || !value.message.trim()) return undefined;
+  const label = codexErrorLabel(value.codexErrorInfo);
+  const details = typeof value.additionalDetails === "string" ? value.additionalDetails.trim() : "";
+  const text = [value.message.trim(), label ? `(${label})` : "", details].filter(Boolean).join(" ");
+  return scrubSensitiveText(text).slice(0, 300);
+}
+
+// Codex's own reason for a rejected request. safeError scrubs endpoints and tokens and bounds the text before it
+// leaves the client.
+function requestFailureText(method: string, error: unknown): string {
+  const reason = isRecord(error) && typeof error.message === "string" ? error.message.trim() : "";
+  return reason ? `Codex App Server request ${method} failed: ${reason}` : `Codex App Server request ${method} failed.`;
+}
+
+// codexErrorInfo is a variant name, or an object keyed by the variant name with fields such as httpStatusCode.
+function codexErrorLabel(value: unknown): string | undefined {
+  if (typeof value === "string") return /^[A-Za-z]{1,60}$/.test(value) ? value : undefined;
+  if (!isRecord(value)) return undefined;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || !/^[A-Za-z]{1,60}$/.test(keys[0]!)) return undefined;
+  const fields = value[keys[0]!];
+  const status = isRecord(fields) && Number.isInteger(fields.httpStatusCode) ? ` ${fields.httpStatusCode}` : "";
+  return `${keys[0]}${status}`;
+}
+
+function formatDuration(ms: number): string {
+  if (ms % 60_000 === 0) return `${ms / 60_000} minute${ms === 60_000 ? "" : "s"}`;
+  if (ms % 1_000 === 0) return `${ms / 1_000} seconds`;
+  return `${ms} ms`;
 }
 
 function notificationThreadId(notification: { method: string; params: JsonRecord }): string | undefined {
@@ -731,11 +828,12 @@ function isNotification(value: Notification | "aborted" | undefined): value is N
   return typeof value === "object" && value !== null;
 }
 
+function scrubSensitiveText(text: string): string {
+  return text.replace(/https?:\/\/\S+/g, "remote endpoint").replace(/\b(?:sk-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]+)\b/g, "[redacted]");
+}
+
 function safeError(error: unknown): string {
-  if (error instanceof Error) {
-    const message = error.message.replace(/https?:\/\/\S+/g, "remote endpoint").replace(/\b(?:sk-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]+)\b/g, "[redacted]");
-    return message.slice(0, 240);
-  }
+  if (error instanceof Error) return scrubSensitiveText(error.message).slice(0, 240);
   return "Codex App Server request failed.";
 }
 

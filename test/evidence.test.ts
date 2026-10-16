@@ -5,7 +5,7 @@ import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import { loadSelectedEvidence } from "../src/evidence.ts";
 import type { GitHubResearcher } from "../src/github.ts";
-import { LocalReadError, type LocalIndex } from "../src/local.ts";
+import { extractExistingCommands, LocalReadError, type LocalIndex } from "../src/local.ts";
 import { ProviderRequestError } from "../src/request-failure.ts";
 import type { RepositorySnapshot, TreeFile } from "../src/types.ts";
 
@@ -158,6 +158,93 @@ describe("bounded source evidence", () => {
     expect(reasonReads).toBe(0);
   });
 
+  test("sends and hashes only the redacted text of a local source that held a credential", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "unshit-redact-"));
+    try {
+      await mkdir(path.join(root, "src"), { recursive: true });
+      await writeFile(path.join(root, "src", "client.ts"), 'export const apiKey = "plainCredentialValue123456";\nexport function send() { return apiKey; }\n');
+      const local: LocalIndex = { root, files: [{ id: "L1", path: "src/client.ts", size: 90 }], gaps: [] };
+      const { fake } = researcher();
+
+      const evidence = await loadSelectedEvidence({
+        local,
+        repositories: [],
+        modelSelection: [{ fileId: "L1", role: "production", rationale: "API client" }],
+        github: fake,
+        relevantText: "send",
+      });
+
+      const redacted = 'export const apiKey = "[redacted by unshit]";\nexport function send() { return apiKey; }\n';
+      expect(evidence.sources.find((source) => source.path === "src/client.ts")?.sha256).toBe(createHash("sha256").update(redacted).digest("hex"));
+      expect(evidence.excerpts.map((excerpt) => excerpt.text).join("\n")).not.toContain("plainCredentialValue123456");
+      expect(evidence.gaps).toContainEqual({
+        kind: "local",
+        material: false,
+        message: "Replaced 1 likely secret value(s) in src/client.ts with [redacted by unshit] before any model turn; the saved snapshot and its SHA-256 cover the redacted text.",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps every part of a quoted credential out of excerpts and snapshots and keeps package scripts readable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "unshit-redact-"));
+    try {
+      const manifest = '{\n  "scripts": {\n    "test": "bun test"\n  },\n  "token": "MARKER_VALUE_0123456789\\"MARKER_TAIL_0123456789"\n}\n';
+      await writeFile(path.join(root, "package.json"), manifest);
+      const local: LocalIndex = { root, files: [{ id: "L1", path: "package.json", size: manifest.length }], gaps: [] };
+      const { fake } = researcher();
+
+      const evidence = await loadSelectedEvidence({ local, repositories: [], modelSelection: [], github: fake, relevantText: "test" });
+
+      const source = evidence.sources.find((entry) => entry.path === "package.json")!;
+      const bytes = evidence.bytesBySourceId.get(source.id)!;
+      expect(new TextDecoder().decode(bytes)).not.toContain("MARKER_TAIL");
+      expect(evidence.excerpts.map((excerpt) => excerpt.text).join("\n")).not.toContain("MARKER_TAIL");
+      expect(extractExistingCommands([{ id: source.id, path: "package.json", bytes }]).map((command) => command.command)).toEqual(["bun run test"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a redacted package.json valid when an assignment sits inside another JSON string", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "unshit-redact-"));
+    try {
+      const manifest = '{\r\n  "description": "token=\'MARKER_VALUE_0123456789",\r\n  "token": "token=\'",\r\n  "scripts": {\r\n    "test": "bun test"\r\n  }\r\n}\r\n';
+      await writeFile(path.join(root, "package.json"), manifest);
+      const local: LocalIndex = { root, files: [{ id: "L1", path: "package.json", size: manifest.length }], gaps: [] };
+      const { fake } = researcher();
+
+      const evidence = await loadSelectedEvidence({ local, repositories: [], modelSelection: [], github: fake, relevantText: "test" });
+
+      const source = evidence.sources.find((entry) => entry.path === "package.json")!;
+      const bytes = evidence.bytesBySourceId.get(source.id)!;
+      expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual({ description: "token='[redacted by unshit]", token: "token='", scripts: { test: "bun test" } });
+      expect(evidence.excerpts.map((excerpt) => excerpt.text).join("\n")).not.toContain("MARKER_VALUE");
+      expect(extractExistingCommands([{ id: source.id, path: "package.json", bytes }]).map((command) => command.command)).toEqual(["bun run test"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("records a material gap and no snapshot for JSON whose member name holds a credential-like value", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "unshit-redact-"));
+    try {
+      const manifest = '{\n  "token=\'MARKER_VALUE_0123456789": 1,\n  "scripts": {\n    "test": "bun test"\n  }\n}\n';
+      await writeFile(path.join(root, "package.json"), manifest);
+      const local: LocalIndex = { root, files: [{ id: "L1", path: "package.json", size: manifest.length }], gaps: [] };
+      const { fake } = researcher();
+
+      const evidence = await loadSelectedEvidence({ local, repositories: [], modelSelection: [], github: fake, relevantText: "test" });
+
+      expect(evidence.sources.map((source) => source.path)).not.toContain("package.json");
+      expect(evidence.bytesBySourceId.size).toBe(0);
+      expect(evidence.gaps).toContainEqual({ kind: "local", message: "Could not read package.json; source was excluded because a JSON member name holds a credential-like value.", material: true });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("reports the fixed local-file limit for a source above 256 KB", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "unshit-evidence-local-"));
     try {
@@ -290,6 +377,24 @@ describe("bounded source evidence", () => {
     expect(fetched).not.toContain("NOTICE");
     expect(evidence.sources.find((source) => source.path === "src/ticket.ts")?.roles).toContain("production");
     expect(evidence.sources.find((source) => source.path === "tests/ticket.test.ts")?.roles).toContain("test");
+  });
+
+  test("reads the standard root license file when an ancillary LICENSE-<suffix> file sorts first", async () => {
+    const paths = ["src/index.ts", "tests/index.test.ts", "LICENSE-adaic.org.txt", "LICENSE.txt", "package.json"];
+    const files: TreeFile[] = paths.map((filePath, index) => ({ id: `C1L${index + 1}`, path: filePath, size: 20 }));
+    const { fake, fetched } = researcher();
+
+    const evidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [{ ...repository(), files }],
+      modelSelection: [],
+      github: fake,
+      relevantText: "refund request",
+    });
+
+    expect(fetched).toContain("LICENSE.txt");
+    expect(fetched).not.toContain("LICENSE-adaic.org.txt");
+    expect(evidence.sources.find((source) => source.path === "LICENSE.txt")?.roles).toEqual(["license"]);
   });
 
   test("prefers code-matched production and test files over the path ranking", async () => {

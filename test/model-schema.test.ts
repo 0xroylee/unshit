@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { INTAKE_SCHEMA, ModelOutputError, REFINED_BRIEF_SCHEMA, parseIntake, parsePlan, parseRefinedBrief, stableMaterialQuestionId } from "../src/model-schema.ts";
+import { CANDIDATE_RANKING_SCHEMA, INTAKE_SCHEMA, ModelOutputError, REFINED_BRIEF_SCHEMA, parseCandidateRanking, parseFileSelection, parseIntake, parsePlan, parseRefinedBrief, stableMaterialQuestionId } from "../src/model-schema.ts";
 import type { EvidenceExcerpt, EvidenceSource, IntakeBrief, RepositorySnapshot } from "../src/types.ts";
 
 const brief = parseIntake({
@@ -241,6 +241,31 @@ describe("material question identities", () => {
     expect(rebuilt.requirements[0]?.id).toBe("R1");
     expect(rebuilt.requirements[0]?.observableAcceptance[0]?.id).toBe("A1");
     expect(() => parseRefinedBrief({ ...refinedPayload, materialQuestions: [{ question: "Another question?", whyMaterial: "It changes scope." }] }, initial)).toThrow(ModelOutputError);
+  });
+});
+
+describe("candidate ranking", () => {
+  test("accepts a ranking of known, unique candidate IDs and rejects others", () => {
+    const candidates = ["C1", "C2", "C3"].map((id) => snapshot(id, `org/${id}`, "a".repeat(40)).candidate);
+
+    expect(parseCandidateRanking({ ranked: ["C3", "C1"] }, candidates)).toEqual(["C3", "C1"]);
+    expect(parseCandidateRanking({ ranked: [] }, candidates)).toEqual([]);
+    expect(() => parseCandidateRanking({ ranked: ["C9"] }, candidates)).toThrow("Unknown repository candidate ID: C9.");
+    expect(() => parseCandidateRanking({ ranked: ["C1", "C1"] }, candidates)).toThrow("Repository candidate appears more than once: C1.");
+    expect(() => parseCandidateRanking({ ranked: Array.from({ length: 13 }, () => "C1") }, candidates)).toThrow("ranked must contain 0 to 12 items.");
+    expect(CANDIDATE_RANKING_SCHEMA).toMatchObject({ required: ["ranked"], properties: { ranked: { maxItems: 12 } } });
+  });
+});
+
+describe("file selection", () => {
+  test("keeps offered file IDs once, in order, and counts the IDs it ignores", () => {
+    const offered = [{ id: "A" }, { id: "B" }];
+    const choice = (fileId: string) => ({ fileId, role: "production" as const, rationale: "Relevant." });
+
+    expect(parseFileSelection({ files: [choice("A"), choice("X"), choice("A"), choice("B")] }, offered)).toEqual({ files: [choice("A"), choice("B")], ignored: 2 });
+    expect(parseFileSelection({ files: [choice("B"), choice("X"), choice("A"), choice("B")] }, offered)).toEqual({ files: [choice("B"), choice("A")], ignored: 2 });
+    expect(parseFileSelection({ files: [choice("X")] }, offered)).toEqual({ files: [], ignored: 1 });
+    expect(() => parseFileSelection({ files: [{ fileId: "A", role: "owner", rationale: "Relevant." }] }, offered)).toThrow(ModelOutputError);
   });
 });
 
