@@ -1,9 +1,10 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { JsonRecord, ModelGateway, ModelSession, ModelTurnResult } from "../src/app-server.ts";
 import { GitHubResearcher } from "../src/github.ts";
+import { scanLocalTree } from "../src/local.ts";
 import { ProviderRequestError } from "../src/request-failure.ts";
 import { parseIntake } from "../src/model-schema.ts";
 import { DEFAULT_QUALITY_BAR } from "../src/repository-screening.ts";
@@ -1876,6 +1877,45 @@ describe("workflow gates and readiness", () => {
       const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
       expect(filePrompt).toContain("\"fileId\":\"C1Z1\",\"path\":\"vendor/legacy/deep/path/refund_hook.ts\"");
       expect(filePrompt).toContain("\"codeMatch\":\"refund_hook\"");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("ranks a local definition of a brief code pattern into the plan's excerpts", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    try {
+      await mkdir(path.join(cwd, "src"), { recursive: true });
+      // Two selected files of about 160,000 characters each, so the first one is not kept whole. No line shares a word
+      // with the brief; only the code pattern marks line 200.
+      const lines = Array.from({ length: 300 }, (_, index) => `const localFiller${index} = ${index};`);
+      lines[199] = "export class LedgerSeal { seal() { return \"anchor-marker-7\"; } }";
+      const ballast = Array.from({ length: 1_500 }, () => "z".repeat(100)).join("\n");
+      await writeFile(path.join(cwd, "src", "ledger.ts"), `${lines.join("\n")}\n${ballast}\n`);
+      await writeFile(path.join(cwd, "src", "other.ts"), `export const other = 1;\n${ballast}\n`);
+      const local = await scanLocalTree(cwd);
+      const ledger = local.files.find((file) => file.path === "src/ledger.ts")!;
+      const other = local.files.find((file) => file.path === "src/other.ts")!;
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: { ...baseIntake(), codePatterns: ["LedgerSeal"] },
+          fileSelection: {
+            files: [
+              { fileId: ledger.id, role: "production", rationale: "Local ledger code." },
+              { fileId: other.id, role: "production", rationale: "Local helper." },
+            ],
+          },
+          onPrompt: (prompt) => prompts.push(prompt),
+        }),
+        researcher: researcher({ snapshots: [repositorySnapshot()] }).value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      const planPrompt = prompts.find((prompt) => prompt.startsWith("Produce a detailed implementation plan"))!;
+      expect(planPrompt).toContain("anchor-marker-7");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

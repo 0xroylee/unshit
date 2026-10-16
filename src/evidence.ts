@@ -43,6 +43,8 @@ export async function loadSelectedEvidence(options: {
   modelSelection: SelectedFile[];
   github: GitHubResearcher;
   relevantText: string;
+  // The brief's code patterns. Excerpt scoring uses them in every planned file, local or remote (see `lineScore`).
+  codePatterns?: string[];
   domainTerms?: RankedTerm[];
   signal?: AbortSignal;
 }): Promise<LoadedEvidence> {
@@ -203,12 +205,9 @@ export async function loadSelectedEvidence(options: {
         gaps.push({ kind: "local", message: `Replaced ${redactions} likely secret value(s) in ${item.file.path} with ${REDACTED_VALUE} before any model turn; the saved snapshot and its SHA-256 cover the redacted text.`, material: false });
       }
 
-      const anchors = item.kind === "remote"
-        ? item.repository!.codeMatches?.find((match) => match.fileId === item.file.id)?.patterns
-        : undefined;
       // Each file gets an equal share of what is left, so a small file passes its unused share to the files after it.
       const share = Math.floor(Math.max(0, maxContextCharacters - excerptCharacters) / (items.length - index));
-      const ranges = chooseExcerptRanges(lines, options.relevantText, share, anchors);
+      const ranges = chooseExcerptRanges(lines, options.relevantText, share, options.codePatterns ?? []);
       if (ranges.length === 0) {
         gaps.push({ kind: item.kind === "local" ? "local" : "file", message: `No excerpt context remained for ${item.file.path}.`, material: true });
         continue;
@@ -341,90 +340,110 @@ function splitLines(text: string): string[] {
   return lines;
 }
 
+// Lines that hold one of these words get the larger anchor bonus in `lineScore`. This list differs from BLOCK_START's.
 const DEFINITION_LINE = /\b(class|def|function|func|fn|interface|struct|type|enum|const|let|var)\b/;
 
 const HEAD_LINES = 30;
 const MAX_REGION_LINES = 150;
-const MAX_REGIONS = 4;
 const AROUND_LINES = 60;
 // How far the search for a definition's start or end may go.
 const SCAN_LINES = 600;
-// A line that opens a function, class or type definition: a statement that starts with a definition keyword, a type
-// whose line opens a block, or a variable whose value is a function.
+// The first line of a definition, for `enclosingDefinition`. It matches `class`, `def`, `function`, `func`, `fn`,
+// `interface`, `struct`, `enum`, `impl` or `trait` as the first word after indentation and optional modifiers (`export`,
+// `default`, `abstract`, `async`, `public`, `private`, `protected`, `static`, `pub`, `final`, `override`); `type` as the
+// first word, after an optional `export`, on a line whose last non-blank character is `{`; and some `const`, `let` or
+// `var` lines whose value is a function (the pattern gives the exact forms). This keyword list differs from
+// DEFINITION_LINE's.
 const BLOCK_START = /^\s*(?:(?:export|default|abstract|async|public|private|protected|static|pub|final|override)\s+)*(?:class|def|function|func|fn|interface|struct|enum|impl|trait)\b|^\s*(?:export\s+)?type\b.*\{\s*$|^\s*(?:export\s+)?(?:const|let|var)\b[^=]*=\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*(?::\s*[^=]+)?=>|[A-Za-z_$][\w$]*\s*=>)/;
 
-// A file of at most MAX_REGION_LINES lines is one window. A longer file gives its first HEAD_LINES lines and then the
-// best-scoring lines, each expanded to the definition around it, until the file's budget is used. Ranges come back
-// in line order, with overlaps merged.
+// Lines `start` to `end - 1` of a file, counted from 0.
+interface LineWindow {
+  start: number;
+  end: number;
+}
+
+// An empty file, or a budget of 0 or less, gives no excerpt. A file whose whole text fits the budget is one window. Any
+// other file gives its first HEAD_LINES lines (all of them in a shorter file), cut from the end while they do not fit;
+// if its first line alone does not fit, the file gets no excerpt. Then the lines with a score above 0 come in order of
+// score, higher first, then of position, earlier first, skipping lines that a taken window already holds. Each such
+// line takes the first of its regionChoices that fits what is left of the budget, and the first line for which none
+// fits ends the file's excerpt. Ranges come back in line order, with overlapping windows merged.
 function chooseExcerptRanges(lines: string[], relevantText: string, budget: number, anchors: string[] = []): Array<{ startLine: number; endLine: number }> {
   if (lines.length === 0 || budget <= 0) return [];
-  const windows: Array<{ start: number; end: number }> = [];
-  if (lines.length <= MAX_REGION_LINES) windows.push({ start: 0, end: lines.length });
-  else {
-    windows.push({ start: 0, end: HEAD_LINES });
-    const matchTerms = [...new Set(relevantText.toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g) ?? [])].slice(0, 30);
-    const anchorTerms = anchors.map((anchor) => anchor.toLowerCase());
-    const hits = lines
-      .map((line, index) => ({ index, score: lineScore(line.toLowerCase(), matchTerms, anchorTerms) }))
-      .filter((hit) => hit.score > 0)
-      .sort((left, right) => right.score - left.score || left.index - right.index);
-    let regions = 0;
-    for (const hit of hits) {
-      if (regions === MAX_REGIONS) break;
-      if (windows.some((window) => hit.index >= window.start && hit.index < window.end)) continue;
-      windows.push(regionAround(lines, hit.index));
-      regions += 1;
-    }
+  // The excerpt joins its lines with newlines and has none after the last line.
+  const cost = (window: LineWindow): number => lines.slice(window.start, window.end).reduce((sum, line) => sum + line.length + 1, 0) - 1;
+  if (cost({ start: 0, end: lines.length }) <= budget) return [{ startLine: 1, endLine: lines.length }];
+  const head = { start: 0, end: Math.min(HEAD_LINES, lines.length) };
+  while (head.end > 1 && cost(head) > budget) head.end -= 1;
+  let used = cost(head);
+  if (used > budget) return [];
+  const windows: LineWindow[] = [head];
+  const matchTerms = [...new Set(relevantText.toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g) ?? [])].slice(0, 30);
+  const anchorTerms = anchors.map((anchor) => anchor.toLowerCase());
+  const hits = lines
+    .map((line, index) => ({ index, score: lineScore(line.toLowerCase(), matchTerms, anchorTerms) }))
+    .filter((hit) => hit.score > 0)
+    .sort((left, right) => right.score - left.score || left.index - right.index);
+  for (const hit of hits) {
+    if (windows.some((window) => hit.index >= window.start && hit.index < window.end)) continue;
+    const region = regionChoices(lines, hit.index).find((choice) => used + cost(choice) <= budget);
+    if (!region) break;
+    windows.push(region);
+    used += cost(region);
   }
-  const ranges: Array<{ start: number; end: number }> = [];
-  let used = 0;
-  for (const window of windows) {
-    let end = window.end;
-    // The excerpt joins its lines with newlines and has none after the last line.
-    let chars = lines.slice(window.start, end).reduce((sum, line) => sum + line.length + 1, 0) - 1;
-    while (end > window.start + 1 && used + chars > budget) {
-      chars -= lines[end - 1]!.length + 1;
-      end -= 1;
-    }
-    if (used + chars > budget) continue;
-    ranges.push({ start: window.start, end });
-    used += chars;
-  }
-  ranges.sort((left, right) => left.start - right.start);
+  windows.sort((left, right) => left.start - right.start);
   const merged: Array<{ startLine: number; endLine: number }> = [];
-  for (const range of ranges) {
+  for (const window of windows) {
     const last = merged.at(-1);
-    if (last && range.start < last.endLine) last.endLine = Math.max(last.endLine, range.end);
-    else merged.push({ startLine: range.start + 1, endLine: range.end });
+    if (last && window.start < last.endLine) last.endLine = Math.max(last.endLine, window.end);
+    else merged.push({ startLine: window.start + 1, endLine: window.end });
   }
   return merged;
 }
 
-// A definition of a code-search pattern beats an import or a call that only mentions it.
+// A line's score: 1 for each match term that the line holds, plus, for each anchor that it holds, 20 if the line
+// matches DEFINITION_LINE and 10 if it does not.
 function lineScore(lower: string, matchTerms: string[], anchorTerms: string[]): number {
   const termScore = matchTerms.reduce((sum, term) => sum + (lower.includes(term) ? 1 : 0), 0);
   const anchorScore = anchorTerms.reduce((sum, anchor) => sum + (!lower.includes(anchor) ? 0 : DEFINITION_LINE.test(lower) ? 20 : 10), 0);
   return termScore + anchorScore;
 }
 
-// The nearest definition at or above a line whose block reaches the line. Up to MAX_REGION_LINES lines of it, kept
-// around the line; AROUND_LINES lines around the line when no definition holds it.
-function regionAround(lines: string[], hit: number): { start: number; end: number } {
+// The windows that can show line `hit`, in the order they are tried. First the window that `enclosingDefinition`
+// returns, if any. Then, if that window is longer than MAX_REGION_LINES, MAX_REGION_LINES of its lines, starting a
+// third of that many lines above `hit` where the window allows. Last, AROUND_LINES lines starting a third of that many
+// lines above `hit` where the file allows (the whole file if it is shorter). Every window holds `hit`.
+function regionChoices(lines: string[], hit: number): LineWindow[] {
+  const choices: LineWindow[] = [];
+  const definition = enclosingDefinition(lines, hit);
+  if (definition) {
+    choices.push(definition);
+    if (definition.end - definition.start > MAX_REGION_LINES) {
+      const start = Math.max(definition.start, Math.min(definition.end - MAX_REGION_LINES, hit - Math.floor(MAX_REGION_LINES / 3)));
+      choices.push({ start, end: start + MAX_REGION_LINES });
+    }
+  }
+  const aroundStart = Math.max(0, Math.min(lines.length - AROUND_LINES, hit - Math.floor(AROUND_LINES / 3)));
+  choices.push({ start: aroundStart, end: Math.min(lines.length, aroundStart + AROUND_LINES) });
+  return choices;
+}
+
+// The window from the nearest line at or at most SCAN_LINES lines above `hit` that matches BLOCK_START and whose
+// definitionEnd lies after `hit`, to that end. Undefined if there is none.
+function enclosingDefinition(lines: string[], hit: number): LineWindow | undefined {
   for (let start = hit; start >= Math.max(0, hit - SCAN_LINES); start -= 1) {
     if (!BLOCK_START.test(lines[start]!)) continue;
     const end = definitionEnd(lines, start);
-    if (end <= hit) continue;
-    if (end - start <= MAX_REGION_LINES) return { start, end };
-    const windowStart = Math.max(start, Math.min(end - MAX_REGION_LINES, hit - Math.floor(MAX_REGION_LINES / 3)));
-    return { start: windowStart, end: windowStart + MAX_REGION_LINES };
+    if (end > hit) return { start, end };
   }
-  const aroundStart = Math.max(0, Math.min(lines.length - AROUND_LINES, hit - Math.floor(AROUND_LINES / 3)));
-  return { start: aroundStart, end: Math.min(lines.length, aroundStart + AROUND_LINES) };
+  return undefined;
 }
 
-// The exclusive end of the definition that starts at `start`: where its braces close, or, without braces, before the
-// next line that is not indented deeper and does not close a bracket. A Python `def` or a header that ends with a colon
-// ends by indentation only; braces in its body are dicts or sets.
+// The exclusive end of the definition whose first line is `start`. If that line begins with `def` or `async def` after
+// indentation, or ends with `:` before an optional `#` comment, braces are not counted. While no `{` has been counted,
+// the definition ends before the next non-blank line that is not indented deeper than `start` and does not begin with
+// `)`, `]` or `}`. After a `{`, it ends after the line where the count of `{` minus `}` falls to 0 or below. Without an
+// end within the SCAN_LINES lines from `start`, the end is SCAN_LINES lines after `start`, or the end of the file.
 function definitionEnd(lines: string[], start: number): number {
   const limit = Math.min(lines.length, start + SCAN_LINES);
   const indentedSuite = /^\s*(?:async\s+)?def\b/.test(lines[start]!) || /:\s*(?:#.*)?$/.test(lines[start]!);
