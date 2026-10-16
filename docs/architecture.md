@@ -41,7 +41,7 @@ Codex 管理认证与会话。CLI 在内存中关联 RPC 和当前回合；应�
 
 已有本地脚本与实施后要创建的命令分开记录。上游测试读取只支持参考判断；CLI 不把它们当作目标应用已执行的测试。
 
-每个 Codex 回合有两个时限。thread 上连续 10 分钟没有任何通知算空闲超时；session 就绪、回合请求发出之后，超过空闲时限的 3 倍算总时长超时。`--turn-timeout` 设置空闲时限。超时后 host 发送 `turn/interrupt`；即使 Codex 以 `interrupted` 结束该回合，结果仍是 `timed_out`，不当作用户取消，CLI 退出码为 124。brief 重建、候选排序、计划修正和复核修正超时后走各自原有的失败处理。失败的回合会读取 `turn.error`，没有时读取该回合最后一条 `error` 通知，去掉链接和 token 后最多保留 300 个字符。
+每个 Codex 回合有两个时限。thread 上连续 10 分钟没有任何通知算空闲超时；session 就绪、回合请求发出之后，超过空闲时限的 3 倍算总时长超时。`--turn-timeout` 设置空闲时限。超时后 host 发送 `turn/interrupt`；即使 Codex 以 `interrupted` 结束该回合，结果仍是 `timed_out`，不当作用户取消，CLI 退出码为 124。brief 重建、候选排序、计划修正和复核修正超时后走各自原有的失败处理。失败的回合会读取 `turn.error`，没有时读取该回合最后一条 `error` 通知，去掉链接和 token 后最多保留 300 个字符。Codex 拒绝 `turn/start` 请求时，错误消息保留 Codex 给出的原因，连接随后断开时也一样；去掉链接和 token 后，整条消息最多 240 个字符。
 
 检查点按实际原因保存：`evidence`、`plan`、`interrupted`、`timed_out`、`failed`、`needs_input`。还没有计划时，占位计划的标题和说明对应这个原因；只有未通过 host 验证的计划才标为 `Draft plan blocked by validation`。
 
@@ -50,6 +50,8 @@ Codex 管理认证与会话。CLI 在内存中关联 RPC 和当前回合；应�
 公开仓库搜索由 host 使用 intake 的 `domainTerms` 和 `topicSlugs` 构建三档查询；模型不能直接编写 GitHub 查询语法。GitHub 与 GitLab 返回的星数、fork、归档、许可证、语言、topic 和日期信号写入研究摘要。host 先应用星数、推送日期、创建年龄、归档与 fork 门槛，再读取固定提交的树，确认存在测试文件；若搜索元数据没有可识别的 SPDX 许可证，包括 GitHub 无法识别时返回的 `NOASSERTION`，则要求树中有根目录许可证文件；同时有多个时优先标准文件名，`LICENSE-*` 只作备选，证据读取使用同一个文件。树检查通过后才交给模型选择，筛选原因和未发送查询也保存在 manifest 中。
 
 GitHub 树响应上限为 8 MB，源码响应仍为 1 MB。文件树不再按字母顺序裁剪；GitHub 的 `treeTruncated` 使用提供方返回的截断标志。GitLab 树最多读取 25 页、每页 100 项；若 host 达到页数上限且仍有下一页，也会将该树标为截断。`file-ranking.ts` 被文件候选展示和自动证据挑选共享：它按 brief 与答复的领域词打分，并为测试、实现文件分别保留配额。
+
+文件挑选回合的提示只列出每个已选仓库的来源、提交和日期，不附整棵文件树。可选文件按来源分组，每个文件只带 ID、路径、大小、角色提示和代码搜索命中。整份文件清单最多 300,000 个字符，本地项目和每个已选仓库平分额度，排名靠后的文件先被省略，省略的数量记为非重大缺口。模型返回未提供或重复的文件 ID 时，host 忽略这些 ID 并记录非重大缺口，运行继续。
 
 代码搜索同样由 host 执行，模型线程的 MCP 仍全部关闭。host 向 `https://mcp.grep.app` 发送 JSON-RPC `tools/call`，调用 `searchGitHub`，请求不带任何凭证。该服务无会话，响应为 SSE；每次最多 10 条结果，链接指向分支而不是提交，也没有星数和日期。发现阶段最多搜 3 个 pattern，按命中的不同 pattern 数排序，忽略示例和文档路径，最多把 4 个新仓库合并为一次 `repo:` GitHub 搜索，再交给 `collectEntries` 的同一门槛。树验证通过后，每个仓库最多再搜 2 个发现阶段未命中的 pattern。`repo` 参数是部分匹配，所以 host 只保留仓库名完全一致、且路径存在于固定提交树的命中，写入 `RepositorySnapshot.codeMatches`。文件挑选和证据读取优先使用这些文件，摘录窗口对准 pattern 所在行。查询记录写入 `research.codeSearch`，随 manifest 保存。`research.md` 没有修改，规则包摘要不变。
 

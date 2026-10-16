@@ -7,7 +7,7 @@ import { GitHubResearcher } from "../src/github.ts";
 import { ProviderRequestError } from "../src/request-failure.ts";
 import { parseIntake } from "../src/model-schema.ts";
 import { DEFAULT_QUALITY_BAR } from "../src/repository-screening.ts";
-import type { CodeSearchSummary, RepositoryCandidate, RepositorySnapshot, TreeFile } from "../src/types.ts";
+import type { CodeSearchSummary, RepositoryCandidate, RepositorySnapshot, ResearchGap, TreeFile } from "../src/types.ts";
 import type { DomainMaterial } from "../src/repository-screening.ts";
 import { REFERENCE_PLAN_MODULES, REFERENCE_POLICY_INPUTS } from "../src/instructions.ts";
 import { renderReport } from "../src/report.ts";
@@ -1876,6 +1876,124 @@ describe("workflow gates and readiness", () => {
       const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
       expect(filePrompt).toContain("\"fileId\":\"C1Z1\",\"path\":\"vendor/legacy/deep/path/refund_hook.ts\"");
       expect(filePrompt).toContain("\"codeMatch\":\"refund_hook\"");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("lists each selected tree once without its file list and gives every file only its own fields", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const snapshot = repositorySnapshot();
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), onPrompt: (prompt) => prompts.push(prompt) }),
+        researcher: researcher({ snapshots: [snapshot] }).value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      const trees = filePrompt.split("COMMIT-PINNED TREES:\n\n")[1]!.split("\n\nACTUAL FILE ID AND PATH LIST:")[0]!;
+      expect(JSON.parse(trees)).toEqual([
+        { candidateId: "C1", source: "github:org/refunds", commitSha: "a".repeat(40), commitDate: "2025-12-01T00:00:00Z", lastActivityAt: "2026-01-01T00:00:00Z", treeTruncated: false },
+      ]);
+      const list = filePrompt.split("ACTUAL FILE ID AND PATH LIST:\n\n")[1]!.split("\n\nBEGIN HOST-PROVIDED MODULE")[0]!;
+      const groups = JSON.parse(list) as Array<{ source: string; files: Array<Record<string, unknown>> }>;
+      expect(groups.map((group) => group.source)).toEqual(["local project", "github:org/refunds"]);
+      expect(groups[1]!.files.map((file) => file.fileId)).toContain("C1F1");
+      expect(groups[1]!.files.every((file) => snapshot.files.some((treeFile) => treeFile.id === file.fileId))).toBe(true);
+      for (const file of groups.flatMap((group) => group.files)) {
+        expect(Object.keys(file).every((key) => ["fileId", "path", "size", "roleHint", "codeMatch"].includes(key))).toBe(true);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the file list within 300,000 characters, gives each source an equal share and ignores a file the limit left out", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const longTree = (candidate: RepositoryCandidate): RepositorySnapshot => ({
+      ...snapshotFor(candidate),
+      files: Array.from({ length: 700 }, (_, index) => ({ id: `${candidate.id}L${index + 1}`, path: `src/refund/${"nested/".repeat(40)}refund_handler_${index + 1}.ts`, size: 100 })),
+    });
+    const second: RepositoryCandidate = { ...repositorySnapshot().candidate, id: "C2", fullName: "org/refund-two", webUrl: "https://github.com/org/refund-two" };
+    const snapshots = [longTree(repositorySnapshot().candidate), longTree(second)];
+    const groupsOf = (prompt: string) =>
+      JSON.parse(prompt.split("ACTUAL FILE ID AND PATH LIST:\n\n")[1]!.split("\n\nBEGIN HOST-PROVIDED MODULE")[0]!) as Array<{ source: string; files: Array<{ fileId: string }> }>;
+    const checkpointGaps: ResearchGap[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          selection: { selected: [{ candidateId: "C1", rationale: "Refund handlers." }, { candidateId: "C2", rationale: "More refund handlers." }], rejected: [] },
+          onPrompt: (prompt) => prompts.push(prompt),
+          turnResult: (kind) => {
+            if (kind === "plan") return timedOutTurn();
+            if (kind !== "files") return undefined;
+            // Choose one offered file and one ranked file that the character limit left out.
+            const offered = new Set(groupsOf(prompts.at(-1)!).flatMap((group) => group.files.map((file) => file.fileId)));
+            const leftOut = snapshots[1]!.files.find((file) => !offered.has(file.id))!.id;
+            const files = [{ fileId: "C1L1", role: "production", rationale: "Handler." }, { fileId: leftOut, role: "production", rationale: "Left out." }];
+            return { status: "completed", text: JSON.stringify({ files }), threadId: "thread-1", turnId: "turn-files" };
+          },
+        }),
+        researcher: researcher({ candidates: snapshots.map((snapshot) => snapshot.candidate), snapshots }).value,
+        onCheckpoint: async (input) => {
+          checkpointGaps.push(...input.gaps);
+          return undefined;
+        },
+      });
+
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      const list = filePrompt.split("ACTUAL FILE ID AND PATH LIST:\n\n")[1]!.split("\n\nBEGIN HOST-PROVIDED MODULE")[0]!;
+      const groups = groupsOf(filePrompt);
+      const share = Math.floor((300_000 - groups.length - 1) / groups.length);
+      expect(list.length).toBeLessThanOrEqual(300_000);
+      expect(groups.map((group) => group.source)).toEqual(["local project", "github:org/refunds", "github:org/refund-two"]);
+      for (const group of groups.slice(1)) {
+        expect(JSON.stringify(group).length).toBeLessThanOrEqual(share);
+        expect(JSON.stringify(group).length).toBeGreaterThan(share - 500);
+      }
+      const offered = groups.reduce((count, group) => count + group.files.length, 0);
+      expect(outcome.status).toBe("timed_out");
+      expect(checkpointGaps).toContainEqual({ kind: "file", material: false, message: `The file list for model selection left out ${1_400 - offered} lower-ranked files to stay within 300,000 characters.` });
+      expect(checkpointGaps).toContainEqual({ kind: "file", material: false, message: "The model chose 1 file ID(s) that were not offered or were repeated; the host ignored them." });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores file IDs that were not offered or were repeated, records a gap and continues", async () => {
+    const cwd = await tempDirectory();
+    const progressMessages: string[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          fileSelection: {
+            files: [
+              { fileId: "C1F1", role: "production", rationale: "Main handler." },
+              { fileId: "C1F99", role: "production", rationale: "Not in the tree." },
+              { fileId: "C1F1", role: "production", rationale: "Repeated." },
+            ],
+          },
+        }),
+        researcher: researcher({ snapshots: [repositorySnapshot()] }).value,
+        onProgress: (event) => progressMessages.push(event.message),
+      });
+
+      expect(outcome.status).toBe("completed");
+      expect(progressMessages).toContain("Selected 1 source files for bounded reads.");
+      if (outcome.status === "completed") {
+        expect(outcome.gaps).toContainEqual({ kind: "file", material: false, message: "The model chose 2 file ID(s) that were not offered or were repeated; the host ignored them." });
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

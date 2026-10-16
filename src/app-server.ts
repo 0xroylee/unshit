@@ -79,6 +79,9 @@ class RequestAbortedError extends Error {
   }
 }
 
+// Codex answered a request with a JSON-RPC error. Its reason outranks a disconnect that follows the answer.
+class RequestRejectedError extends Error {}
+
 class TurnControl {
   reason: CancelReason | undefined;
   private resolveCancel!: (reason: CancelReason) => void;
@@ -271,6 +274,12 @@ export class AppServerClient {
         startRequest.then((response) => ({ kind: "response" as const, response })),
         control.canceled.then((reason) => ({ kind: "cancelled" as const, reason })),
       ]);
+      if (startOutcome.kind === "cancelled" && startOutcome.reason.kind === "transport_failure") {
+        // Codex can answer with an error and then close the connection. A disconnect settles every pending request, so
+        // waiting is brief, and the answer wins over the disconnect.
+        const answer = await startRequest.then(() => undefined, (error: unknown) => error);
+        if (answer instanceof RequestRejectedError) throw answer;
+      }
       if (startOutcome.kind === "cancelled") {
         const belongsToActiveTurn = (notification: Notification): boolean => {
           const notificationId = notificationTurnId(notification);
@@ -382,7 +391,7 @@ export class AppServerClient {
       if (control.reason?.kind === "needs_input") return { status: "needs_input", questions: control.reason.questions, threadId, ...(turnId ?? activeTurn.turnId ? { turnId: turnId ?? activeTurn.turnId } : {}) };
       if (control.reason?.kind === "tool_forbidden") return { status: "failed", message: control.reason.message, threadId, ...(turnId ? { turnId } : {}) };
       if (control.reason?.kind === "signal") return this.cancelResult(control.reason, threadId, turnId);
-      if (control.reason?.kind === "transport_failure") return timedOut ? this.timeoutResult(timedOut, threadId, turnId) : { status: "failed", message: control.reason.message, threadId, ...(turnId ? { turnId } : {}) };
+      if (control.reason?.kind === "transport_failure" && !(error instanceof RequestRejectedError)) return timedOut ? this.timeoutResult(timedOut, threadId, turnId) : { status: "failed", message: control.reason.message, threadId, ...(turnId ? { turnId } : {}) };
       return { status: "failed", message: safeError(error), threadId, ...(turnId ? { turnId } : {}) };
     } finally {
       this.currentTurn = undefined;
@@ -459,7 +468,7 @@ export class AppServerClient {
       if (!pending) return;
       this.pending.delete(key);
       clearTimeout(pending.timeout);
-      if (message.error) pending.reject(new Error(`Codex App Server request ${pending.method} failed.`));
+      if (message.error) pending.reject(new RequestRejectedError(requestFailureText(pending.method, message.error)));
       else pending.resolve(message.result);
     }
   }
@@ -737,6 +746,13 @@ function describeTurnError(value: unknown): string | undefined {
   const details = typeof value.additionalDetails === "string" ? value.additionalDetails.trim() : "";
   const text = [value.message.trim(), label ? `(${label})` : "", details].filter(Boolean).join(" ");
   return scrubSensitiveText(text).slice(0, 300);
+}
+
+// Codex's own reason for a rejected request. safeError scrubs endpoints and tokens and bounds the text before it
+// leaves the client.
+function requestFailureText(method: string, error: unknown): string {
+  const reason = isRecord(error) && typeof error.message === "string" ? error.message.trim() : "";
+  return reason ? `Codex App Server request ${method} failed: ${reason}` : `Codex App Server request ${method} failed.`;
 }
 
 // codexErrorInfo is a variant name, or an object keyed by the variant name with fields such as httpStatusCode.

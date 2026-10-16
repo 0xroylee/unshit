@@ -544,6 +544,39 @@ describe("failed turn causes", () => {
     expect(message.startsWith("Codex turn ended with status failed: Upstream failure. (other) xxx")).toBe(true);
     expect(message.length).toBe("Codex turn ended with status failed: ".length + 300);
   });
+
+  test("a rejected turn request keeps the reason Codex gave, scrubbed and bounded", async () => {
+    const rejecting = (error: Record<string, unknown>) => createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-reject")) return;
+        if (message.method === "turn/start") process.sendJsonChunk({ jsonrpc: "2.0", id: message.id!, error });
+      },
+    }));
+    const token = `ghp_${"A".repeat(36)}`;
+
+    expect(await failedMessage(rejecting({ code: -32600, message: "Input exceeds the maximum length of 1048576 characters." })))
+      .toBe("Codex App Server request turn/start failed: Input exceeds the maximum length of 1048576 characters.");
+    expect(await failedMessage(rejecting({ code: -32603, message: `Rejected at https://api.example.test/v1/responses using ${token}` })))
+      .toBe("Codex App Server request turn/start failed: Rejected at remote endpoint using [redacted]");
+    expect(await failedMessage(rejecting({ code: -32603 }))).toBe("Codex App Server request turn/start failed.");
+    expect(await failedMessage(rejecting({ code: -32603, message: "y".repeat(1_000) }))).toHaveLength(240);
+  });
+
+  test("a rejected turn request keeps its reason when the connection closes right after the answer", async () => {
+    for (const close of ["disconnect", "exit"] as const) {
+      const fixture = createMockSpawner(() => ({
+        onClientMessage(message, process) {
+          if (answerHandshake(message, process, "thread-closing")) return;
+          if (message.method !== "turn/start") return;
+          process.sendJsonChunk({ jsonrpc: "2.0", id: message.id!, error: { code: -32600, message: "Input exceeds the maximum length of 1048576 characters." } });
+          if (close === "disconnect") process.disconnect();
+          else process.exit(1);
+        },
+      }));
+
+      expect(await failedMessage(fixture)).toBe("Codex App Server request turn/start failed: Input exceeds the maximum length of 1048576 characters.");
+    }
+  });
 });
 
 describe("model turn time limits", () => {

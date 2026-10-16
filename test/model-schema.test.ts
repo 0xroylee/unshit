@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CANDIDATE_RANKING_SCHEMA, INTAKE_SCHEMA, ModelOutputError, REFINED_BRIEF_SCHEMA, parseCandidateRanking, parseIntake, parsePlan, parseRefinedBrief, stableMaterialQuestionId } from "../src/model-schema.ts";
+import { CANDIDATE_RANKING_SCHEMA, INTAKE_SCHEMA, ModelOutputError, REFINED_BRIEF_SCHEMA, parseCandidateRanking, parseFileSelection, parseIntake, parsePlan, parseRefinedBrief, stableMaterialQuestionId } from "../src/model-schema.ts";
 import type { EvidenceExcerpt, EvidenceSource, IntakeBrief, RepositorySnapshot } from "../src/types.ts";
 
 const brief = parseIntake({
@@ -254,6 +254,18 @@ describe("candidate ranking", () => {
     expect(() => parseCandidateRanking({ ranked: ["C1", "C1"] }, candidates)).toThrow("Repository candidate appears more than once: C1.");
     expect(() => parseCandidateRanking({ ranked: Array.from({ length: 13 }, () => "C1") }, candidates)).toThrow("ranked must contain 0 to 12 items.");
     expect(CANDIDATE_RANKING_SCHEMA).toMatchObject({ required: ["ranked"], properties: { ranked: { maxItems: 12 } } });
+  });
+});
+
+describe("file selection", () => {
+  test("keeps offered file IDs once, in order, and counts the IDs it ignores", () => {
+    const offered = [{ id: "A" }, { id: "B" }];
+    const choice = (fileId: string) => ({ fileId, role: "production" as const, rationale: "Relevant." });
+
+    expect(parseFileSelection({ files: [choice("A"), choice("X"), choice("A"), choice("B")] }, offered)).toEqual({ files: [choice("A"), choice("B")], ignored: 2 });
+    expect(parseFileSelection({ files: [choice("B"), choice("X"), choice("A"), choice("B")] }, offered)).toEqual({ files: [choice("B"), choice("A")], ignored: 2 });
+    expect(parseFileSelection({ files: [choice("X")] }, offered)).toEqual({ files: [], ignored: 1 });
+    expect(() => parseFileSelection({ files: [{ fileId: "A", role: "owner", rationale: "Relevant." }] }, offered)).toThrow(ModelOutputError);
   });
 });
 

@@ -46,6 +46,7 @@ import type {
   ResolvedAnswer,
   ResearchSummary,
   ValidationRecord,
+  SelectedFile,
   TreeFile,
 } from "./types.ts";
 
@@ -336,21 +337,26 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     checkpointRepositoryChoices = repositoryChoices;
 
     throwIfAborted(options.signal);
-    const fileCandidates = candidateFiles(local.files, selectedSnapshots, domainTermsFor(brief, resolvedAnswerContext));
-    let fileSelection: ReturnType<typeof parseFileSelection> = [];
-    if (fileCandidates.length > 0) {
+    const choices = fileChoices(local.files, selectedSnapshots, domainTermsFor(brief, resolvedAnswerContext));
+    if (choices.omitted > 0) {
+      gaps.push({ kind: "file", material: false, message: `The file list for model selection left out ${choices.omitted} lower-ranked files to stay within 300,000 characters.` });
+    }
+    let fileSelection: SelectedFile[] = [];
+    if (choices.offered.length > 0) {
       progress({ stage: "file_selection", state: "started", message: "Choosing production and test files from actual local and commit-pinned trees." });
       const fileValue = await modelJson(
         planningSession,
-        fileSelectionPrompt(brief, resolvedAnswerContext, fileCandidates, selectedSnapshots),
+        fileSelectionPrompt(brief, resolvedAnswerContext, choices),
         FILE_SELECTION_SCHEMA,
         "research",
         "file selection",
         options.signal,
       );
-      fileSelection = parseFileSelection(fileValue, fileCandidates.flatMap((candidate) =>
-        typeof candidate.fileId === "string" ? [{ id: candidate.fileId }] : [],
-      ));
+      const parsed = parseFileSelection(fileValue, choices.offered);
+      fileSelection = parsed.files;
+      if (parsed.ignored > 0) {
+        gaps.push({ kind: "file", material: false, message: `The model chose ${parsed.ignored} file ID(s) that were not offered or were repeated; the host ignored them.` });
+      }
       progress({ stage: "file_selection", state: "completed", message: `Selected ${fileSelection.length} source files for bounded reads.` });
     } else {
       gaps.push({ kind: "file", message: "No eligible source or test file IDs were available for evidence selection.", material: true });
@@ -712,52 +718,88 @@ function repositorySelectionPrompt(
   ].join("\n\n");
 }
 
-function candidateFiles(localFiles: TreeFile[], snapshots: RepositorySnapshot[], terms: ReturnType<typeof domainTermsFor>): Array<Record<string, unknown>> {
-  const result: Array<Record<string, unknown>> = [];
-  for (const file of rankTreeFiles(localFiles, terms, 300)) result.push({ fileId: file.id, path: file.path, size: file.size, source: "local project", roleHint: pathRoleHint(file.path) });
-  for (const snapshot of snapshots) {
-    const filesById = new Map(snapshot.files.map((file) => [file.id, file]));
-    const patternsById = new Map((snapshot.codeMatches ?? []).map((match) => [match.fileId, match.patterns]));
-    const codeMatched = (snapshot.codeMatches ?? []).flatMap((match) => {
-      const file = filesById.get(match.fileId);
-      return file && isTextSourcePath(file.path) ? [file] : [];
-    });
-    const files = [...new Map([...codeMatched, ...rankTreeFiles(snapshot.files, terms, 800)].map((file) => [file.id, file])).values()].slice(0, 800);
-    for (const file of files) {
-      const patterns = patternsById.get(file.id);
-      result.push({
-        fileId: file.id,
-        path: file.path,
-        size: file.size,
-        source: `${snapshot.candidate.provider}:${snapshot.candidate.fullName}`,
-        commitSha: snapshot.commitSha,
-        commitDate: snapshot.commitDate ?? null,
-        lastActivityAt: snapshot.candidate.lastActivityAt ?? null,
-        roleHint: pathRoleHint(file.path),
-        ...(patterns ? { codeMatch: patterns.join(", ") } : {}),
-      });
-    }
-  }
-  return result;
+// The serialized file list offered for model selection never exceeds this many characters.
+const FILE_LIST_LIMIT = 300_000;
+
+interface FileChoice {
+  fileId: string;
+  path: string;
+  size: number | null;
+  roleHint: string;
+  codeMatch?: string;
 }
 
-function fileSelectionPrompt(
-  brief: IntakeBrief,
-  answers: ResolvedAnswer[],
-  files: Array<Record<string, unknown>>,
-  snapshots: Array<{ candidate: { id: string; provider: string; fullName: string }; commitSha: string; treeTruncated: boolean }>,
-): string {
+interface FileChoices {
+  trees: Array<{ candidateId: string; source: string; commitSha: string; commitDate: string | null; lastActivityAt: string | null; treeTruncated: boolean }>;
+  groups: Array<{ source: string; files: FileChoice[] }>;
+  offered: Array<{ id: string }>;
+  omitted: number;
+}
+
+// Repository and commit details appear once per selected tree, never its whole file list. The local project and each
+// tree fill an equal share of FILE_LIST_LIMIT with their ranked files, so the lowest-ranked files are left out first.
+function fileChoices(localFiles: TreeFile[], snapshots: RepositorySnapshot[], terms: ReturnType<typeof domainTermsFor>): FileChoices {
+  const ranked = [
+    { source: "local project", files: rankTreeFiles(localFiles, terms, 300).map((file) => fileChoice(file)) },
+    ...snapshots.map((snapshot) => {
+      const filesById = new Map(snapshot.files.map((file) => [file.id, file]));
+      const patternsById = new Map((snapshot.codeMatches ?? []).map((match) => [match.fileId, match.patterns]));
+      const codeMatched = (snapshot.codeMatches ?? []).flatMap((match) => {
+        const file = filesById.get(match.fileId);
+        return file && isTextSourcePath(file.path) ? [file] : [];
+      });
+      const files = [...new Map([...codeMatched, ...rankTreeFiles(snapshot.files, terms, 800)].map((file) => [file.id, file])).values()].slice(0, 800);
+      return { source: treeSource(snapshot), files: files.map((file) => fileChoice(file, patternsById.get(file.id))) };
+    }),
+  ];
+  const share = Math.floor((FILE_LIST_LIMIT - ranked.length - 1) / ranked.length);
+  let omitted = 0;
+  const groups = ranked.map(({ source, files }) => {
+    const kept: FileChoice[] = [];
+    let size = JSON.stringify({ source, files: [] }).length;
+    for (const file of files) {
+      size += JSON.stringify(file).length + 1;
+      if (size > share) break;
+      kept.push(file);
+    }
+    omitted += files.length - kept.length;
+    return { source, files: kept };
+  });
+  return {
+    trees: snapshots.map((snapshot) => ({
+      candidateId: snapshot.candidate.id,
+      source: treeSource(snapshot),
+      commitSha: snapshot.commitSha,
+      commitDate: snapshot.commitDate ?? null,
+      lastActivityAt: snapshot.candidate.lastActivityAt ?? null,
+      treeTruncated: snapshot.treeTruncated,
+    })),
+    groups,
+    offered: groups.flatMap((group) => group.files.map((file) => ({ id: file.fileId }))),
+    omitted,
+  };
+}
+
+function fileChoice(file: TreeFile, patterns?: string[]): FileChoice {
+  return { fileId: file.id, path: file.path, size: file.size, roleHint: pathRoleHint(file.path), ...(patterns ? { codeMatch: patterns.join(", ") } : {}) };
+}
+
+function treeSource(snapshot: RepositorySnapshot): string {
+  return `${snapshot.candidate.provider}:${snapshot.candidate.fullName}`;
+}
+
+function fileSelectionPrompt(brief: IntakeBrief, answers: ResolvedAnswer[], choices: FileChoices): string {
   return [
     "Choose up to fifteen local or remote production and test files that can answer specific design questions in the brief.",
-    "Use only supplied file IDs and choose role production or test. Select relevant implementation and tests. The host separately reads a bounded project manifest, license, and CI file when present. A remote file ID resolves only to the exact SHA shown in the repository tree. Never invent paths or claim to have read files.",
+    "Use only supplied file IDs and choose role production or test. Select relevant implementation and tests. The host separately reads a bounded project manifest, license, and CI file when present. A remote file ID resolves only to the exact SHA shown for its source in the commit-pinned trees. Never invent paths or claim to have read files.",
     "A codeMatch value lists literal patterns that the host's code search found at that path in Grep's index of the default branch. The path exists in the pinned tree, but the file is not evidence until the host reads it at the pinned commit.",
     "Return only the requested JSON.",
     "CLARIFIED BRIEF:",
     JSON.stringify({ summary: brief.summary, requirements: brief.requirements, answers }),
     "COMMIT-PINNED TREES:",
-    JSON.stringify(snapshots),
+    JSON.stringify(choices.trees),
     "ACTUAL FILE ID AND PATH LIST:",
-    JSON.stringify(files),
+    JSON.stringify(choices.groups),
   ].join("\n\n");
 }
 
