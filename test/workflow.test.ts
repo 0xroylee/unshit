@@ -7,7 +7,7 @@ import { GitHubResearcher } from "../src/github.ts";
 import { ProviderRequestError } from "../src/request-failure.ts";
 import { parseIntake } from "../src/model-schema.ts";
 import { DEFAULT_QUALITY_BAR } from "../src/repository-screening.ts";
-import type { RepositoryCandidate, RepositorySnapshot, TreeFile } from "../src/types.ts";
+import type { CodeSearchSummary, RepositoryCandidate, RepositorySnapshot, TreeFile } from "../src/types.ts";
 import type { DomainMaterial } from "../src/repository-screening.ts";
 import { REFERENCE_PLAN_MODULES, REFERENCE_POLICY_INPUTS } from "../src/instructions.ts";
 import { renderReport } from "../src/report.ts";
@@ -157,10 +157,13 @@ function researcher(options: {
   }>;
   shortlistGaps?: Array<{ kind: "tree" | "search"; message: string; material: boolean }>;
   shortlistRateLimited?: boolean;
+  shortlistCodeSearch?: CodeSearchSummary;
+  discoveryCodeSearch?: CodeSearchSummary;
   discoveryGaps?: Array<{ kind: "search"; message: string; material: boolean }>;
-} = {}): { value: GitHubResearcher; searches: number; materials: DomainMaterial[] } {
+} = {}): { value: GitHubResearcher; searches: number; materials: DomainMaterial[]; shortlistPatterns: string[][] } {
   let searches = 0;
   const materials: DomainMaterial[] = [];
+  const shortlistPatterns: string[][] = [];
   const snapshots = options.snapshots ?? [repositorySnapshot()];
   const candidates = options.candidates ?? snapshots.map((snapshot) => snapshot.candidate);
   const content = new Map<string, string>([
@@ -190,12 +193,21 @@ function researcher(options: {
           excluded: options.discoveryExcluded?.length ?? 0,
           rateLimited: false,
           trustworthyReferenceFound: false,
+          ...(options.discoveryCodeSearch ? { codeSearch: options.discoveryCodeSearch } : {}),
         },
       };
     },
-    async resolveShortlist() {
+    async resolveShortlist(_candidates: unknown, _signal?: unknown, _onProgress?: unknown, codePatterns: string[] = []) {
+      shortlistPatterns.push(codePatterns);
       const excluded = options.shortlistExcluded ?? [];
-      return { snapshots, excluded, resolutions: snapshots.length + excluded.length, gaps: options.shortlistGaps ?? [], rateLimited: options.shortlistRateLimited ?? false };
+      return {
+        snapshots,
+        excluded,
+        resolutions: snapshots.length + excluded.length,
+        gaps: options.shortlistGaps ?? [],
+        rateLimited: options.shortlistRateLimited ?? false,
+        ...(options.shortlistCodeSearch ? { codeSearch: options.shortlistCodeSearch } : {}),
+      };
     },
     async fetchSource(_snapshot: RepositorySnapshot, filePath: string) {
       if (options.sourceFailure !== undefined && (!options.sourceFailurePath || filePath === options.sourceFailurePath)) {
@@ -205,7 +217,7 @@ function researcher(options: {
       return new TextEncoder().encode(content.get(filePath) ?? `export const path = '${filePath}';\n`);
     },
   } as unknown as GitHubResearcher;
-  return { value, get searches() { return searches; }, materials };
+  return { value, get searches() { return searches; }, materials, shortlistPatterns };
 }
 
 function providerFailureWithThrowingGetter(marker: string): ProviderRequestError {
@@ -1164,6 +1176,215 @@ describe("workflow gates and readiness", () => {
         expect(outcome.initialBrief?.materialQuestions).toEqual(priorQuestions);
         expect(outcome.brief.summary).toBe("Clarified ticket and refund brief.");
       }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("asks intake for literal code patterns and carries them into the rebuilt brief", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const question = { question: "Who may approve a refund?", whyMaterial: "This defines the refund authorization boundary." };
+    const questionId = parseIntake(baseIntake([question])).materialQuestions[0]!.id;
+    const refs = researcher();
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build refunds.",
+        answers: { [questionId]: "Only refund managers." },
+        modelGateway: gateway({
+          intake: { ...baseIntake([question]), codePatterns: ["createRefund"] },
+          refined: { ...baseIntake(), codePatterns: ["createRefund", "refund_status"] },
+          onPrompt: (prompt) => prompts.push(prompt),
+        }),
+        researcher: refs.value,
+      });
+      expect(outcome.status).toBe("completed");
+      expect(prompts[0]).toContain("Supply 1–4 codePatterns: identifiers or lowercase words that source files implementing the core workflow would literally contain, such as OrderRefund, refund_amount, or checkin.");
+      expect(prompts[0]).toContain("Use only letters, digits, and underscores, and put the most distinctive pattern first.");
+      const rebuild = prompts.find((prompt) => prompt.startsWith("Rebuild the software brief"))!;
+      expect(rebuild).toContain("domainTerms, topicSlugs, codePatterns, and researchQueries to reflect those decisions");
+      expect(rebuild).toContain("\"codePatterns\":[\"createRefund\"]");
+      expect(refs.materials[0]?.codePatterns).toEqual(["createRefund", "refund_status"]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("passes code patterns to tree screening and shows host code matches to the model and the report", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const base = repositorySnapshot();
+    const one: RepositorySnapshot = {
+      ...base,
+      candidate: { ...base.candidate, codeMatches: [{ pattern: "OrderRefund", path: "src/index.ts" }] },
+      codeMatches: [{ fileId: "C1F1", path: "src/index.ts", patterns: ["createRefund"] }],
+    };
+    const two = snapshotFor({ ...base.candidate, id: "C2", fullName: "org/two", webUrl: "https://github.com/org/two", codeMatches: [{ pattern: "refund_status", path: "src/index.ts" }] });
+    const three: RepositoryCandidate = { ...base.candidate, id: "C3", fullName: "org/three", webUrl: "https://github.com/org/three", codeMatches: [{ pattern: "createRefund", path: "src/index.ts" }] };
+    const codeSearch: CodeSearchSummary = {
+      queries: [
+        { provider: "grep", purpose: "location", query: "refund_status", repository: "org/refunds", status: "ok", resultCount: 0 },
+        {
+          provider: "grep",
+          purpose: "location",
+          query: "OrderRefund",
+          repository: "org/refunds",
+          status: "failed",
+          resultCount: 0,
+          failure: { provider: "grep", endpoint: "search", category: "http_status", status: 503, attempts: 2, retryRefused: false },
+        },
+      ],
+      requests: 2,
+      budget: 12,
+      repositoriesMatched: 0,
+      repositoriesScreened: 0,
+      metadataRequests: 0,
+    };
+    const discoveryCodeSearch: CodeSearchSummary = {
+      queries: [
+        { provider: "grep", purpose: "discovery", query: "createRefund", status: "ok", resultCount: 3 },
+        { provider: "grep", purpose: "discovery", query: "refund_status", status: "ok", resultCount: 1 },
+      ],
+      requests: 2,
+      budget: 12,
+      repositoriesMatched: 2,
+      repositoriesScreened: 1,
+      metadataRequests: 1,
+    };
+    const refs = researcher({
+      snapshots: [one, two],
+      shortlistExcluded: [{ candidate: three, reasons: ["no test file at the pinned commit"] }],
+      shortlistCodeSearch: codeSearch,
+      discoveryCodeSearch,
+    });
+    let report = "";
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: { ...baseIntake(), codePatterns: ["createRefund", "refund_status"] },
+          selection: {
+            selected: [{ candidateId: "C1", rationale: "The repository implements refund requests." }],
+            rejected: [{ candidateId: "C2", rationale: "It only wraps a payment library." }],
+          },
+          onPrompt: (prompt) => prompts.push(prompt),
+        }),
+        researcher: refs.value,
+        onArtifacts: async (input) => {
+          report = renderReport(input);
+          return undefined;
+        },
+      });
+      expect(outcome.status).toBe("completed");
+      expect(refs.shortlistPatterns).toEqual([["createRefund", "refund_status"]]);
+      const selectionPrompt = prompts.find((prompt) => prompt.startsWith("Select zero to three public repository"))!;
+      expect(selectionPrompt).toContain("\"codeMatchedFiles\":1");
+      expect(selectionPrompt).toContain("\"codePatterns\":[\"createRefund\"]");
+      expect(selectionPrompt).toContain("Use them as relevance hints, not as evidence.");
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      expect(filePrompt).toContain("\"fileId\":\"C1F1\",\"path\":\"src/index.ts\"");
+      expect(filePrompt).toContain("\"codeMatch\":\"createRefund\"");
+      expect(filePrompt).toContain("the file is not evidence until the host reads it at the pinned commit.");
+      if (outcome.status === "completed") {
+        expect(outcome.research?.codeSearch?.requests).toBe(4);
+        const choices = new Map(outcome.plan.repositoryChoices.map((choice) => [choice.candidateId, choice.codeMatches]));
+        expect(choices.get("C1")).toEqual(["OrderRefund", "createRefund"]);
+        expect(choices.get("C2")).toEqual(["refund_status"]);
+        expect(choices.get("C3")).toEqual(["createRefund"]);
+      }
+      const lines = report.split("\n");
+      expect(report).toContain("Code search (Grep by Vercel): 4/12 request(s)");
+      expect(report).toContain("- grep location `refund_status` in org/refunds — ok; 0 result(s).");
+      expect(lines.find((line) => line.startsWith("- Selected [github:org/refunds]"))).toContain("Code search matched `OrderRefund`, `createRefund`.");
+      expect(lines.find((line) => line.startsWith("- Rejected [github:org/two]"))).toContain("Code search matched `refund_status`.");
+      expect(lines.find((line) => line.startsWith("- Host excluded [github:org/three]"))).toContain("Code search matched `createRefund`.");
+      if (outcome.status === "completed") {
+        expect(outcome.research?.codeSearch).toMatchObject({
+          requests: 4,
+          budget: 12,
+          repositoriesMatched: 2,
+          repositoriesScreened: 1,
+          metadataRequests: 1,
+        });
+        expect(outcome.research?.codeSearch?.queries.map((query) => [query.purpose, query.query, query.status])).toEqual([
+          ["discovery", "createRefund", "ok"],
+          ["discovery", "refund_status", "ok"],
+          ["location", "refund_status", "ok"],
+          ["location", "OrderRefund", "failed"],
+        ]);
+      }
+      expect(report).toContain("Code search (Grep by Vercel): 4/12 request(s); 2 repositories matched outside example and documentation paths; 1 new repositories screened with 1 GitHub metadata request(s).");
+      expect(report).toContain("- grep location `OrderRefund` in org/refunds — failed (Grep search request failed after one retry: HTTP 503); 0 result(s).");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps non-text code matches out of the file list", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const base = repositorySnapshot();
+    const textMatch: TreeFile = { id: "C1F7", path: "src/refund_match.ts", size: 100 };
+    const imageMatch: TreeFile = { id: "C1F8", path: "assets/refund-flow.png", size: 100 };
+    const snapshot: RepositorySnapshot = {
+      ...base,
+      files: [...base.files, textMatch, imageMatch],
+      codeMatches: [
+        { fileId: textMatch.id, path: textMatch.path, patterns: ["OrderRefund"] },
+        { fileId: imageMatch.id, path: imageMatch.path, patterns: ["refund_flow"] },
+      ],
+    };
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: { ...baseIntake(), codePatterns: ["OrderRefund", "refund_flow"] },
+          onPrompt: (prompt) => prompts.push(prompt),
+        }),
+        researcher: researcher({ snapshots: [snapshot] }).value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      const actualFileList = filePrompt.split("ACTUAL FILE ID AND PATH LIST:\n\n")[1]?.split("\n\nBEGIN HOST-PROVIDED MODULE")[0] ?? "";
+      expect(actualFileList).toContain("\"fileId\":\"C1F7\",\"path\":\"src/refund_match.ts\"");
+      expect(actualFileList).toContain("\"codeMatch\":\"OrderRefund\"");
+      expect(actualFileList).not.toContain("C1F8");
+      expect(actualFileList).not.toContain("assets/refund-flow.png");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("lists a code-matched file even when the path ranking would cut it", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const base = repositorySnapshot();
+    const filler: TreeFile[] = Array.from({ length: 850 }, (_, index) => ({ id: `C1X${index + 1}`, path: `src/refund_module_${index}.ts`, size: 100 }));
+    const matched: TreeFile = { id: "C1Z1", path: "vendor/legacy/deep/path/refund_hook.ts", size: 100 };
+    const snapshot: RepositorySnapshot = {
+      ...base,
+      files: [...base.files, ...filler, matched],
+      codeMatches: [{ fileId: "C1Z1", path: matched.path, patterns: ["refund_hook"] }],
+    };
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: { ...baseIntake(), codePatterns: ["refund_hook"] },
+          fileSelection: { files: [{ fileId: "C1Z1", role: "production", rationale: "Code match." }] },
+          onPrompt: (prompt) => prompts.push(prompt),
+        }),
+        researcher: researcher({ snapshots: [snapshot] }).value,
+      });
+      expect(outcome.status).toBe("completed");
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      expect(filePrompt).toContain("\"fileId\":\"C1Z1\",\"path\":\"vendor/legacy/deep/path/refund_hook.ts\"");
+      expect(filePrompt).toContain("\"codeMatch\":\"refund_hook\"");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

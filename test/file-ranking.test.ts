@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, test } from "bun:test";
 import { parseIntake } from "../src/model-schema.ts";
-import { domainTermsFor, isRootLicensePath, isTestPath, rankTreeFiles, scorePath } from "../src/file-ranking.ts";
+import { domainTermsFor, isDemoPath, isRootLicensePath, isTestPath, rankTreeFiles, scorePath } from "../src/file-ranking.ts";
 import type { ResolvedAnswer, TreeFile } from "../src/types.ts";
 
 const terms = [
@@ -94,6 +94,15 @@ describe("domain-ranked repository file lists", () => {
     }
     for (const path of ["NOTICE", "docs/LICENSE", "LICENSES/LICENSE-MIT.txt", "LICENSES/"]) {
       expect(isRootLicensePath(path)).toBe(false);
+    }
+  });
+
+  test("recognizes example, sample, demo, tutorial and documentation paths", () => {
+    for (const filePath of ["python/samples/handoff.py", "examples/refund.ts", "docs/refunds.md", "demo/app.ts", "site/tutorials/step1.ts", "Doc/guide.ts"]) {
+      expect(isDemoPath(filePath)).toBe(true);
+    }
+    for (const filePath of ["src/refunds.ts", "tests/refund.test.ts", "src/sample_data.ts", "documentation.ts"]) {
+      expect(isDemoPath(filePath)).toBe(false);
     }
   });
 });

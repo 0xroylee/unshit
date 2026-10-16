@@ -68,4 +68,8 @@ describe("modular reference-plan guidance", () => {
       }
     }
   });
+
+  test("describes host code-search matches as location hints", () => {
+    expect(DEVELOPER_INSTRUCTIONS).toContain("- The host may run grep.app code searches itself. A codeMatch, codeMatchedFiles, or codePatterns value only marks where to look; a file becomes evidence only after the host reads it at the pinned commit.");
+  });
 });

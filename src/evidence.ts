@@ -88,10 +88,16 @@ export async function loadSelectedEvidence(options: {
       return entry?.repository.candidate.id === repository.candidate.id ? [{ selection, file: entry.file }] : [];
     });
     const ranked = rankTreeFiles(repository.files, options.domainTerms ?? [], repository.files.length);
+    const filesById = new Map(repository.files.map((file) => [file.id, file]));
+    const codeMatched = (repository.codeMatches ?? []).flatMap((match) => filesById.get(match.fileId) ?? []);
     const selectedProduction = selectedFromRepository.find(({ selection, file }) => selection.role === "production" && isImplementationSourceFile(file.path));
-    const production = selectedProduction?.file ?? ranked.find((file) => isImplementationSourceFile(file.path));
+    const production = selectedProduction?.file
+      ?? codeMatched.find((file) => isImplementationSourceFile(file.path))
+      ?? ranked.find((file) => isImplementationSourceFile(file.path));
     const selectedTest = selectedFromRepository.find(({ selection, file }) => selection.role === "test" && isTestPath(file.path) && isTextSourcePath(file.path));
-    const test = selectedTest?.file ?? ranked.find((file) => isTestPath(file.path));
+    const test = selectedTest?.file
+      ?? codeMatched.find((file) => isTestPath(file.path) && isTextSourcePath(file.path))
+      ?? ranked.find((file) => isTestPath(file.path));
     if (production) {
       if (!add({ file: production, role: "production", kind: "remote", repository })) {
         gaps.push({ kind: "repository", message: `Production source ${production.path} for ${repository.candidate.fullName} exceeded the 24-file remote source budget.`, material: true });
@@ -187,7 +193,10 @@ export async function loadSelectedEvidence(options: {
       bytesBySourceId.set(sourceId, bytes);
       textBySourceId.set(sourceId, text);
 
-      const ranges = chooseExcerptRanges(lines, options.relevantText, Math.max(0, maxContextCharacters - excerptCharacters));
+      const anchors = item.kind === "remote"
+        ? item.repository!.codeMatches?.find((match) => match.fileId === item.file.id)?.patterns
+        : undefined;
+      const ranges = chooseExcerptRanges(lines, options.relevantText, Math.max(0, maxContextCharacters - excerptCharacters), anchors);
       if (ranges.length === 0) {
         gaps.push({ kind: item.kind === "local" ? "local" : "file", message: `No excerpt context remained for ${item.file.path}.`, material: true });
         continue;
@@ -319,16 +328,22 @@ function splitLines(text: string): string[] {
   return lines;
 }
 
-function chooseExcerptRanges(lines: string[], relevantText: string, remainingCharacters: number): Array<{ startLine: number; endLine: number }> {
+const DEFINITION_LINE = /\b(class|def|function|func|fn|interface|struct|type|enum|const|let|var)\b/;
+
+function chooseExcerptRanges(lines: string[], relevantText: string, remainingCharacters: number, anchors: string[] = []): Array<{ startLine: number; endLine: number }> {
   if (lines.length === 0 || remainingCharacters <= 0) return [];
   const maxChunkLines = 90;
   const maxChunkChars = Math.min(9_000, remainingCharacters);
   const matchTerms = [...new Set(relevantText.toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g) ?? [])].slice(0, 30);
+  const anchorTerms = anchors.map((anchor) => anchor.toLowerCase());
   let bestLine = 0;
   let bestScore = -1;
   for (let index = 0; index < lines.length; index += 1) {
     const lower = lines[index]!.toLowerCase();
-    const score = matchTerms.reduce((sum, term) => sum + (lower.includes(term) ? 1 : 0), 0);
+    const termScore = matchTerms.reduce((sum, term) => sum + (lower.includes(term) ? 1 : 0), 0);
+    // A definition of a code-search pattern beats an import or a call that only mentions it.
+    const anchorScore = anchorTerms.reduce((sum, anchor) => sum + (!lower.includes(anchor) ? 0 : DEFINITION_LINE.test(lower) ? 20 : 10), 0);
+    const score = termScore + anchorScore;
     if (score > bestScore) {
       bestScore = score;
       bestLine = index;

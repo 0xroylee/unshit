@@ -138,7 +138,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return readlineInterface.question(`\n${question.id}: ${question.question}\nWhy it matters: ${question.whyMaterial}\n> `);
   } : undefined;
   const gateway = new NativeModelGateway({ cwd, ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}) });
-  const researcher = new GitHubResearcher({ githubToken: process.env.GITHUB_TOKEN, gitlabToken: process.env.GITLAB_TOKEN });
+  const researcher = new GitHubResearcher({ githubToken: process.env.GITHUB_TOKEN, gitlabToken: process.env.GITLAB_TOKEN, codeSearch: true });
   const runId = createRunId();
   let flowHeaderPrinted = false;
 

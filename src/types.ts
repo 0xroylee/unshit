@@ -32,7 +32,7 @@ export type RequestFailureCategory =
   | "internal";
 
 export interface RequestFailure {
-  provider: "github" | "gitlab";
+  provider: "github" | "gitlab" | "grep";
   endpoint: RequestEndpoint;
   category: RequestFailureCategory;
   status?: number;
@@ -58,6 +58,7 @@ export interface IntakeBrief {
   researchQueries: string[];
   domainTerms: string[];
   topicSlugs: string[];
+  codePatterns?: string[];
 }
 
 export interface RepositoryQualitySignals {
@@ -93,6 +94,36 @@ export interface SearchQueryRecord {
   failure?: RequestFailure;
 }
 
+export interface CodePatternMatch {
+  pattern: string;
+  path: string;
+}
+
+export interface CodeMatch {
+  fileId: string;
+  path: string;
+  patterns: string[];
+}
+
+export interface CodeSearchQueryRecord {
+  provider: "grep";
+  purpose: "discovery" | "location";
+  query: string;
+  repository?: string;
+  status: "ok" | "failed" | "rate_limited" | "skipped";
+  resultCount: number;
+  failure?: RequestFailure;
+}
+
+export interface CodeSearchSummary {
+  queries: CodeSearchQueryRecord[];
+  requests: number;
+  budget: number;
+  repositoriesMatched: number;
+  repositoriesScreened: number;
+  metadataRequests: number;
+}
+
 export interface ResearchSummary {
   queries: SearchQueryRecord[];
   searchRequests: { github: number; gitlab: number; budget: number };
@@ -104,6 +135,7 @@ export interface ResearchSummary {
   excluded: number;
   rateLimited: boolean;
   trustworthyReferenceFound: boolean;
+  codeSearch?: CodeSearchSummary;
 }
 
 export interface RepositoryCandidate {
@@ -118,6 +150,7 @@ export interface RepositoryCandidate {
   signals?: RepositoryQualitySignals;
   searchRank?: number;
   matchedQueries?: string[];
+  codeMatches?: CodePatternMatch[];
 }
 
 export interface RepositorySnapshot {
@@ -128,6 +161,7 @@ export interface RepositorySnapshot {
   files: TreeFile[];
   testFileCount?: number;
   licensePath?: string;
+  codeMatches?: CodeMatch[];
 }
 
 export interface TreeFile {
@@ -256,6 +290,7 @@ export interface RepositoryChoice {
   testFileCount?: number;
   licenseEvidence?: LicenseEvidence;
   licensePath?: string;
+  codeMatches?: string[];
 }
 
 export interface ReferenceComparison {

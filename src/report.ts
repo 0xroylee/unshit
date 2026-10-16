@@ -116,6 +116,15 @@ export function renderReport(input: ReportInput): string {
         lines.push(`- ${label} \`${query.query}\` — ${query.status}${failure}; ${query.resultCount} result(s), ${query.newCandidates} new candidate(s).`);
       }
     }
+    if (research.codeSearch) {
+      const code = research.codeSearch;
+      lines.push(`Code search (Grep by Vercel): ${code.requests}/${code.budget} request(s); ${code.repositoriesMatched} repositories matched outside example and documentation paths; ${code.repositoriesScreened} new repositories screened with ${code.metadataRequests} GitHub metadata request(s).`);
+      for (const query of code.queries) {
+        const scope = query.repository ? ` in ${query.repository}` : "";
+        const failure = query.failure ? ` (${describeRequestFailure(query.failure)})` : "";
+        lines.push(`- grep ${query.purpose} \`${query.query}\`${scope} — ${query.status}${failure}; ${query.resultCount} result(s).`);
+      }
+    }
     if (!research.trustworthyReferenceFound) {
       const noTrustGap = input.gaps.find((gap) => gap.message.startsWith("No trustworthy public reference repository was found"));
       lines.push(noTrustGap?.message ?? "No trustworthy public reference repository was found.");
@@ -130,16 +139,17 @@ export function renderReport(input: ReportInput): string {
       const signals = choice.signals
         ? ` Signals: ${choice.signals.stars === null ? "star count unavailable" : `${choice.signals.stars} stars`}; ${choice.signals.forks === null ? "fork count unavailable" : `${choice.signals.forks} forks`}; archived ${choice.signals.archived ?? "unknown"}; fork ${choice.signals.fork ?? "unknown"}; ${choice.signals.language ?? "language unknown"}; topics ${choice.signals.topics.join(", ") || "none"}; pushed ${choice.signals.pushedAt ?? "date unavailable"}; created ${choice.signals.createdAt ?? "date unavailable (age unknown)"}; license ${choice.signals.licenseSpdxId ?? "not reported"}${choice.licenseEvidence ? ` (${choice.licenseEvidence} evidence)` : ""}; ${choice.testFileCount === undefined ? "test count unknown" : `${choice.testFileCount} test files`}.`
         : "";
+      const code = choice.codeMatches?.length ? ` Code search matched ${choice.codeMatches.map((pattern) => `\`${pattern}\``).join(", ")}.` : "";
       if (choice.decidedBy === "host") {
-        lines.push(`- Host excluded ${label}. Reason: ${choice.rationale}${signals}`);
+        lines.push(`- Host excluded ${label}. Reason: ${choice.rationale}${signals}${code}`);
       } else if (choice.outcome === "selected") {
         const commit = choice.commitSha ? `, inspected at \`${choice.commitSha}\`` : ", selected but its tree could not be read";
         const activity = choice.lastActivityAt ? `, last activity reported ${choice.lastActivityAt}` : "";
         const commitDate = choice.commitDate ? `, commit dated ${choice.commitDate}` : "";
-        lines.push(`- Selected ${label}${commit}${commitDate}${activity}.${signals} ${choice.rationale}`);
+        lines.push(`- Selected ${label}${commit}${commitDate}${activity}.${signals}${code} ${choice.rationale}`);
       } else {
         const activity = choice.lastActivityAt ? ` Search metadata reported last activity ${choice.lastActivityAt}.` : "";
-        lines.push(`- Rejected ${label}.${activity}${signals} ${choice.rationale}`);
+        lines.push(`- Rejected ${label}.${activity}${signals}${code} ${choice.rationale}`);
       }
     }
     lines.push("");
