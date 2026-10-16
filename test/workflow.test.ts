@@ -8,7 +8,7 @@ import { scanLocalTree } from "../src/local.ts";
 import { ProviderRequestError } from "../src/request-failure.ts";
 import { parseIntake } from "../src/model-schema.ts";
 import { DEFAULT_QUALITY_BAR } from "../src/repository-screening.ts";
-import type { CodeSearchSummary, RepositoryCandidate, RepositorySnapshot, ResearchGap, TreeFile } from "../src/types.ts";
+import type { CodeSearchSummary, ProgressEvent, RepositoryCandidate, RepositorySnapshot, ResearchGap, TreeFile } from "../src/types.ts";
 import type { DomainMaterial } from "../src/repository-screening.ts";
 import { REFERENCE_PLAN_MODULES, REFERENCE_POLICY_INPUTS } from "../src/instructions.ts";
 import { renderReport } from "../src/report.ts";
@@ -107,7 +107,7 @@ function noReferencesPlan() {
   return output;
 }
 
-type TurnKind = "refined" | "intake" | "ranking" | "selection" | "files" | "plan" | "review";
+type TurnKind = "refined" | "intake" | "ranking" | "selection" | "files" | "requests" | "plan" | "review";
 
 function turnKind(schema: JsonRecord): TurnKind {
   const properties = schema.properties as Record<string, unknown>;
@@ -116,6 +116,7 @@ function turnKind(schema: JsonRecord): TurnKind {
   if ("ranked" in properties) return "ranking";
   if ("selected" in properties) return "selection";
   if ("files" in properties) return "files";
+  if ("requests" in properties) return "requests";
   if ("tasks" in properties) return "plan";
   if ("findings" in properties) return "review";
   throw new Error("Unexpected model schema.");
@@ -133,7 +134,10 @@ function gateway(options: {
   selection?: unknown;
   ranking?: unknown;
   fileSelection?: unknown;
-  onPrompt?: (prompt: string, schema: JsonRecord) => void;
+  // The evidence request answer, or a function of the request prompt that returns it.
+  evidenceRequests?: unknown;
+  // Also gets the 0-based index of the session that the turn runs in.
+  onPrompt?: (prompt: string, schema: JsonRecord, session: number) => void;
   // Returns a scripted turn result for the given turn kind and its 1-based occurrence, or undefined for the default.
   turnResult?: (kind: TurnKind, occurrence: number) => ModelTurnResult | undefined;
   // Like the native client after an unacknowledged interrupt: a session that timed out fails every later turn.
@@ -149,7 +153,7 @@ function gateway(options: {
       let disposed = false;
       return {
         async turn(prompt: string, schema: JsonRecord): Promise<ModelTurnResult> {
-          options.onPrompt?.(prompt, schema);
+          options.onPrompt?.(prompt, schema, sessionIndex);
           if (disposed) return { status: "failed", message: "Codex App Server session cannot be reused after connection termination." };
           const kind = turnKind(schema);
           const occurrence = (occurrences.get(kind) ?? 0) + 1;
@@ -165,6 +169,7 @@ function gateway(options: {
           else if (kind === "ranking") result = options.ranking ?? { ranked: [] };
           else if (kind === "selection") result = options.selection ?? { selected: [{ candidateId: "C1", rationale: "The repository implements refund requests." }], rejected: [] };
           else if (kind === "files") result = options.fileSelection ?? { files: [{ fileId: "C1F1", role: "production", rationale: "Main request handler." }] };
+          else if (kind === "requests") result = typeof options.evidenceRequests === "function" ? options.evidenceRequests(prompt) : options.evidenceRequests ?? { requests: [] };
           else if (kind === "plan") result = options.plans?.[planIndex++] ?? validPlan();
           else result = options.reviews?.[reviewIndex++] ?? { findings: [] };
           if (sessionIndex > 0 && kind === "review" && result === undefined) result = { findings: [] };
@@ -181,6 +186,8 @@ function researcher(options: {
   snapshots?: RepositorySnapshot[];
   failReads?: boolean;
   failPaths?: string[];
+  // File contents by path, in place of the default contents.
+  content?: Record<string, string>;
   sourceFailure?: unknown;
   sourceFailurePath?: string;
   discoveryExcluded?: Array<{ candidate: RepositoryCandidate; reasons: string[] }>;
@@ -209,6 +216,7 @@ function researcher(options: {
     ["LICENSE", "MIT License\n"],
     [".github/workflows/check.yml", "name: checks\non: [push]\n"],
     ["vitest.config.ts", "export default {};\n"],
+    ...Object.entries(options.content ?? {}),
   ]);
   const value = {
     treeResolutionLimit: options.treeResolutionLimit ?? 8,
@@ -2077,6 +2085,256 @@ describe("workflow gates and readiness", () => {
         expect(outcome.brief.summary).toBe("Build a small refund request service.");
         expect(outcome.gaps.some((gap) => gap.kind === "validation" && gap.material && gap.message.includes("could not be rebuilt"))).toBe(true);
         expect(outcome.readiness).toBe("draft");
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("evidence requests", () => {
+  // About 230,000 characters in lines of about 100 characters. No line shares a word with the brief.
+  async function writeLedger(cwd: string, extra: (lines: string[]) => void = () => {}): Promise<TreeFile> {
+    await mkdir(path.join(cwd, "src"), { recursive: true });
+    const lines = Array.from({ length: 2_300 }, (_, index) => `const ledgerFiller${String(index).padStart(4, "0")} = "${"z".repeat(70)}";`);
+    extra(lines);
+    await writeFile(path.join(cwd, "src", "ledger.ts"), `${lines.join("\n")}\n`);
+    return (await scanLocalTree(cwd)).files.find((file) => file.path === "src/ledger.ts")!;
+  }
+
+  test("asks for missing source after the reads and gives the plan the added excerpt", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const sessions: number[] = [];
+    const events: ProgressEvent[] = [];
+    const checkpointTexts: string[] = [];
+    let ledgerSourceId = "";
+    try {
+      const ledger = await writeLedger(cwd, (lines) => {
+        lines[1_999] = "export function settleLedger() {";
+        lines[2_000] = '  return "settle-ledger-marker";';
+        lines[2_001] = "}";
+      });
+      await writeFile(path.join(cwd, "src", "notes.ts"), "export const notes = 1;\n");
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          fileSelection: { files: [{ fileId: ledger.id, role: "production", rationale: "Local ledger code." }] },
+          evidenceRequests: (prompt: string) => {
+            const counts = JSON.parse(prompt.split("SOURCE LINE COUNTS:\n\n")[1]!.split("\n\nUNREAD FILE ID AND PATH LIST:")[0]!) as Array<{ sourceId: string; path: string }>;
+            const sourceId = counts.find((entry) => entry.path === "src/ledger.ts")!.sourceId;
+            ledgerSourceId = sourceId;
+            return {
+              requests: [
+                { kind: "definition", id: sourceId, name: "settleLedger", startLine: 0, endLine: 0, reason: "The plan needs the settlement." },
+                // Lines that the first excerpts already hold: served, nothing added.
+                { kind: "lines", id: sourceId, name: "", startLine: 1, endLine: 10, reason: "The plan needs the start." },
+                { kind: "definition", id: sourceId, name: "missingThing", startLine: 0, endLine: 0, reason: "The plan needs it." },
+              ],
+            };
+          },
+          onPrompt: (prompt, _schema, session) => {
+            prompts.push(prompt);
+            sessions.push(session);
+          },
+        }),
+        researcher: researcher().value,
+        onProgress: (event) => events.push(event),
+        onCheckpoint: async (input, stage) => {
+          if (stage === "evidence") checkpointTexts.push(...input.evidence.excerpts.map((excerpt) => excerpt.text));
+          return undefined;
+        },
+      });
+
+      expect(outcome.status).toBe("completed");
+      expect(checkpointTexts.some((text) => text.includes("settle-ledger-marker"))).toBe(true);
+      const requestIndex = prompts.findIndex((prompt) => prompt.startsWith("Before the plan is written"));
+      const planIndex = prompts.findIndex((prompt) => prompt.startsWith("Produce a detailed implementation plan"));
+      expect(requestIndex).toBeGreaterThan(-1);
+      expect(planIndex).toBeGreaterThan(requestIndex);
+      expect(prompts[requestIndex]).not.toContain("settle-ledger-marker");
+      expect(prompts[requestIndex]).toContain("ledgerFiller0000");
+      expect(prompts[planIndex]).toContain("settle-ledger-marker");
+      expectPhaseModules(prompts[requestIndex]!, "research");
+      expect(sessions[requestIndex]).toBe(sessions[planIndex]!);
+      if (outcome.status === "completed") {
+        expect(outcome.gaps).toContainEqual({ kind: "file", material: false, message: `The model asked for missingThing in ${ledgerSourceId}; no line of src/ledger.ts holds missingThing.` });
+      }
+      const unread = prompts[requestIndex]!.split("UNREAD FILE ID AND PATH LIST:\n\n")[1]!.split("\n\nHOST-CREATED SOURCE REGISTRY")[0]!;
+      expect(unread).toContain("\"path\":\"src/notes.ts\"");
+      expect(unread).not.toContain("\"path\":\"src/ledger.ts\"");
+      expect(events.filter((event) => event.stage === "evidence_requests").map((event) => [event.state, event.message])).toEqual([
+        ["started", "Asking the model which source the plan needs beyond the excerpts."],
+        ["completed", "Added 1 excerpts for 2 of 3 requests."],
+      ]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps 40,000 characters of the excerpt budget for requested source", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    try {
+      // With no comparator, the ledger is the only planned file: whole within 260,000 characters, not within 220,000.
+      const ledger = await writeLedger(cwd);
+      await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          fileSelection: { files: [{ fileId: ledger.id, role: "production", rationale: "Local ledger code." }] },
+          onPrompt: (prompt) => prompts.push(prompt),
+        }),
+        researcher: researcher({ snapshots: [], candidates: [] }).value,
+      });
+
+      const requestPrompt = prompts.find((prompt) => prompt.startsWith("Before the plan is written"))!;
+      expect(Number(/fit in (\d+) characters/.exec(requestPrompt)![1])).toBeGreaterThanOrEqual(40_000);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("lists at most 40,000 characters of unread files, without the files already read", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    try {
+      const base = repositorySnapshot();
+      const filler: TreeFile[] = Array.from({ length: 1_000 }, (_, index) => ({ id: `C1M${index + 1}`, path: `src/refund_module_${index}.ts`, size: 100 }));
+      await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), onPrompt: (prompt) => prompts.push(prompt) }),
+        researcher: researcher({ snapshots: [{ ...base, files: [...base.files, ...filler] }] }).value,
+      });
+
+      const requestPrompt = prompts.find((prompt) => prompt.startsWith("Before the plan is written"))!;
+      const unread = requestPrompt.split("UNREAD FILE ID AND PATH LIST:\n\n")[1]!.split("\n\nHOST-CREATED SOURCE REGISTRY")[0]!;
+      expect(unread.length).toBeLessThanOrEqual(40_000);
+      // Each group, the local project and the tree, fills at most an equal share.
+      const groups = JSON.parse(unread) as Array<{ source: string; files: unknown[] }>;
+      const share = Math.floor((40_000 - groups.length - 1) / groups.length);
+      for (const group of groups) expect(JSON.stringify(group).length).toBeLessThanOrEqual(share);
+      expect(unread).toContain("\"fileId\":\"C1M");
+      expect(unread).not.toContain("\"fileId\":\"C1F1\"");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("counts a comparator file that a request adds as comparator source", async () => {
+    const cwd = await tempDirectory();
+    try {
+      const base = repositorySnapshot();
+      const extra: TreeFile = { id: "C1F7", path: "src/extra.ts", size: 100 };
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          evidenceRequests: { requests: [{ kind: "file", id: "C1F7", name: "", startLine: 0, endLine: 0, reason: "The comparator's production code." }] },
+        }),
+        // The first reads of the comparator's production and test files fail, so only the requested file is its code.
+        researcher: researcher({ snapshots: [{ ...base, files: [...base.files, extra] }], failPaths: ["src/index.ts", "tests/index.test.ts"] }).value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") expect(outcome.research?.trustworthyReferenceFound).toBe(true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("gives a requested file the brief's code patterns", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    try {
+      const base = repositorySnapshot();
+      // A remote file of about 300,000 characters: larger than what is left, so only its head and the pattern line fit.
+      const lines = Array.from({ length: 3_000 }, (_, index) => `const remoteFiller${String(index).padStart(4, "0")} = "${"z".repeat(70)}";`);
+      lines[2_499] = 'export class LedgerSeal { seal() { return "remote-seal-marker"; } }';
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: { ...baseIntake(), codePatterns: ["LedgerSeal"] },
+          evidenceRequests: { requests: [{ kind: "file", id: "C1F7", name: "", startLine: 0, endLine: 0, reason: "The comparator's seal code." }] },
+          onPrompt: (prompt) => prompts.push(prompt),
+        }),
+        researcher: researcher({ snapshots: [{ ...base, files: [...base.files, { id: "C1F7", path: "src/seal.ts", size: 300_000 }] }], content: { "src/seal.ts": `${lines.join("\n")}\n` } }).value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      expect(prompts.find((prompt) => prompt.startsWith("Produce a detailed implementation plan"))).toContain("remote-seal-marker");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("stops before the plan when the evidence request turn is interrupted or asks for input", async () => {
+    const results: Array<[ModelTurnResult, "interrupted" | "needs_input"]> = [
+      [{ status: "interrupted", message: "The run was interrupted." }, "interrupted"],
+      [{ status: "needs_input", questions: [{ id: "Q1", question: "Which ledger holds refunds?" }] }, "needs_input"],
+    ];
+    for (const [result, status] of results) {
+      const cwd = await tempDirectory();
+      const prompts: string[] = [];
+      try {
+        const outcome = await runWorkflow({
+          cwd,
+          requirement: "Build a refund request service.",
+          modelGateway: gateway({ intake: baseIntake(), turnResult: (kind) => (kind === "requests" ? result : undefined), onPrompt: (prompt) => prompts.push(prompt) }),
+          researcher: researcher().value,
+        });
+
+        expect(outcome.status).toBe(status);
+        expect(prompts.some((prompt) => prompt.startsWith("Produce a detailed implementation plan"))).toBe(false);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("plans with the first excerpts when the evidence request turn fails", async () => {
+    const cwd = await tempDirectory();
+    const events: ProgressEvent[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), turnResult: (kind) => (kind === "requests" ? { status: "failed", message: "Codex turn ended with status failed." } : undefined) }),
+        researcher: researcher().value,
+        onProgress: (event) => events.push(event),
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.gaps).toContainEqual({ kind: "file", material: false, message: "The model's requests for more source failed, so the plan uses the first excerpts." });
+        // The flag comes from the first excerpts, which hold the comparator's production code.
+        expect(outcome.research?.trustworthyReferenceFound).toBe(true);
+      }
+      expect(events.filter((event) => event.stage === "evidence_requests").map((event) => event.state)).toEqual(["started", "warning"]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("continues with a new planning session after an evidence request timeout disposes the session", async () => {
+    const cwd = await tempDirectory();
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), disposeOnTimeout: true, turnResult: (kind) => (kind === "requests" ? timedOutTurn() : undefined) }),
+        researcher: researcher().value,
+      });
+
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.gaps.some((gap) => !gap.material && gap.message.startsWith("The model's requests for more source failed, so the plan uses the first excerpts. "))).toBe(true);
       }
     } finally {
       await rm(cwd, { recursive: true, force: true });

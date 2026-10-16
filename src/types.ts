@@ -176,6 +176,17 @@ export interface TreeFile {
 
 export type SelectedFileRole = "production" | "test" | "manifest" | "ci" | "license" | "config";
 
+// A piece of source that the model asks for after reading the first excerpts. `definition` names something that the
+// source `id` defines; `lines` is a 1-based line range of source `id`; `file` is an unread file with file ID `id`.
+export interface EvidenceRequest {
+  kind: "definition" | "lines" | "file";
+  id: string;
+  name: string;
+  startLine: number;
+  endLine: number;
+  reason: string;
+}
+
 export interface SelectedFile {
   fileId: string;
   role: SelectedFileRole;

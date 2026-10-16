@@ -7,6 +7,7 @@ import { domainTermsFor, isTestPath, isTextSourcePath, pathRoleHint, rankTreeFil
 import { mergeCodeSearchSummaries } from "./code-search.ts";
 import {
   CANDIDATE_RANKING_SCHEMA,
+  EVIDENCE_REQUEST_SCHEMA,
   FILE_SELECTION_SCHEMA,
   INTAKE_SCHEMA,
   REFINED_BRIEF_SCHEMA,
@@ -15,6 +16,7 @@ import {
   REVIEW_SCHEMA,
   ModelOutputError,
   createPlanDocument,
+  parseEvidenceRequests,
   parseFileSelection,
   parseCandidateRanking,
   parseIntake,
@@ -27,7 +29,7 @@ import {
   stableMaterialQuestionId,
   type ParsedPlanPayload,
 } from "./model-schema.ts";
-import { excerptPromptData, finalSources, loadSelectedEvidence } from "./evidence.ts";
+import { EXCERPT_BUDGET, MAX_REQUESTED_FILES, addRequestedEvidence, excerptPromptData, finalSources, loadSelectedEvidence } from "./evidence.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import type {
   CheckpointStage,
@@ -365,13 +367,15 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
 
     throwIfAborted(options.signal);
     progress({ stage: "source_reads", state: "started", message: "Reading selected files, hashing source bytes, and assigning exact line ranges." });
-    const evidence = await loadSelectedEvidence({
+    const relevantText = `${brief.summary}\n${brief.requirements.map((requirement) => requirement.description).join("\n")}`;
+    let evidence = await loadSelectedEvidence({
       local,
       repositories: selectedSnapshots,
       modelSelection: fileSelection,
       github: options.researcher,
-      relevantText: `${brief.summary}\n${brief.requirements.map((requirement) => requirement.description).join("\n")}`,
+      relevantText,
       codePatterns: domainMaterial.codePatterns ?? [],
+      excerptBudget: FIRST_EXCERPT_BUDGET,
       domainTerms: domainTermsFor(brief, resolvedAnswerContext),
       signal: options.signal,
     });
@@ -380,6 +384,44 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     gaps.push(...evidence.gaps);
     if (evidence.excerpts.length === 0) gaps.push({ kind: "file", message: "No source excerpt could be prepared for evidence-backed planning.", material: true });
     progress({ stage: "source_reads", state: "completed", message: `Prepared ${evidence.sources.length} hashed source snapshots and ${evidence.excerpts.length} line-validated excerpts.` });
+
+    if (evidence.excerpts.length > 0) {
+      progress({ stage: "evidence_requests", state: "started", message: "Asking the model which source the plan needs beyond the excerpts." });
+      try {
+        const unread = unreadFileChoices(choices, evidence, local.files, selectedSnapshots);
+        const left = EXCERPT_BUDGET - evidence.excerpts.reduce((sum, excerpt) => sum + excerpt.text.length, 0);
+        const requestValue = await modelJson(
+          planningSession,
+          evidenceRequestPrompt(brief, resolvedAnswerContext, evidence, unread.groups, left),
+          EVIDENCE_REQUEST_SCHEMA,
+          "research",
+          "evidence requests",
+          options.signal,
+        );
+        const requests = parseEvidenceRequests(requestValue);
+        const result = await addRequestedEvidence(evidence, requests, {
+          local,
+          repositories: selectedSnapshots,
+          unreadFileIds: unread.ids,
+          github: options.researcher,
+          relevantText,
+          codePatterns: domainMaterial.codePatterns ?? [],
+          signal: options.signal,
+        });
+        throwIfAborted(options.signal);
+        evidence = result.evidence;
+        checkpointEvidence = evidence;
+        research.trustworthyReferenceFound = selectedSnapshots.some((snapshot) => hasComparatorSource(snapshot, evidence));
+        gaps.push(...result.gaps);
+        progress({ stage: "evidence_requests", state: "completed", message: `Added ${result.added} excerpts for ${result.served} of ${requests.length} requests.` });
+      } catch (error) {
+        if (options.signal?.aborted || error instanceof InterruptedWorkflowError || error instanceof NeedsInputError) throw error;
+        // After a timeout the native session can be unusable; the planning turn needs a working one.
+        if (error instanceof TurnTimeoutError) planningSession = await replaceSession(options.modelGateway, planningSession);
+        gaps.push({ kind: "file", material: false, message: `The model's requests for more source failed, so the plan uses the first excerpts.${error instanceof TurnTimeoutError ? ` ${error.message}` : ""}` });
+        progress({ stage: "evidence_requests", state: "warning", message: "The plan uses the first excerpts." });
+      }
+    }
 
     const localCommands = evidence.sources.flatMap((source) => {
       if (source.kind !== "local") return [];
@@ -721,6 +763,10 @@ function repositorySelectionPrompt(
 
 // The serialized file list offered for model selection never exceeds this many characters.
 const FILE_LIST_LIMIT = 300_000;
+// The first excerpts leave EXCERPT_BUDGET minus this for the excerpts that the model asks for afterwards.
+const FIRST_EXCERPT_BUDGET = 220_000;
+// The unread files listed in the evidence request prompt fit in this many characters.
+const UNREAD_FILE_LIST_LIMIT = 40_000;
 
 interface FileChoice {
   fileId: string;
@@ -787,6 +833,52 @@ function fileChoice(file: TreeFile, patterns?: string[]): FileChoice {
 
 function treeSource(snapshot: RepositorySnapshot): string {
   return `${snapshot.candidate.provider}:${snapshot.candidate.fullName}`;
+}
+
+// The offered files that no source of `evidence` was read from, in the same groups and order. The local project and
+// each tree fill an equal share of UNREAD_FILE_LIST_LIMIT, so the lowest-ranked files are left out first.
+function unreadFileChoices(
+  choices: FileChoices,
+  evidence: LoadedEvidence,
+  localFiles: TreeFile[],
+  snapshots: RepositorySnapshot[],
+): { groups: FileChoices["groups"]; ids: Set<string> } {
+  const read = new Set(evidence.sources.flatMap((source) => {
+    if (source.kind === "local") return localFiles.filter((file) => file.path === source.path).map((file) => file.id);
+    const snapshot = snapshots.find((entry) => entry.candidate.fullName === source.repository && entry.commitSha === source.commitSha);
+    return snapshot ? snapshot.files.filter((file) => file.path === source.path).map((file) => file.id) : [];
+  }));
+  const share = Math.floor((UNREAD_FILE_LIST_LIMIT - choices.groups.length - 1) / Math.max(1, choices.groups.length));
+  const groups = choices.groups.map(({ source, files }) => {
+    const kept: FileChoice[] = [];
+    let size = JSON.stringify({ source, files: [] }).length;
+    for (const file of files) {
+      if (read.has(file.fileId)) continue;
+      size += JSON.stringify(file).length + 1;
+      if (size > share) break;
+      kept.push(file);
+    }
+    return { source, files: kept };
+  });
+  return { groups, ids: new Set(groups.flatMap((group) => group.files.map((file) => file.fileId))) };
+}
+
+function evidenceRequestPrompt(brief: IntakeBrief, answers: ResolvedAnswer[], evidence: LoadedEvidence, unread: FileChoices["groups"], left: number): string {
+  return [
+    "Before the plan is written, compare the excerpts below with the brief, and name the source that the plan needs and the excerpts do not show.",
+    `Ask for at most 8 items. Kind definition: id is the sourceId of a file already read, and name is the name of a function, class, type or variable in it. Kind lines: id is a sourceId, and startLine and endLine give a 1-based line range of that file. Kind file: id is a fileId from the unread file list, at most ${MAX_REQUESTED_FILES} files.`,
+    "Set name to an empty string unless the kind is definition, and startLine and endLine to 0 unless the kind is lines. Give a short reason for each item.",
+    `The host adds the items in the order of the list while they fit in ${left} characters, and skips the others. Return an empty list if the plan needs nothing more.`,
+    "Return only the requested JSON.",
+    "CLARIFIED BRIEF:",
+    JSON.stringify({ summary: brief.summary, requirements: brief.requirements, answers }),
+    "SOURCE LINE COUNTS:",
+    JSON.stringify(evidence.sources.map((source) => ({ sourceId: source.id, path: source.path, lineCount: source.lineCount }))),
+    "UNREAD FILE ID AND PATH LIST:",
+    JSON.stringify(unread),
+    "HOST-CREATED SOURCE REGISTRY AND UNTRUSTED EXCERPTS:",
+    excerptPromptData(evidence.sources, evidence.excerpts),
+  ].join("\n\n");
 }
 
 function fileSelectionPrompt(brief: IntakeBrief, answers: ResolvedAnswer[], choices: FileChoices): string {
