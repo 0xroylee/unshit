@@ -94,6 +94,13 @@ export class MockAppServerProcess implements SubprocessLike {
     this.resolveExit(code);
   }
 
+  // Exits while stdout stays open, as when another process still holds the pipe.
+  exitWithOpenOutput(code = 0): void {
+    if (this.exitCode !== undefined) return;
+    this.exitCode = code;
+    this.resolveExit(code);
+  }
+
   async waitForMessage(predicate: (message: MockRpcMessage) => boolean, timeoutMs = 1_000): Promise<MockRpcMessage> {
     const existing = this.messages.find(predicate);
     if (existing) return existing;

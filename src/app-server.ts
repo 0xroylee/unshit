@@ -72,6 +72,10 @@ type CancelReason =
   | { kind: "tool_forbidden"; message: string }
   | { kind: "transport_failure"; message: string };
 
+// After the process exits, the reader gets this long to reach EOF before pending requests fail.
+const EXIT_DRAIN_MS = 1_000;
+
+
 class RequestAbortedError extends Error {
   constructor() {
     super("Codex App Server request was interrupted.");
@@ -191,7 +195,12 @@ export class AppServerClient {
     }
     this.reader = this.process.stdout.getReader();
     this.readerTask = this.readLoop();
-    void this.process.exited.then((code) => {
+    void this.process.exited.then(async (code) => {
+      // Buffered stdout can still hold answers. The reader handles them and ends at EOF; a pipe that stays open after
+      // the exit gets at most EXIT_DRAIN_MS before pending requests fail.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([this.readerTask, new Promise<void>((resolve) => { timer = setTimeout(resolve, EXIT_DRAIN_MS); })]);
+      clearTimeout(timer);
       if (!this.closing && !this.failed) this.failAll(new Error(`Codex App Server exited (${code}).`));
     });
 
