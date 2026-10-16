@@ -605,7 +605,8 @@ describe("failed turn causes", () => {
         if (message.method === "turn/start") process.exitWithOpenOutput(1);
       },
     }));
-    const client = new AppServerClient({ spawn: fixture.spawn, requestTimeoutMs: 5_000, turnStartTimeoutMs: 5_000, interruptGraceMs: 100 });
+    // Request limits of 2.5 s stay inside bun's 5 s test limit, so a drain without its own bound fails here.
+    const client = new AppServerClient({ spawn: fixture.spawn, requestTimeoutMs: 2_500, turnStartTimeoutMs: 2_500, interruptGraceMs: 100 });
     try {
       const started = Date.now();
       const result = await client.turn("Plan the change.", { type: "object" });
@@ -613,7 +614,7 @@ describe("failed turn causes", () => {
 
       expect(result.status).toBe("failed");
       expect(elapsed).toBeGreaterThanOrEqual(900);
-      expect(elapsed).toBeLessThan(3_000);
+      expect(elapsed).toBeLessThan(2_000);
     } finally {
       await client.close();
     }
