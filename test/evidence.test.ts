@@ -53,6 +53,11 @@ function researcher(options: { failPaths?: Set<string>; failures?: Map<string, u
   return { fake, fetched };
 }
 
+// A last line longer than any share keeps a remote file from being excerpted whole.
+function tooLong(lines: string[]): string {
+  return `${lines.join("\n")}\n${"z".repeat(260_000)}\n`;
+}
+
 function claimedLocalReadError(reason: unknown, marker: string): LocalReadError {
   const error = Object.create(LocalReadError.prototype) as LocalReadError;
   Object.defineProperties(error, {
@@ -427,17 +432,14 @@ describe("bounded source evidence", () => {
   test("centers the second excerpt on the line that contains a code-search pattern", async () => {
     const lines = Array.from({ length: 300 }, (_, index) => `const filler${index} = ${index};`);
     lines[199] = "class OrderRefund { approve() { return true; } }";
-    const repo: RepositorySnapshot = {
-      ...repository(),
-      codeMatches: [{ fileId: "C1F1", path: "src/index.ts", patterns: ["OrderRefund"] }],
-    };
-    const { fake } = researcher({ content: new Map([["src/index.ts", `${lines.join("\n")}\n`]]) });
+    const { fake } = researcher({ content: new Map([["src/index.ts", tooLong(lines)]]) });
     const evidence = await loadSelectedEvidence({
       local: localIndex(),
-      repositories: [repo],
+      repositories: [repository()],
       modelSelection: [{ fileId: "C1F1", role: "production", rationale: "entry point" }],
       github: fake,
       relevantText: "unrelated words only",
+      codePatterns: ["OrderRefund"],
     });
     const source = evidence.sources.find((entry) => entry.path === "src/index.ts")!;
     const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
@@ -487,47 +489,195 @@ describe("bounded source evidence", () => {
     expect(fetched).not.toContain("tests/code-matched.test.ts");
   });
 
-  test("keeps two 90-line windows and the total excerpt budget around an anchor", async () => {
-    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
-    lines[299] = "export class OrderRefund { approve() { return true; } }";
-    const repo: RepositorySnapshot = {
-      ...repository(),
-      codeMatches: [{ fileId: "C1F1", path: "src/index.ts", patterns: ["OrderRefund"] }],
-    };
-    const { fake } = researcher({ content: new Map([["src/index.ts", `${lines.join("\n")}\n`]]) });
+  // src/index.ts is the first of six planned files, so its share is 260,000 / 6 = 43,333 characters.
+  async function excerptRangesFor(content: string, relevantText: string, patterns: string[]): Promise<number[][]> {
+    const { fake } = researcher({ content: new Map([["src/index.ts", content]]) });
     const evidence = await loadSelectedEvidence({
       local: localIndex(),
-      repositories: [repo],
+      repositories: [repository()],
       modelSelection: [{ fileId: "C1F1", role: "production", rationale: "entry point" }],
       github: fake,
-      relevantText: "unrelated words only",
+      relevantText,
+      codePatterns: patterns,
     });
     const source = evidence.sources.find((entry) => entry.path === "src/index.ts")!;
-    const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
+    return evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id).map((excerpt) => [excerpt.startLine, excerpt.endLine]);
+  }
 
-    expect(ranges.map((range) => [range.startLine, range.endLine])).toEqual([[1, 90], [270, 359]]);
-    expect(ranges.filter((range) => range.startLine <= 300 && range.endLine >= 300)).toHaveLength(1);
+  test("keeps a file whole when it fits its share, and otherwise a 30-line head and the complete definition around a match", async () => {
+    const fits = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    expect(await excerptRangesFor(`${fits.join("\n")}\n`, "unrelated words only", [])).toEqual([[1, 400]]);
 
+    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    lines[249] = "export function approveRefund(order: Order) {";
+    for (let index = 250; index < 279; index += 1) lines[index] = `  const step${index} = ${index};`;
+    lines[264] = "  return OrderRefund.approve(order);";
+    lines[279] = "}";
+
+    expect(await excerptRangesFor(tooLong(lines), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [250, 280]]);
+
+    // A region that starts right after the head stays a separate range.
+    const nearHead = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    nearHead[30] = "export function nearHead() {";
+    for (let index = 31; index < 39; index += 1) nearHead[index] = `  step(${index});`;
+    nearHead[34] = "  OrderRefund.approve();";
+    nearHead[39] = "}";
+    expect(await excerptRangesFor(tooLong(nearHead), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [31, 40]]);
+  });
+
+  test("treats a one-line arrow function as a definition", async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    lines[249] = "export const approveOne = () => { return OrderRefund.ok(); };";
+    lines[299] = "export const approveTwo = (order: Order) => OrderRefund.check(order);";
+
+    expect(await excerptRangesFor(tooLong(lines), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [250, 250], [300, 300]]);
+  });
+
+  test("ends a Python function by indentation, not by a dict in its body", async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `filler_${index} = ${index}`);
+    lines[199] = "def approve_refund(order):";
+    for (let index = 200; index < 239; index += 1) lines[index] = `    step(${index})`;
+    lines[200] = "    state = {}";
+    lines[220] = "    OrderRefund.approve(order)";
+    lines[238] = "    return state";
+
+    expect(await excerptRangesFor(tooLong(lines), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [200, 239]]);
+  });
+
+  test("excerpts a file that exactly fills its share", async () => {
+    const evidenceOf = async (content: string) => {
+      const repo: RepositorySnapshot = { ...repository(), files: [{ id: "C1F1", path: "src/index.ts", size: content.length }], codeMatches: [] };
+      return loadSelectedEvidence({
+        local: { root: "/nonexistent-unshit-local", files: [], gaps: [] },
+        repositories: [repo],
+        modelSelection: [{ fileId: "C1F1", role: "production", rationale: "The only file." }],
+        github: researcher({ content: new Map([["src/index.ts", content]]) }).fake,
+        relevantText: "unrelated words only",
+      });
+    };
+    const excerptOf = async (content: string) => (await evidenceOf(content)).excerpts.map((excerpt) => [excerpt.startLine, excerpt.endLine, excerpt.text.length]);
+    // With one planned file, the file's share is the whole 260,000-character budget.
+    expect(await excerptOf("x".repeat(260_000))).toEqual([[1, 1, 260_000]]);
+    expect(await excerptOf(`${"x".repeat(260_000)}\n`)).toEqual([[1, 1, 260_000]]);
+    expect(await excerptOf(`${"a".repeat(129_999)}\n${"b".repeat(130_000)}`)).toEqual([[1, 2, 260_000]]);
+    expect(await excerptOf("x".repeat(260_001))).toEqual([]);
+    expect((await evidenceOf("x".repeat(260_001))).gaps.map((gap) => gap.message)).toContain("No excerpt context remained for src/index.ts.");
+    // A head that does not fit is cut from its end.
+    expect(await excerptOf(Array.from({ length: 40 }, () => "x".repeat(10_000)).join("\n"))).toEqual([[1, 25, 250_024]]);
+    // 40 lines that join to exactly 260,000 characters stay whole; one more character leaves the 30-line head.
+    const forty = (last: number) => [...Array.from({ length: 39 }, () => "x".repeat(6_499)), "y".repeat(last)].join("\n");
+    expect(await excerptOf(forty(6_500))).toEqual([[1, 40, 260_000]]);
+    expect(await excerptOf(forty(6_501))).toEqual([[1, 30, 194_999]]);
+  });
+
+  test("keeps the definition that holds the match, not one that ended above it", async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    lines[199] = "export function outerFlow() {";
+    lines[200] = "  const helper = () => {";
+    lines[201] = "    prepare();";
+    lines[202] = "  };";
+    lines[203] = "  if (ready) {";
+    lines[204] = "    OrderRefund.approve();";
+    lines[205] = "  }";
+    for (let index = 206; index < 239; index += 1) lines[index] = `  step(${index});`;
+    lines[239] = "}";
+
+    expect(await excerptRangesFor(tooLong(lines), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [200, 240]]);
+
+    // In these fixtures, a variable whose value is a function is a definition; a callback passed to a call is not.
+    const inArrow = [...lines];
+    inArrow[201] = "    OrderRefund.prepare();";
+    inArrow[204] = "    approve();";
+    expect(await excerptRangesFor(tooLong(inArrow), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [201, 203]]);
+
+    const inCallback = [...lines];
+    inCallback[200] = "  const results = items.map((item) => {";
+    inCallback[201] = "    return OrderRefund.check(item);";
+    inCallback[202] = "  });";
+    inCallback[204] = "    approve();";
+    expect(await excerptRangesFor(tooLong(inCallback), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [200, 240]]);
+  });
+
+  test("takes the best-scoring matches first and stops at the first match that no window fits", async () => {
+    const lines = Array.from({ length: 800 }, (_, index) => `const filler${index} = "${"x".repeat(80)}";`);
+    // Each definition is 40 lines of about 11,500 characters; the 43,333-character share holds the head and three.
+    const define = (line: number, name: string) => {
+      lines[line - 1] = `export function ${name}() {`;
+      for (let index = line; index < line + 38; index += 1) lines[index] = `  step("${"y".repeat(290)}");`;
+      lines[line + 38] = "}";
+    };
+    for (const line of [200, 300, 400, 500, 600]) define(line, `AnchorToken${line}`);
+    define(700, "AnchorTokenRefundApproval");
+    lines[749] = "export function refundHelper() { return 1; }";
+    const ranges = await excerptRangesFor(tooLong(lines), "refund approval", ["AnchorToken"]);
+    const covers = (line: number) => ranges.some(([start, end]) => start! <= line && end! >= line);
+
+    expect([200, 300, 700].every(covers)).toBe(true);
+    // The match at line 400 fits no window, so the one-line definition at line 750 is not taken either.
+    expect([400, 500, 600, 750].some(covers)).toBe(false);
+    expect(ranges).toEqual([[1, 30], [200, 239], [300, 339], [700, 739]]);
+  });
+
+  test("keeps a long definition whole when it fits, and else 150 or 60 lines of it around the match", async () => {
+    const flow = (bodyLine: (index: number) => string) => {
+      const lines = Array.from({ length: 700 }, (_, index) => `const filler${index} = ${index};`);
+      lines[99] = "export function longRefundFlow() {";
+      for (let index = 100; index < 599; index += 1) lines[index] = bodyLine(index);
+      lines[399] = "  OrderRefund.approve();";
+      lines[599] = "}";
+      return tooLong(lines);
+    };
+
+    expect(await excerptRangesFor(flow((index) => `  step(${index});`), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [100, 600]]);
+    expect(await excerptRangesFor(flow(() => `  step("${"y".repeat(240)}");`), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [350, 499]]);
+    expect(await excerptRangesFor(flow(() => `  step("${"y".repeat(600)}");`), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [380, 439]]);
+  });
+
+  test("keeps 60 lines around a match that no definition holds", async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `step(${index});`);
+    lines[249] = "function setup() {";
+    lines[250] = "  prepare();";
+    lines[251] = "}";
+    lines[299] = "OrderRefund.approve();";
+
+    expect(await excerptRangesFor(tooLong(lines), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [280, 339]]);
+
+    // A window that starts inside the head merges with it.
+    const nearHead = [...lines];
+    nearHead[34] = "OrderRefund.approve();";
+    nearHead[299] = "step(299);";
+    expect(await excerptRangesFor(tooLong(nearHead), "unrelated words only", ["OrderRefund"])).toEqual([[1, 74]]);
+  });
+
+  test("chooses a definition of a code-search pattern before its mentions", async () => {
+    // Lines of about 700 characters: the share holds the head and the one-line definition, not 60 lines around a mention.
+    const lines = Array.from({ length: 400 }, (_, index) => `step(${index}, "${"x".repeat(690)}");`);
+    for (const line of [60, 100, 140, 180, 220]) lines[line - 1] = "use(OrderRefund);";
+    lines[349] = "export class OrderRefund { approve() { return true; } }";
+
+    expect(await excerptRangesFor(`${lines.join("\n")}\n`, "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [350, 350]]);
+  });
+
+  test("gives every selected file an equal share of the excerpt budget", async () => {
     const sourcePaths = Array.from({ length: 19 }, (_, index) => `src/anchor-${index}.ts`);
     const budgetFiles: TreeFile[] = [
-      ...sourcePaths.map((filePath, index) => ({ id: `C1B${index + 1}`, path: filePath, size: 70_000 })),
-      { id: "C1BT", path: "tests/anchor.test.ts", size: 70_000 },
+      ...sourcePaths.map((filePath, index) => ({ id: `C1B${index + 1}`, path: filePath, size: 130_000 })),
+      { id: "C1BT", path: "tests/anchor.test.ts", size: 130_000 },
       { id: "C1BM", path: "package.json", size: 20 },
       { id: "C1BL", path: "LICENSE", size: 20 },
       { id: "C1BC", path: ".github/workflows/check.yml", size: 20 },
       { id: "C1BG", path: "vitest.config.ts", size: 20 },
     ];
-    const budgetRepo: RepositorySnapshot = {
-      ...repository(),
-      files: budgetFiles,
-      codeMatches: [
-        ...sourcePaths.map((filePath, index) => ({ fileId: `C1B${index + 1}`, path: filePath, patterns: ["AnchorToken"] })),
-        { fileId: "C1BT", path: "tests/anchor.test.ts", patterns: ["AnchorToken"] },
-      ],
-    };
+    const budgetRepo: RepositorySnapshot = { ...repository(), files: budgetFiles };
+    // Every file wants about 22,000 characters: a 30-line head and four 20-line anchor definitions. An equal share
+    // of about 10,800 characters holds the head and one definition.
     const largeContent = (index: number): string => {
-      const longLines = Array.from({ length: 300 }, (_, line) => `const filler${line} = ${"x".repeat(180)};`);
-      longLines[199] = `export const AnchorToken${index} = "${"x".repeat(180)}";`;
+      const longLines = Array.from({ length: 600 }, (_, line) => `const filler${line} = "${"x".repeat(180)}";`);
+      for (const start of [200, 300, 400, 500]) {
+        longLines[start - 1] = `export function AnchorToken${index}Part${start}() {`;
+        for (let line = start; line < start + 18; line += 1) longLines[line] = `  return "${"x".repeat(190)}";`;
+        longLines[start + 18] = "}";
+      }
       return `${longLines.join("\n")}\n`;
     };
     const budgetContent = new Map<string, string>(sourcePaths.map((filePath, index) => [filePath, largeContent(index)]));
@@ -543,80 +693,48 @@ describe("bounded source evidence", () => {
       modelSelection,
       github: budgetReader.fake,
       relevantText: "unrelated words only",
+      codePatterns: ["AnchorToken"],
     });
     const excerptCharacters = budgetEvidence.excerpts.reduce((sum, excerpt) => sum + excerpt.text.length, 0);
+    const anchorSources = budgetEvidence.sources.filter((source) => [...sourcePaths, "tests/anchor.test.ts"].includes(source.path));
 
     expect(budgetReader.fetched).toHaveLength(24);
+    expect(anchorSources).toHaveLength(20);
+    for (const source of anchorSources) {
+      expect(budgetEvidence.excerpts.some((excerpt) => excerpt.sourceId === source.id && excerpt.startLine <= 200 && excerpt.endLine >= 200)).toBe(true);
+    }
     expect(excerptCharacters).toBeLessThanOrEqual(260_000);
   });
-
-  test("centers the second excerpt on a definition line rather than an earlier mention", async () => {
-    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
-    lines[119] = "import { OrderRefund } from './models';";
-    lines[299] = "export class OrderRefund { approve() { return true; } }";
-    const repo: RepositorySnapshot = {
-      ...repository(),
-      codeMatches: [{ fileId: "C1F1", path: "src/index.ts", patterns: ["OrderRefund"] }],
-    };
-    const { fake } = researcher({ content: new Map([["src/index.ts", `${lines.join("\n")}\n`]]) });
-    const evidence = await loadSelectedEvidence({
-      local: localIndex(),
-      repositories: [repo],
-      modelSelection: [{ fileId: "C1F1", role: "production", rationale: "entry point" }],
-      github: fake,
-      relevantText: "unrelated words only",
-    });
-    const source = evidence.sources.find((entry) => entry.path === "src/index.ts")!;
-    const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
-    expect(ranges.some((range) => range.startLine <= 300 && range.endLine >= 300)).toBe(true);
-    expect(ranges.some((range) => range.startLine <= 120 && range.endLine >= 120)).toBe(false);
-  });
-
-  test("uses code-search anchors only for the matched file", async () => {
-    const lines = Array.from({ length: 300 }, (_, index) => `const filler${index} = ${index};`);
-    lines[199] = "class OrderRefund { approve() { return true; } }";
-    const repo: RepositorySnapshot = {
-      ...repository(),
-      codeMatches: [{ fileId: "C1F2", path: "tests/index.test.ts", patterns: ["OrderRefund"] }],
-    };
-    const { fake } = researcher({ content: new Map([["src/index.ts", `${lines.join("\n")}\n`]]) });
-    const evidence = await loadSelectedEvidence({
-      local: localIndex(),
-      repositories: [repo],
-      modelSelection: [{ fileId: "C1F1", role: "production", rationale: "entry point" }],
-      github: fake,
-      relevantText: "unrelated words only",
-    });
-    const source = evidence.sources.find((entry) => entry.path === "src/index.ts")!;
-    const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
-    expect(ranges.some((range) => range.startLine <= 200 && range.endLine >= 200)).toBe(false);
-  });
-
-  test("does not give remote anchors to local files", async () => {
+  test("ranks lines that hold a code pattern first in local files too", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "unshit-local-anchor-"));
     try {
       await mkdir(path.join(root, "src"), { recursive: true });
+      // Two selected files of about 160,000 characters each: the first one's share is half the budget, so it is not
+      // kept whole. Short lines keep the local credential scan fast.
       const lines = Array.from({ length: 300 }, (_, index) => `const localFiller${index} = ${index};`);
       lines[199] = "export class OrderRefund { approve() { return true; } }";
-      await writeFile(path.join(root, "src", "local.ts"), `${lines.join("\n")}\n`);
-      const localFile: TreeFile = { id: "L-anchor", path: "src/local.ts", size: 100 };
-      const local: LocalIndex = { root, files: [localFile], gaps: [] };
-      const repo: RepositorySnapshot = {
-        ...repository(),
-        codeMatches: [{ fileId: "C1F2", path: "tests/index.test.ts", patterns: ["OrderRefund"] }],
-      };
+      const ballast = Array.from({ length: 1_500 }, () => "z".repeat(100)).join("\n");
+      await writeFile(path.join(root, "src", "local.ts"), `${lines.join("\n")}\n${ballast}\n`);
+      await writeFile(path.join(root, "src", "other.ts"), `export const other = 1;\n${ballast}\n`);
+      const localFile: TreeFile = { id: "L-anchor", path: "src/local.ts", size: 160_000 };
+      const otherFile: TreeFile = { id: "L-other", path: "src/other.ts", size: 160_000 };
+      const local: LocalIndex = { root, files: [localFile, otherFile], gaps: [] };
       const evidence = await loadSelectedEvidence({
         local,
-        repositories: [repo],
-        modelSelection: [{ fileId: localFile.id, role: "production", rationale: "Local entry point." }],
+        repositories: [],
+        modelSelection: [
+          { fileId: localFile.id, role: "production", rationale: "Local entry point." },
+          { fileId: otherFile.id, role: "production", rationale: "Local helper." },
+        ],
         github: researcher().fake,
         relevantText: "unrelated words only",
+        codePatterns: ["OrderRefund"],
       });
       const source = evidence.sources.find((entry) => entry.path === "src/local.ts")!;
-      const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id);
+      const ranges = evidence.excerpts.filter((excerpt) => excerpt.sourceId === source.id).map((excerpt) => [excerpt.startLine, excerpt.endLine]);
 
       expect(source.kind).toBe("local");
-      expect(ranges.some((range) => range.startLine <= 200 && range.endLine >= 200)).toBe(false);
+      expect(ranges).toEqual([[1, 30], [200, 200]]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

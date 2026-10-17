@@ -371,6 +371,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       modelSelection: fileSelection,
       github: options.researcher,
       relevantText: `${brief.summary}\n${brief.requirements.map((requirement) => requirement.description).join("\n")}`,
+      codePatterns: domainMaterial.codePatterns ?? [],
       domainTerms: domainTermsFor(brief, resolvedAnswerContext),
       signal: options.signal,
     });

@@ -577,6 +577,48 @@ describe("failed turn causes", () => {
       expect(await failedMessage(fixture)).toBe("Codex App Server request turn/start failed: Input exceeds the maximum length of 1048576 characters.");
     }
   });
+
+  test("a rejected turn request keeps its reason when the process exits before the reader has read the answer", async () => {
+    for (const layout of ["fragmented", "after a notification"] as const) {
+      const fixture = createMockSpawner(() => ({
+        onClientMessage(message, process) {
+          if (answerHandshake(message, process, "thread-draining")) return;
+          if (message.method !== "turn/start") return;
+          const rejection: MockRpcMessage = { jsonrpc: "2.0", id: message.id!, error: { code: -32600, message: "Input exceeds the maximum length of 1048576 characters." } };
+          if (layout === "fragmented") process.sendJsonFragmented([rejection], "maximum");
+          else {
+            process.sendJsonChunk(notification("thread/tokenUsage/updated", { threadId: "thread-draining" }));
+            process.sendJsonChunk(rejection);
+          }
+          process.exit(1);
+        },
+      }));
+
+      expect(await failedMessage(fixture)).toBe("Codex App Server request turn/start failed: Input exceeds the maximum length of 1048576 characters.");
+    }
+  });
+
+  test("pending requests fail about one second after an exit that leaves stdout open", async () => {
+    const fixture = createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-open")) return;
+        if (message.method === "turn/start") process.exitWithOpenOutput(1);
+      },
+    }));
+    // Request limits of 2.5 s stay inside bun's 5 s test limit, so a drain without its own bound fails here.
+    const client = new AppServerClient({ spawn: fixture.spawn, requestTimeoutMs: 2_500, turnStartTimeoutMs: 2_500, interruptGraceMs: 100 });
+    try {
+      const started = Date.now();
+      const result = await client.turn("Plan the change.", { type: "object" });
+      const elapsed = Date.now() - started;
+
+      expect(result.status).toBe("failed");
+      expect(elapsed).toBeGreaterThanOrEqual(900);
+      expect(elapsed).toBeLessThan(2_000);
+    } finally {
+      await client.close();
+    }
+  });
 });
 
 describe("model turn time limits", () => {
