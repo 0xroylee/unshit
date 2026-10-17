@@ -3,7 +3,7 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { REFERENCE_POLICY_HASH } from "./instructions.ts";
 import { renderReport, type ReportInput } from "./report.ts";
-import type { MaterialQuestion, RunArtifacts } from "./types.ts";
+import type { CheckpointStage, MaterialQuestion, RunArtifacts } from "./types.ts";
 
 export async function writePlanArtifacts(options: {
   cwd: string;
@@ -63,7 +63,7 @@ export async function writePlanArtifacts(options: {
 export async function writeCheckpointArtifacts(options: {
   cwd: string;
   runId: string;
-  stage: "evidence" | "plan" | "interrupted" | "failed";
+  stage: CheckpointStage;
   input: ReportInput;
 }): Promise<string> {
   const evidenceDirectory = path.join(path.resolve(options.cwd), ".unshit", options.runId);

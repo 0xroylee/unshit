@@ -15,6 +15,7 @@ const STOP_WORDS = new Set([
 ]);
 
 const TEXT_SOURCE_PATTERN = /\.(c|cc|cpp|cs|css|go|h|hpp|html?|java|js|jsx|json|kt|md|mjs|php|py|rb|rs|scss|sh|sql|swift|toml|ts|tsx|txt|vue|xml|yaml|yml|zig)$/i;
+const STANDARD_LICENSE_NAME = /^((un)?licen[sc]e|copying)(\.(txt|md|rst))?$/i;
 
 export function domainTermsFor(brief: IntakeBrief, answers: ResolvedAnswer[]): RankedTerm[] {
   const terms: RankedTerm[] = [];
@@ -109,6 +110,17 @@ export function pathRoleHint(filePath: string): string {
 export function isRootLicensePath(filePath: string): boolean {
   if (path.posix.dirname(filePath) !== ".") return false;
   return /^((un)?licen[sc]e(-[a-z0-9.]+)?|copying)(\.(txt|md|rst))?$/i.test(path.posix.basename(filePath));
+}
+
+// A standard name such as LICENSE.txt wins over an ancillary LICENSE-<suffix> file in the same root.
+export function chooseRootLicensePath(paths: Iterable<string>): string | undefined {
+  let fallback: string | undefined;
+  for (const filePath of paths) {
+    if (!isRootLicensePath(filePath)) continue;
+    if (STANDARD_LICENSE_NAME.test(path.posix.basename(filePath))) return filePath;
+    fallback ??= filePath;
+  }
+  return fallback;
 }
 
 export function isDemoPath(filePath: string): boolean {

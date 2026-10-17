@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AppServerClient, NativeModelGateway, type JsonRecord } from "../src/app-server.ts";
+import { AppServerClient, NativeModelGateway, type JsonRecord, type ModelTurnResult } from "../src/app-server.ts";
 import { createMockSpawner, type MockAppServerProcess, type MockRpcMessage } from "./helpers/mock-process.ts";
 
 const CONFIG = {
@@ -100,7 +100,7 @@ describe("native App Server stdio protocol", () => {
       effort: "medium",
       spawn: fixture.spawn,
       requestTimeoutMs: 200,
-      turnTimeoutMs: 500,
+      turnIdleTimeoutMs: 500,
       turnStartTimeoutMs: 150,
       interruptGraceMs: 100,
     });
@@ -321,7 +321,7 @@ describe("native App Server stdio protocol", () => {
       const client = new AppServerClient({
         spawn: fixture.spawn,
         requestTimeoutMs: 10_000,
-        turnTimeoutMs: 10_000,
+        turnIdleTimeoutMs: 10_000,
         turnStartTimeoutMs: 50,
         interruptGraceMs: 40,
       });
@@ -426,7 +426,7 @@ describe("native App Server stdio protocol", () => {
     const client = new AppServerClient({
       spawn: fixture.spawn,
       requestTimeoutMs: 150,
-      turnTimeoutMs: 35,
+      turnIdleTimeoutMs: 35,
       turnStartTimeoutMs: 100,
       interruptGraceMs: 35,
     });
@@ -434,7 +434,7 @@ describe("native App Server stdio protocol", () => {
 
     const firstResult = await client.turn("Wait for a server that never completes.", { type: "object" });
 
-    expect(firstResult.status).toBe("failed");
+    expect(firstResult).toMatchObject({ status: "timed_out", limit: "idle", limitMs: 35 });
     expect(Date.now() - startedAt).toBeLessThan(2_000);
     const child = fixture.processes[0]!;
     expect(requestMessages(child, "turn/interrupt")).toHaveLength(1);
@@ -466,7 +466,7 @@ describe("native App Server stdio protocol", () => {
       const client = new AppServerClient({
         spawn: fixture.spawn,
         requestTimeoutMs: 10_000,
-        turnTimeoutMs: 10_000,
+        turnIdleTimeoutMs: 10_000,
         turnStartTimeoutMs: 100,
         interruptGraceMs: 50,
       });
@@ -479,6 +479,221 @@ describe("native App Server stdio protocol", () => {
       expect(fixture.processes[0]!.isExited).toBe(true);
       await client.close();
     }
+  });
+});
+
+describe("failed turn causes", () => {
+  function failingTurn(threadId: string, turnId: string, turn: Record<string, unknown>, before: MockRpcMessage[] = []) {
+    return createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, threadId)) return;
+        if (message.method !== "turn/start") return;
+        process.sendJsonChunk(
+          response(message, { turn: { id: turnId } }),
+          notification("turn/started", { threadId, turnId }),
+          ...before,
+          notification("turn/completed", { threadId, turn: { id: turnId, status: "failed", items: [], ...turn } }),
+        );
+      },
+    }));
+  }
+
+  async function failedMessage(fixture: ReturnType<typeof createMockSpawner>): Promise<string> {
+    const client = new AppServerClient({ spawn: fixture.spawn, requestTimeoutMs: 200, turnStartTimeoutMs: 100, interruptGraceMs: 100 });
+    try {
+      const result = await client.turn("Plan the change.", { type: "object" });
+      if (result.status !== "failed") throw new Error(`Expected a failed turn, got ${result.status}.`);
+      return result.message;
+    } finally {
+      await client.close();
+    }
+  }
+
+  test("a failed turn reports the Codex error message and category", async () => {
+    const fixture = failingTurn("thread-fail", "turn-fail", {
+      error: { message: "Your input exceeds the context window of this model.", codexErrorInfo: "contextWindowExceeded", additionalDetails: null },
+    });
+
+    expect(await failedMessage(fixture)).toBe("Codex turn ended with status failed: Your input exceeds the context window of this model. (contextWindowExceeded)");
+  });
+
+  test("a failed turn without its own error uses this turn's last error notification and scrubs endpoints and tokens", async () => {
+    const token = `ghp_${"A".repeat(36)}`;
+    const fixture = failingTurn("thread-stream", "turn-stream", { error: null }, [
+      notification("error", { threadId: "thread-stream", turnId: "turn-stream", willRetry: true, error: { message: "stream disconnected before completion", codexErrorInfo: null, additionalDetails: null } }),
+      notification("error", {
+        threadId: "thread-stream",
+        turnId: "turn-stream",
+        willRetry: false,
+        error: { message: `stream disconnected at https://api.example.test/v1/responses using ${token}`, codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 502 } }, additionalDetails: "Retries exhausted." },
+      }),
+      notification("error", { threadId: "thread-stream", turnId: "turn-other", willRetry: false, error: { message: "A different turn failed.", codexErrorInfo: "other", additionalDetails: null } }),
+    ]);
+
+    const message = await failedMessage(fixture);
+
+    expect(message).toBe("Codex turn ended with status failed: stream disconnected at remote endpoint using [redacted] (responseStreamDisconnected 502) Retries exhausted.");
+    expect(message).not.toContain(token);
+  });
+
+  test("caps the reported failure detail at 300 characters", async () => {
+    const fixture = failingTurn("thread-long", "turn-long", { error: { message: "Upstream failure.", codexErrorInfo: "other", additionalDetails: "x".repeat(1_000) } });
+
+    const message = await failedMessage(fixture);
+
+    expect(message.startsWith("Codex turn ended with status failed: Upstream failure. (other) xxx")).toBe(true);
+    expect(message.length).toBe("Codex turn ended with status failed: ".length + 300);
+  });
+
+  test("a rejected turn request keeps the reason Codex gave, scrubbed and bounded", async () => {
+    const rejecting = (error: Record<string, unknown>) => createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-reject")) return;
+        if (message.method === "turn/start") process.sendJsonChunk({ jsonrpc: "2.0", id: message.id!, error });
+      },
+    }));
+    const token = `ghp_${"A".repeat(36)}`;
+
+    expect(await failedMessage(rejecting({ code: -32600, message: "Input exceeds the maximum length of 1048576 characters." })))
+      .toBe("Codex App Server request turn/start failed: Input exceeds the maximum length of 1048576 characters.");
+    expect(await failedMessage(rejecting({ code: -32603, message: `Rejected at https://api.example.test/v1/responses using ${token}` })))
+      .toBe("Codex App Server request turn/start failed: Rejected at remote endpoint using [redacted]");
+    expect(await failedMessage(rejecting({ code: -32603 }))).toBe("Codex App Server request turn/start failed.");
+    expect(await failedMessage(rejecting({ code: -32603, message: "y".repeat(1_000) }))).toHaveLength(240);
+  });
+
+  test("a rejected turn request keeps its reason when the connection closes right after the answer", async () => {
+    for (const close of ["disconnect", "exit"] as const) {
+      const fixture = createMockSpawner(() => ({
+        onClientMessage(message, process) {
+          if (answerHandshake(message, process, "thread-closing")) return;
+          if (message.method !== "turn/start") return;
+          process.sendJsonChunk({ jsonrpc: "2.0", id: message.id!, error: { code: -32600, message: "Input exceeds the maximum length of 1048576 characters." } });
+          if (close === "disconnect") process.disconnect();
+          else process.exit(1);
+        },
+      }));
+
+      expect(await failedMessage(fixture)).toBe("Codex App Server request turn/start failed: Input exceeds the maximum length of 1048576 characters.");
+    }
+  });
+});
+
+describe("model turn time limits", () => {
+  test("returns timed_out, not interrupted, when Codex acknowledges the interrupt sent at the idle limit", async () => {
+    const fixture = createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-idle")) return;
+        if (message.method === "turn/start") {
+          process.sendJsonChunk(
+            response(message, { turn: { id: "turn-idle" } }),
+            notification("turn/started", { threadId: "thread-idle", turnId: "turn-idle" }),
+          );
+        } else if (message.method === "turn/interrupt") {
+          process.sendJsonChunk(
+            response(message, {}),
+            notification("turn/completed", { threadId: "thread-idle", turn: { id: "turn-idle", status: "interrupted", items: [] } }),
+          );
+        }
+      },
+    }));
+    const client = new AppServerClient({ spawn: fixture.spawn, requestTimeoutMs: 200, turnStartTimeoutMs: 100, interruptGraceMs: 100, turnIdleTimeoutMs: 60 });
+
+    const result = await client.turn("Stay silent.", { type: "object" });
+
+    expect(result).toMatchObject({ status: "timed_out", limit: "idle", limitMs: 60, threadId: "thread-idle", turnId: "turn-idle" });
+    expect(requestMessages(fixture.processes[0]!, "turn/interrupt")).toHaveLength(1);
+    await client.close();
+  });
+
+  test("keeps timed_out when the process disconnects during the timeout interrupt", async () => {
+    const fixture = createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-drop")) return;
+        if (message.method === "turn/start") {
+          process.sendJsonChunk(
+            response(message, { turn: { id: "turn-drop" } }),
+            notification("turn/started", { threadId: "thread-drop", turnId: "turn-drop" }),
+          );
+        } else if (message.method === "turn/interrupt") {
+          process.exit(1);
+        }
+      },
+    }));
+    const client = new AppServerClient({ spawn: fixture.spawn, requestTimeoutMs: 200, turnStartTimeoutMs: 100, interruptGraceMs: 100, turnIdleTimeoutMs: 60 });
+
+    const result = await client.turn("Stay silent, then drop the connection.", { type: "object" });
+
+    expect(result).toMatchObject({ status: "timed_out", limit: "idle", limitMs: 60 });
+    await client.close();
+  });
+
+  test("notifications on the thread restart the idle clock", async () => {
+    const timers: Array<ReturnType<typeof setTimeout>> = [];
+    const fixture = createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-busy")) return;
+        if (message.method !== "turn/start") return;
+        const send = (...messages: MockRpcMessage[]): void => {
+          if (!process.isOutputClosed) process.sendJsonChunk(...messages);
+        };
+        send(response(message, { turn: { id: "turn-busy" } }), notification("turn/started", { threadId: "thread-busy", turnId: "turn-busy" }));
+        for (let tick = 1; tick <= 6; tick += 1) {
+          timers.push(setTimeout(() => send(notification("item/agentMessage/delta", { threadId: "thread-busy", turnId: "turn-busy", itemId: "m1", delta: "." })), tick * 40));
+        }
+        timers.push(setTimeout(() => send(notification("turn/completed", {
+          threadId: "thread-busy",
+          turn: { id: "turn-busy", status: "completed", items: [{ type: "agentMessage", phase: "final_answer", text: "{\"done\":true}" }] },
+        })), 280));
+      },
+    }));
+    const client = new AppServerClient({ spawn: fixture.spawn, requestTimeoutMs: 200, turnStartTimeoutMs: 100, interruptGraceMs: 100, turnIdleTimeoutMs: 150, turnTotalTimeoutMs: 5_000 });
+    try {
+      const result = await client.turn("Report progress, then answer.", { type: "object" });
+
+      expect(result).toMatchObject({ status: "completed", text: "{\"done\":true}" });
+      expect(requestMessages(fixture.processes[0]!, "turn/interrupt")).toHaveLength(0);
+    } finally {
+      for (const timer of timers) clearTimeout(timer);
+      await client.close();
+    }
+  });
+
+  test("the total limit ends a turn that keeps reporting activity", async () => {
+    let ticker: ReturnType<typeof setInterval> | undefined;
+    const fixture = createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-chatty")) return;
+        const send = (...messages: MockRpcMessage[]): void => {
+          if (!process.isOutputClosed) process.sendJsonChunk(...messages);
+        };
+        if (message.method === "turn/start") {
+          send(response(message, { turn: { id: "turn-chatty" } }), notification("turn/started", { threadId: "thread-chatty", turnId: "turn-chatty" }));
+          ticker = setInterval(() => send(notification("item/agentMessage/delta", { threadId: "thread-chatty", turnId: "turn-chatty", itemId: "m1", delta: "." })), 20);
+        } else if (message.method === "turn/interrupt") {
+          clearInterval(ticker);
+          send(response(message, {}), notification("turn/completed", { threadId: "thread-chatty", turn: { id: "turn-chatty", status: "interrupted", items: [] } }));
+        }
+      },
+    }));
+    const client = new AppServerClient({ spawn: fixture.spawn, requestTimeoutMs: 200, turnStartTimeoutMs: 100, interruptGraceMs: 100, turnIdleTimeoutMs: 100 });
+    try {
+      const result = await Promise.race([
+        client.turn("Keep talking.", { type: "object" }),
+        delay(2_000).then((): ModelTurnResult => ({ status: "failed", message: "The turn was still running after 2 seconds." })),
+      ]);
+
+      expect(result).toMatchObject({ status: "timed_out", limit: "total", limitMs: 300 });
+    } finally {
+      clearInterval(ticker);
+      await client.close();
+    }
+  });
+
+  test("defaults to a 10-minute idle limit and a total limit of three idle limits", () => {
+    expect(new AppServerClient().turnLimits).toEqual({ idleMs: 600_000, totalMs: 1_800_000 });
+    expect(new AppServerClient({ turnIdleTimeoutMs: 900_000 }).turnLimits).toEqual({ idleMs: 900_000, totalMs: 2_700_000 });
+    expect(new AppServerClient({ turnIdleTimeoutMs: 1_000, turnTotalTimeoutMs: 1_500 }).turnLimits).toEqual({ idleMs: 1_000, totalMs: 1_500 });
   });
 });
 

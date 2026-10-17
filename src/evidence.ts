@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { describeRequestFailure, registeredRequestFailure } from "./request-failure.ts";
 import { encodeRepositoryPath, type GitHubResearcher } from "./github.ts";
-import { isRootLicensePath, isTestPath, isTextSourcePath, rankTreeFiles, type RankedTerm } from "./file-ranking.ts";
-import { chooseLocalReferenceFiles, localReadFailureText, readLocalSource, type LocalIndex } from "./local.ts";
+import { chooseRootLicensePath, isTestPath, isTextSourcePath, rankTreeFiles, type RankedTerm } from "./file-ranking.ts";
+import { REDACTED_VALUE, chooseLocalReferenceFiles, localReadFailureText, readLocalSource, type LocalIndex } from "./local.ts";
 import type {
   EvidenceExcerpt,
   EvidenceSource,
@@ -154,9 +154,15 @@ export async function loadSelectedEvidence(options: {
       break;
     }
     try {
-      const bytes = item.kind === "local"
-        ? await readLocalSource(options.local.root, item.file)
-        : await options.github.fetchSource(item.repository!, item.file.path, options.signal);
+      let redactions = 0;
+      let bytes: Uint8Array;
+      if (item.kind === "local") {
+        const local = await readLocalSource(options.local.root, item.file);
+        bytes = local.bytes;
+        redactions = local.redactions;
+      } else {
+        bytes = await options.github.fetchSource(item.repository!, item.file.path, options.signal);
+      }
       if (bytes.byteLength > (item.kind === "local" ? 256_000 : 1_000_000)) {
         throw new EvidenceReadError(item.kind === "local" ? "local_size_limit" : "remote_size_limit");
       }
@@ -192,6 +198,9 @@ export async function loadSelectedEvidence(options: {
       sources.push(source);
       bytesBySourceId.set(sourceId, bytes);
       textBySourceId.set(sourceId, text);
+      if (redactions > 0) {
+        gaps.push({ kind: "local", message: `Replaced ${redactions} likely secret value(s) in ${item.file.path} with ${REDACTED_VALUE} before any model turn; the saved snapshot and its SHA-256 cover the redacted text.`, material: false });
+      }
 
       const anchors = item.kind === "remote"
         ? item.repository!.codeMatches?.find((match) => match.fileId === item.file.id)?.patterns
@@ -284,7 +293,8 @@ function chooseRepositoryReferenceFiles(files: TreeFile[]): Array<{ file: TreeFi
   const result: Array<{ file: TreeFile; role: "manifest" | "ci" | "license" | "config" }> = [];
   const manifest = choose((file) => path.posix.dirname(file.path) === "." && /^(package\.json|pyproject\.toml|cargo\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|composer\.json)$/i.test(path.posix.basename(file.path)));
   if (manifest) result.push({ file: manifest, role: "manifest" });
-  const license = choose((file) => isRootLicensePath(file.path))
+  const licensePath = chooseRootLicensePath(files.map((file) => file.path));
+  const license = (licensePath ? files.find((file) => file.path === licensePath) : undefined)
     ?? choose((file) => path.posix.dirname(file.path) === "." && /^notice(\.txt|\.md|\.rst)?$/i.test(path.posix.basename(file.path)));
   if (license && !result.some((entry) => entry.file.id === license.id)) result.push({ file: license, role: "license" });
   const ci = choose((file) => file.path.startsWith(".github/workflows/") || rootFile(".gitlab-ci.yml")(file) || rootFile("jenkinsfile")(file));

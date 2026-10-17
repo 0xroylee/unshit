@@ -3,7 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stderr, stdout } from "node:process";
-import { AppServerClient, NativeModelGateway } from "./app-server.ts";
+import { NativeModelGateway, type AppServerClientOptions } from "./app-server.ts";
 import { GitHubResearcher } from "./github.ts";
 import { runWorkflow } from "./workflow.ts";
 import { createRunId, writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts } from "./storage.ts";
@@ -18,6 +18,7 @@ interface CliArguments {
   answers?: string;
   model?: string;
   effort?: string;
+  turnTimeoutSeconds?: number;
   json: boolean;
   jsonl: boolean;
   help: boolean;
@@ -36,6 +37,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
   let answers: string | undefined;
   let model: string | undefined;
   let effort: string | undefined;
+  let turnTimeoutSeconds: number | undefined;
   let json = false;
   let jsonl = false;
   let help = false;
@@ -50,7 +52,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
     if (token === "--json") { json = true; continue; }
     if (token === "--jsonl") { jsonl = true; continue; }
     const [name, inlineValue] = token.startsWith("--") && token.includes("=") ? [token.slice(0, token.indexOf("=")), token.slice(token.indexOf("=") + 1)] : [token, undefined];
-    if (["--cwd", "--out", "--answers", "--model", "--effort"].includes(name)) {
+    if (["--cwd", "--out", "--answers", "--model", "--effort", "--turn-timeout"].includes(name)) {
       const value = inlineValue ?? argv[++index];
       if (!value || value.startsWith("--")) throw new CliError(`${name} needs a value.`);
       if (name === "--cwd") cwd = value;
@@ -58,6 +60,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
       if (name === "--answers") answers = value;
       if (name === "--model") model = value;
       if (name === "--effort") effort = value;
+      if (name === "--turn-timeout") turnTimeoutSeconds = parseTurnTimeout(value);
       continue;
     }
     if (token.startsWith("-")) throw new CliError(`Unknown option: ${token}`);
@@ -72,7 +75,32 @@ export function parseCliArguments(argv: string[]): CliArguments {
   if (["resume", "refs", "export"].includes(positional[0]?.toLowerCase() ?? "")) {
     throw new CliError("This CLI accepts one software requirement and produces a plan. Start with a quoted requirement.");
   }
-  return { requirement: positional.join(" "), cwd, out, answers, model, effort, json, jsonl, help };
+  return { requirement: positional.join(" "), cwd, out, answers, model, effort, turnTimeoutSeconds, json, jsonl, help };
+}
+
+function parseTurnTimeout(value: string): number {
+  const seconds = Number(value);
+  if (!/^\d+$/.test(value) || seconds < 30 || seconds > 3_600) {
+    throw new CliError("--turn-timeout must be a whole number of seconds from 30 to 3600.");
+  }
+  return seconds;
+}
+
+export function gatewayOptions(args: CliArguments, cwd: string): AppServerClientOptions {
+  return {
+    cwd,
+    ...(args.model ? { model: args.model } : {}),
+    ...(args.effort ? { effort: args.effort } : {}),
+    ...(args.turnTimeoutSeconds ? { turnIdleTimeoutMs: args.turnTimeoutSeconds * 1_000 } : {}),
+  };
+}
+
+export function exitCodeFor(outcome: RunOutcome, aborted: boolean): number {
+  if (outcome.status === "needs_input") return 2;
+  if (outcome.status === "interrupted" || aborted) return 130;
+  if (outcome.status === "timed_out") return 124;
+  if (outcome.status === "error") return 1;
+  return 0;
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
@@ -137,7 +165,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     readlineInterface ??= createInterface({ input: stdin, output: stderr });
     return readlineInterface.question(`\n${question.id}: ${question.question}\nWhy it matters: ${question.whyMaterial}\n> `);
   } : undefined;
-  const gateway = new NativeModelGateway({ cwd, ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}) });
+  const gateway = new NativeModelGateway(gatewayOptions(args, cwd));
   const researcher = new GitHubResearcher({ githubToken: process.env.GITHUB_TOKEN, gitlabToken: process.env.GITLAB_TOKEN, codeSearch: true });
   const runId = createRunId();
   let flowHeaderPrinted = false;
@@ -191,16 +219,17 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   } else if (outcome.status === "interrupted") {
     stderr.write(`${outcome.message}\n`);
     if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
+  } else if (outcome.status === "timed_out") {
+    stderr.write(`${outcome.message}\n`);
+    if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
+    stderr.write("Use --turn-timeout <seconds> to allow longer model turns.\n");
   } else if (outcome.status === "error") {
     stderr.write(`${outcome.message}\n`);
     if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
   }
 
   if (args.jsonl) stdout.write(`${formatJsonlResult(outcome)}\n`);
-  if (outcome.status === "needs_input") return 2;
-  if (outcome.status === "interrupted" || controller.signal.aborted) return 130;
-  if (outcome.status === "error") return 1;
-  return 0;
+  return exitCodeFor(outcome, controller.signal.aborted);
 }
 
 export async function readAnswerFile(
@@ -290,7 +319,7 @@ function writeCliError(message: string, json: boolean, jsonl: boolean): number {
   return 1;
 }
 
-function helpText(): string {
+export function helpText(): string {
   return [
     "unshit \"software requirement\"",
     "",
@@ -302,12 +331,13 @@ function helpText(): string {
     "  --answers <json-file> Use and edit the answers.json template returned by needs_input",
     "  --model <name>        Use a Codex model for this run",
     "  --effort <level>      minimal, low, medium, high, or xhigh",
+    "  --turn-timeout <seconds>  End a model turn after this many seconds without Codex activity (30-3600, default 600); a turn may run three times as long in total",
     "  --json                Emit one JSON result object",
     "  --jsonl               Emit progress and result as JSON Lines",
     "  --help                Show this help",
     "",
     "The default report and evidence manifest are saved under .unshit/<run-id>/.",
-    "Missing material answers return needs_input with exit code 2. Ctrl+C returns 130.",
+    "Missing material answers return needs_input with exit code 2. A model turn that times out returns 124. Ctrl+C returns 130.",
     "",
   ].join("\n");
 }

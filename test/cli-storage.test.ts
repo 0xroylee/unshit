@@ -2,7 +2,7 @@ import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
-import { formatJsonlResult, parseCliArguments, readAnswerFile } from "../src/cli.ts";
+import { exitCodeFor, formatJsonlResult, gatewayOptions, helpText, parseCliArguments, readAnswerFile } from "../src/cli.ts";
 import { sourceLocation } from "../src/evidence.ts";
 import { parseIntake, stableMaterialQuestionId } from "../src/model-schema.ts";
 import { writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts } from "../src/storage.ts";
@@ -51,6 +51,7 @@ describe("answers and script output", () => {
     const outcomes: RunOutcome[] = [
       { status: "needs_input", questions: [], brief },
       { status: "interrupted", message: "cancelled" },
+      { status: "timed_out", message: "The plan turn timed out.", stage: "plan", limit: "idle", limitSeconds: 600 },
       { status: "error", message: "failed" },
     ];
     for (const outcome of outcomes) {
@@ -58,6 +59,33 @@ describe("answers and script output", () => {
       expect(lines).toHaveLength(1);
       expect(JSON.parse(lines[0]!).type).toBe("result");
     }
+  });
+
+  test("parses --turn-timeout as whole seconds from 30 to 3600", () => {
+    expect(parseCliArguments(["plan refunds", "--turn-timeout", "900"]).turnTimeoutSeconds).toBe(900);
+    expect(parseCliArguments(["plan refunds", "--turn-timeout=30"]).turnTimeoutSeconds).toBe(30);
+    expect(parseCliArguments(["plan refunds", "--turn-timeout", "3600"]).turnTimeoutSeconds).toBe(3600);
+    expect(parseCliArguments(["plan refunds"]).turnTimeoutSeconds).toBeUndefined();
+    for (const value of ["29", "3601", "90.5", "1e3", "-60", "ten"]) {
+      expect(() => parseCliArguments(["plan refunds", "--turn-timeout", value])).toThrow("--turn-timeout must be a whole number of seconds from 30 to 3600.");
+    }
+    expect(() => parseCliArguments(["plan refunds", "--turn-timeout"])).toThrow("--turn-timeout needs a value.");
+  });
+
+  test("passes --turn-timeout to the model gateway as the idle limit in milliseconds", () => {
+    expect(gatewayOptions(parseCliArguments(["plan refunds", "--turn-timeout", "900"]), "/work")).toEqual({ cwd: "/work", turnIdleTimeoutMs: 900_000 });
+    expect(gatewayOptions(parseCliArguments(["plan refunds", "--effort", "high"]), "/work")).toEqual({ cwd: "/work", effort: "high" });
+  });
+
+  test("maps run outcomes to exit codes, with 124 for a model turn timeout", () => {
+    const timedOut: RunOutcome = { status: "timed_out", message: "The plan turn timed out.", stage: "plan", limit: "idle", limitSeconds: 600 };
+    expect(exitCodeFor(timedOut, false)).toBe(124);
+    expect(exitCodeFor(timedOut, true)).toBe(130);
+    expect(exitCodeFor({ status: "interrupted", message: "cancelled" }, false)).toBe(130);
+    expect(exitCodeFor({ status: "error", message: "failed" }, false)).toBe(1);
+    expect(exitCodeFor({ status: "needs_input", questions: [], brief }, true)).toBe(2);
+    expect(helpText()).toContain("--turn-timeout <seconds>");
+    expect(helpText()).toContain("A model turn that times out returns 124.");
   });
 
   test("serializes the initial brief and repository research in the JSON result", () => {
@@ -70,6 +98,7 @@ describe("answers and script output", () => {
       matched: 2,
       passedMetadataBar: 1,
       shortlisted: 1,
+      selected: 1,
       excluded: 1,
       rateLimited: false,
       trustworthyReferenceFound: true,
@@ -157,6 +186,7 @@ describe("partial evidence persistence", () => {
         matched: 0,
         passedMetadataBar: 0,
         shortlisted: 0,
+        selected: 0,
         excluded: 0,
         rateLimited: false,
         trustworthyReferenceFound: false,

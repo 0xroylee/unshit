@@ -1,11 +1,12 @@
-import type { ModelGateway, ModelSession, ModelTurnResult, JsonRecord } from "./app-server.ts";
+import type { ModelGateway, ModelSession, ModelTurnResult, JsonRecord, TurnTimeoutLimit } from "./app-server.ts";
 import { referencePlanPrompt, type ReferencePlanPhase } from "./instructions.ts";
 import { GitHubResearcher } from "./github.ts";
 import { scanLocalTree, extractExistingCommands } from "./local.ts";
-import { domainMaterialFromBrief } from "./repository-screening.ts";
+import { domainMaterialFromBrief, identifiedLicenseId } from "./repository-screening.ts";
 import { domainTermsFor, isTestPath, isTextSourcePath, pathRoleHint, rankTreeFiles } from "./file-ranking.ts";
 import { mergeCodeSearchSummaries } from "./code-search.ts";
 import {
+  CANDIDATE_RANKING_SCHEMA,
   FILE_SELECTION_SCHEMA,
   INTAKE_SCHEMA,
   REFINED_BRIEF_SCHEMA,
@@ -15,6 +16,7 @@ import {
   ModelOutputError,
   createPlanDocument,
   parseFileSelection,
+  parseCandidateRanking,
   parseIntake,
   parseRefinedBrief,
   parseModelJson,
@@ -28,6 +30,7 @@ import {
 import { excerptPromptData, finalSources, loadSelectedEvidence } from "./evidence.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import type {
+  CheckpointStage,
   CodeMatch,
   IntakeBrief,
   MaterialQuestion,
@@ -43,6 +46,7 @@ import type {
   ResolvedAnswer,
   ResearchSummary,
   ValidationRecord,
+  SelectedFile,
   TreeFile,
 } from "./types.ts";
 
@@ -63,7 +67,7 @@ export interface WorkflowArtifactInput {
   commands: ReturnType<typeof extractExistingCommands>;
 }
 
-export type CheckpointStage = "evidence" | "plan" | "interrupted" | "failed";
+export type { CheckpointStage };
 
 export interface WorkflowOptions {
   cwd: string;
@@ -93,6 +97,18 @@ class InterruptedWorkflowError extends Error {
   }
 }
 
+class TurnTimeoutError extends Error {
+  readonly limit: TurnTimeoutLimit;
+  readonly limitSeconds: number;
+
+  constructor(readonly stage: string, result: Extract<ModelTurnResult, { status: "timed_out" }>) {
+    super(`The ${stage} turn timed out. ${result.message}`);
+    this.name = "TurnTimeoutError";
+    this.limit = result.limit;
+    this.limitSeconds = Math.round(result.limitMs / 1_000);
+  }
+}
+
 export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome> {
   const gaps: ResearchGap[] = [];
   const reviews: ReviewResult[] = [];
@@ -110,22 +126,25 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
   let savedCheckpointPath: string | undefined;
   const progress = (event: ProgressEvent): void => options.onProgress?.(event);
 
-  const saveCheckpoint = async (stage: CheckpointStage): Promise<void> => {
-    if (!options.onCheckpoint || !brief || !checkpointEvidence) return;
-    const plan = checkpointPlan ?? blockedDraft(brief, checkpointRepositoryChoices, ["Planning had not completed when this evidence checkpoint was saved."]);
+  const saveCheckpoint = async (stage: CheckpointStage, placeholderNotes: string[] = []): Promise<void> => {
+    // A timeout leaves a checkpoint even before intake or the source reads finished.
+    const checkpointBrief = brief ?? (stage === "timed_out" ? emptyBrief(options.requirement) : undefined);
+    const savedEvidence = checkpointEvidence ?? (stage === "timed_out" ? emptyEvidence() : undefined);
+    if (!options.onCheckpoint || !checkpointBrief || !savedEvidence) return;
+    const plan = checkpointPlan ?? placeholderPlan(checkpointBrief, checkpointRepositoryChoices, stage === "plan" ? "evidence" : stage, placeholderNotes);
     try {
       savedCheckpointPath = await options.onCheckpoint({
-        brief,
+        brief: checkpointBrief,
         ...(initialBrief ? { initialBrief } : {}),
         ...(research ? { research } : {}),
         resolvedAnswers: [...resolvedAnswerContext],
         plan,
-        sources: finalSources(checkpointEvidence.sources, checkpointEvidence.excerpts),
+        sources: finalSources(savedEvidence.sources, savedEvidence.excerpts),
         gaps: [...gaps],
         reviews: [...reviews],
         validationIssues: [...validationIssues],
         validationHistory: [...validationHistory],
-        evidence: checkpointEvidence,
+        evidence: savedEvidence,
         commands: [...checkpointCommands],
       }, stage);
     } catch {
@@ -134,14 +153,15 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
   };
 
   const preserveKnownState = async (stage: CheckpointStage, message: string): Promise<void> => {
-    if (!brief || !checkpointEvidence) return;
+    if (stage !== "timed_out" && (!brief || !checkpointEvidence)) return;
     if (!gaps.some((gap) => gap.kind === "validation" && gap.message === message)) {
       gaps.push({ kind: "validation", message, material: true });
     }
-    if (!checkpointPlan) checkpointPlan = blockedDraft(brief, checkpointRepositoryChoices, [message]);
-    checkpointPlan.readiness = "draft";
-    checkpointPlan.readinessNotes = [...new Set([...checkpointPlan.readinessNotes, message])];
-    await saveCheckpoint(stage);
+    if (checkpointPlan) {
+      checkpointPlan.readiness = "draft";
+      checkpointPlan.readinessNotes = [...new Set([...checkpointPlan.readinessNotes, message])];
+    }
+    await saveCheckpoint(stage, [message]);
   };
 
   try {
@@ -153,6 +173,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       planningSession,
       intakePrompt(options.requirement),
       INTAKE_SCHEMA,
+      "intake",
       "intake",
       options.signal,
     );
@@ -184,16 +205,19 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
           refineBriefPrompt(options.requirement, brief, resolvedAnswerContext),
           REFINED_BRIEF_SCHEMA,
           "intake",
+          "brief rebuild",
           options.signal,
         );
         brief = parseRefinedBrief(refinedValue, brief);
         progress({ stage: "intake", state: "completed", message: `Rebuilt the brief from ${resolvedAnswerContext.length} material answers.` });
       } catch (error) {
         if (error instanceof NeedsInputError || error instanceof InterruptedWorkflowError || options.signal?.aborted) throw error;
+        // After a timeout the native session can be unusable; the search and planning turns need a working one.
+        if (error instanceof TurnTimeoutError) planningSession = await replaceSession(options.modelGateway, planningSession);
         gaps.push({
           kind: "validation",
           material: true,
-          message: "The brief could not be rebuilt after the material answers; planning used the initial brief with the answers as context.",
+          message: `The brief could not be rebuilt after the material answers; planning used the initial brief with the answers as context.${error instanceof TurnTimeoutError ? ` ${error.message}` : ""}`,
         });
       }
     }
@@ -220,10 +244,35 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     research = discovery.research;
     progress({ stage: "repository_search", state: "completed", message: `Matched ${discovery.research.matched} unique repositories; ${discovery.candidates.length} passed the metadata bar.` });
 
+    let treeCandidates = discovery.candidates;
+    const treeChecks = options.researcher.treeResolutionLimit;
+    if (discovery.candidates.length > treeChecks) {
+      progress({ stage: "candidate_ranking", state: "started", message: `Ranking ${discovery.candidates.length} metadata-passing repositories for ${treeChecks} commit-pinned tree checks.` });
+      try {
+        const rankingValue = await modelJson(
+          planningSession,
+          candidateRankingPrompt(brief, resolvedAnswerContext, discovery.candidates, treeChecks),
+          CANDIDATE_RANKING_SCHEMA,
+          "research",
+          "candidate ranking",
+          options.signal,
+        );
+        const ranked = parseCandidateRanking(rankingValue, discovery.candidates);
+        treeCandidates = rankedFirst(discovery.candidates, ranked);
+        progress({ stage: "candidate_ranking", state: "completed", message: `The model put ${ranked.length} repositories first for tree checks.` });
+      } catch (error) {
+        if (options.signal?.aborted || error instanceof InterruptedWorkflowError || error instanceof NeedsInputError) throw error;
+        // After a timeout the native session can be unusable; the selection and planning turns need a working one.
+        if (error instanceof TurnTimeoutError) planningSession = await replaceSession(options.modelGateway, planningSession);
+        gaps.push({ kind: "repository", material: false, message: `The model ranking of metadata-passing repositories failed, so tree checks used the host keyword order.${error instanceof TurnTimeoutError ? ` ${error.message}` : ""}` });
+        progress({ stage: "candidate_ranking", state: "warning", message: "Tree checks use the host keyword order." });
+      }
+    }
+
     throwIfAborted(options.signal);
     progress({ stage: "repository_trees", state: discovery.candidates.length > 0 ? "started" : "skipped", message: discovery.candidates.length > 0 ? "Verifying candidate commits, tests, and license evidence before selection." : "No candidate passed the metadata quality bar." });
     const treeResolution = await options.researcher.resolveShortlist(
-      discovery.candidates,
+      treeCandidates,
       options.signal,
       (message) => progress({ stage: "repository_trees", state: "completed", message }),
       domainMaterial.codePatterns ?? [],
@@ -234,7 +283,6 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     research.treeResolutions = treeResolution.resolutions;
     research.shortlisted = treeResolution.snapshots.length;
     research.excluded = discovery.excluded.length + treeResolution.excluded.length;
-    research.trustworthyReferenceFound = treeResolution.snapshots.length > 0;
     const hostExcluded = [...discovery.excluded, ...treeResolution.excluded];
     if (treeResolution.snapshots.length === 0) {
       gaps.push({ kind: "search", message: noTrustworthyReferenceMessage(research), material: true });
@@ -253,7 +301,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         defaultBranch: snapshot.candidate.defaultBranch,
         lastActivityAt: snapshot.candidate.lastActivityAt ?? null,
         signals: snapshot.candidate.signals ?? null,
-        licenseEvidence: snapshot.candidate.signals?.licenseSpdxId ? "metadata" : snapshot.licensePath ? "tree" : "none",
+        licenseEvidence: identifiedLicenseId(snapshot.candidate.signals) ? "metadata" : snapshot.licensePath ? "tree" : "none",
         licensePath: snapshot.licensePath ?? null,
         commitSha: snapshot.commitSha,
         commitDate: snapshot.commitDate ?? null,
@@ -267,6 +315,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         repositorySelectionPrompt(brief, resolvedAnswerContext, candidateData),
         REPOSITORY_SELECTION_SCHEMA,
         "research",
+        "candidate selection",
         options.signal,
       );
       selection = parseRepositorySelection(selectionValue, shortlistCandidates);
@@ -278,6 +327,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       gaps.push({ kind: "repository", message: "The model selected no comparator repository for deep inspection.", material: true });
     }
     const selectedSnapshots = selectedRepositorySnapshots(selection.selected, shortlistCandidates, treeResolution.snapshots);
+    research.selected = selectedSnapshots.length;
     const repositoryChoices = buildRepositoryChoices(
       [...discovery.candidates, ...discovery.excluded.map((entry) => entry.candidate), ...treeResolution.excluded.map((entry) => entry.candidate)],
       selection,
@@ -287,20 +337,26 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     checkpointRepositoryChoices = repositoryChoices;
 
     throwIfAborted(options.signal);
-    const fileCandidates = candidateFiles(local.files, selectedSnapshots, domainTermsFor(brief, resolvedAnswerContext));
-    let fileSelection: ReturnType<typeof parseFileSelection> = [];
-    if (fileCandidates.length > 0) {
+    const choices = fileChoices(local.files, selectedSnapshots, domainTermsFor(brief, resolvedAnswerContext));
+    if (choices.omitted > 0) {
+      gaps.push({ kind: "file", material: false, message: `The file list for model selection left out ${choices.omitted} lower-ranked files to stay within 300,000 characters.` });
+    }
+    let fileSelection: SelectedFile[] = [];
+    if (choices.offered.length > 0) {
       progress({ stage: "file_selection", state: "started", message: "Choosing production and test files from actual local and commit-pinned trees." });
       const fileValue = await modelJson(
         planningSession,
-        fileSelectionPrompt(brief, resolvedAnswerContext, fileCandidates, selectedSnapshots),
+        fileSelectionPrompt(brief, resolvedAnswerContext, choices),
         FILE_SELECTION_SCHEMA,
         "research",
+        "file selection",
         options.signal,
       );
-      fileSelection = parseFileSelection(fileValue, fileCandidates.flatMap((candidate) =>
-        typeof candidate.fileId === "string" ? [{ id: candidate.fileId }] : [],
-      ));
+      const parsed = parseFileSelection(fileValue, choices.offered);
+      fileSelection = parsed.files;
+      if (parsed.ignored > 0) {
+        gaps.push({ kind: "file", material: false, message: `The model chose ${parsed.ignored} file ID(s) that were not offered or were repeated; the host ignored them.` });
+      }
       progress({ stage: "file_selection", state: "completed", message: `Selected ${fileSelection.length} source files for bounded reads.` });
     } else {
       gaps.push({ kind: "file", message: "No eligible source or test file IDs were available for evidence selection.", material: true });
@@ -319,6 +375,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       signal: options.signal,
     });
     checkpointEvidence = evidence;
+    research.trustworthyReferenceFound = selectedSnapshots.some((snapshot) => hasComparatorSource(snapshot, evidence));
     gaps.push(...evidence.gaps);
     if (evidence.excerpts.length === 0) gaps.push({ kind: "file", message: "No source excerpt could be prepared for evidence-backed planning.", material: true });
     progress({ stage: "source_reads", state: "completed", message: `Prepared ${evidence.sources.length} hashed source snapshots and ${evidence.excerpts.length} line-validated excerpts.` });
@@ -338,12 +395,11 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     }));
     const evidenceData = excerptPromptData(evidence.sources, evidence.excerpts);
     const selectedRationales = new Map(selection.selected.map((entry) => [entry.candidateId, entry.rationale]));
-    checkpointPlan = blockedDraft(brief, repositoryChoices, ["Plan generation is in progress; this checkpoint contains evidence only."]);
-    await saveCheckpoint("evidence");
+    await saveCheckpoint("evidence", ["Plan generation is in progress; this checkpoint contains evidence only."]);
 
     progress({ stage: "plan", state: "started", message: "Generating the requirement-to-task plan with host-owned evidence IDs." });
     const planPrompt = planGenerationPrompt(options.requirement, brief, resolvedAnswerContext, repositoryChoices, evidenceData, commandContext);
-    const rawPlan = await modelJson(planningSession, planPrompt, PLAN_SCHEMA, "planning", options.signal);
+    const rawPlan = await modelJson(planningSession, planPrompt, PLAN_SCHEMA, "planning", "plan", options.signal);
     let parsedPlan: ParsedPlanPayload | undefined;
     try {
       parsedPlan = parsePlan(rawPlan, brief, evidence.excerpts, commands, selectedSnapshots, evidence.sources);
@@ -358,6 +414,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
           planRepairPrompt(planPrompt, rawPlan, [issue]),
           PLAN_SCHEMA,
           "planning",
+          "plan repair",
           options.signal,
         );
         parsedPlan = parsePlan(repaired, brief, evidence.excerpts, commands, selectedSnapshots, evidence.sources);
@@ -375,7 +432,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
 
     let plan: PlanDocument;
     if (!parsedPlan) {
-      plan = blockedDraft(brief, repositoryChoices, validationIssues);
+      plan = placeholderPlan(brief, repositoryChoices, "validation", validationIssues);
       progress({ stage: "plan", state: "warning", message: "A usable task map could not pass host validation; the report will show the blocker as Draft." });
     } else {
       const draftReviewNotes = gaps.filter((gap) => gap.material).map((gap) => gap.message);
@@ -409,6 +466,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
             reviewRepairPrompt(options.requirement, brief, resolvedAnswerContext, plan, importantFindings, evidenceData, commandContext),
             PLAN_SCHEMA,
             "planning",
+            "review repair",
             options.signal,
           );
           const repairedPayload = parsePlan(repaired, brief, evidence.excerpts, commands, selectedSnapshots, evidence.sources);
@@ -480,12 +538,23 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
   } catch (error) {
     if (error instanceof NeedsInputError) {
       const knownBrief = brief ?? emptyBrief(options.requirement);
-      await preserveKnownState("failed", "The workflow paused for additional input after some evidence had been collected.");
+      await preserveKnownState("needs_input", "The workflow paused for additional input after some evidence had been collected.");
       return { status: "needs_input", questions: error.questions, brief: knownBrief, ...(savedCheckpointPath ? { checkpointPath: savedCheckpointPath } : {}) };
     }
     if (error instanceof InterruptedWorkflowError || options.signal?.aborted) {
       await preserveKnownState("interrupted", "The run was interrupted before planning and review completed; saved material remains Draft.");
       return { status: "interrupted", message: "The run was interrupted. The active Codex turn and source requests were cancelled.", ...(savedCheckpointPath ? { checkpointPath: savedCheckpointPath } : {}) };
+    }
+    if (error instanceof TurnTimeoutError) {
+      await preserveKnownState("timed_out", error.message);
+      return {
+        status: "timed_out",
+        message: error.message,
+        stage: error.stage,
+        limit: error.limit,
+        limitSeconds: error.limitSeconds,
+        ...(savedCheckpointPath ? { checkpointPath: savedCheckpointPath } : {}),
+      };
     }
     await preserveKnownState("failed", "The workflow failed before final plan validation and review completed; saved material remains Draft.");
     return { status: "error", message: error instanceof Error ? error.message : "The workflow failed.", ...(savedCheckpointPath ? { checkpointPath: savedCheckpointPath } : {}) };
@@ -531,6 +600,7 @@ async function modelJson(
   prompt: string,
   schema: JsonRecord,
   phase: ReferencePlanPhase,
+  stage: string,
   signal?: AbortSignal,
 ): Promise<unknown> {
   throwIfAborted(signal);
@@ -543,8 +613,14 @@ async function modelJson(
     })));
   }
   if (result.status === "interrupted") throw new InterruptedWorkflowError();
+  if (result.status === "timed_out") throw new TurnTimeoutError(stage, result);
   if (result.status === "failed") throw new Error(result.message);
   return parseModelJson(result.text);
+}
+
+async function replaceSession(gateway: ModelGateway, session: ModelSession): Promise<ModelSession> {
+  await session.close();
+  return gateway.createSession();
 }
 
 async function independentReview(
@@ -557,7 +633,7 @@ async function independentReview(
 ): Promise<ReviewResult> {
   const reviewer = options.modelGateway.createSession();
   try {
-    const value = await modelJson(reviewer, reviewPrompt(options.requirement, brief, answers, plan, evidenceData), REVIEW_SCHEMA, "review", signal);
+    const value = await modelJson(reviewer, reviewPrompt(options.requirement, brief, answers, plan, evidenceData), REVIEW_SCHEMA, "review", "independent review", signal);
     return parseReview(value, brief, parseExcerptMetadata(evidenceData));
   } finally {
     await reviewer.close();
@@ -598,6 +674,33 @@ function refineBriefPrompt(requirement: string, initial: IntakeBrief, answers: R
   ].join("\n\n");
 }
 
+function candidateRankingPrompt(brief: IntakeBrief, answers: ResolvedAnswer[], candidates: RepositoryCandidate[], treeChecks: number): string {
+  return [
+    `Rank up to twelve repositories for commit-pinned tree checks. The host checks at most ${treeChecks} trees, in your order; unranked repositories follow in the host keyword order.`,
+    "Rank first the repositories whose description and topics show that their production code implements the brief's core workflow. Leave out documentation collections, tutorials, samples, awesome lists, and large platforms that only mention the domain. Stars and popularity are background only. codePatterns lists the brief's literal patterns that the host's code search found in the repository; a common word there is a weak hint.",
+    "Use only the supplied candidate IDs. The host verifies tests, license, and the pinned tree after ranking. Return only the requested JSON.",
+    "CLARIFIED BRIEF:",
+    JSON.stringify({ summary: brief.summary, requirements: brief.requirements, answers }),
+    "METADATA-PASSING REPOSITORIES:",
+    JSON.stringify(candidates.map((candidate) => ({
+      id: candidate.id,
+      repository: candidate.fullName,
+      description: candidate.description,
+      topics: candidate.signals?.topics ?? [],
+      language: candidate.signals?.language ?? null,
+      stars: candidate.signals?.stars ?? null,
+      pushedAt: candidate.signals?.pushedAt ?? null,
+      codePatterns: [...new Set((candidate.codeMatches ?? []).map((match) => match.pattern))],
+    }))),
+  ].join("\n\n");
+}
+
+function rankedFirst(candidates: RepositoryCandidate[], rankedIds: string[]): RepositoryCandidate[] {
+  const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+  const ranked = new Set(rankedIds);
+  return [...rankedIds.flatMap((id) => byId.get(id) ?? []), ...candidates.filter((candidate) => !ranked.has(candidate.id))];
+}
+
 function repositorySelectionPrompt(
   brief: IntakeBrief,
   answers: ResolvedAnswer[],
@@ -615,52 +718,88 @@ function repositorySelectionPrompt(
   ].join("\n\n");
 }
 
-function candidateFiles(localFiles: TreeFile[], snapshots: RepositorySnapshot[], terms: ReturnType<typeof domainTermsFor>): Array<Record<string, unknown>> {
-  const result: Array<Record<string, unknown>> = [];
-  for (const file of rankTreeFiles(localFiles, terms, 300)) result.push({ fileId: file.id, path: file.path, size: file.size, source: "local project", roleHint: pathRoleHint(file.path) });
-  for (const snapshot of snapshots) {
-    const filesById = new Map(snapshot.files.map((file) => [file.id, file]));
-    const patternsById = new Map((snapshot.codeMatches ?? []).map((match) => [match.fileId, match.patterns]));
-    const codeMatched = (snapshot.codeMatches ?? []).flatMap((match) => {
-      const file = filesById.get(match.fileId);
-      return file && isTextSourcePath(file.path) ? [file] : [];
-    });
-    const files = [...new Map([...codeMatched, ...rankTreeFiles(snapshot.files, terms, 800)].map((file) => [file.id, file])).values()].slice(0, 800);
-    for (const file of files) {
-      const patterns = patternsById.get(file.id);
-      result.push({
-        fileId: file.id,
-        path: file.path,
-        size: file.size,
-        source: `${snapshot.candidate.provider}:${snapshot.candidate.fullName}`,
-        commitSha: snapshot.commitSha,
-        commitDate: snapshot.commitDate ?? null,
-        lastActivityAt: snapshot.candidate.lastActivityAt ?? null,
-        roleHint: pathRoleHint(file.path),
-        ...(patterns ? { codeMatch: patterns.join(", ") } : {}),
-      });
-    }
-  }
-  return result;
+// The serialized file list offered for model selection never exceeds this many characters.
+const FILE_LIST_LIMIT = 300_000;
+
+interface FileChoice {
+  fileId: string;
+  path: string;
+  size: number | null;
+  roleHint: string;
+  codeMatch?: string;
 }
 
-function fileSelectionPrompt(
-  brief: IntakeBrief,
-  answers: ResolvedAnswer[],
-  files: Array<Record<string, unknown>>,
-  snapshots: Array<{ candidate: { id: string; provider: string; fullName: string }; commitSha: string; treeTruncated: boolean }>,
-): string {
+interface FileChoices {
+  trees: Array<{ candidateId: string; source: string; commitSha: string; commitDate: string | null; lastActivityAt: string | null; treeTruncated: boolean }>;
+  groups: Array<{ source: string; files: FileChoice[] }>;
+  offered: Array<{ id: string }>;
+  omitted: number;
+}
+
+// Repository and commit details appear once per selected tree, never its whole file list. The local project and each
+// tree fill an equal share of FILE_LIST_LIMIT with their ranked files, so the lowest-ranked files are left out first.
+function fileChoices(localFiles: TreeFile[], snapshots: RepositorySnapshot[], terms: ReturnType<typeof domainTermsFor>): FileChoices {
+  const ranked = [
+    { source: "local project", files: rankTreeFiles(localFiles, terms, 300).map((file) => fileChoice(file)) },
+    ...snapshots.map((snapshot) => {
+      const filesById = new Map(snapshot.files.map((file) => [file.id, file]));
+      const patternsById = new Map((snapshot.codeMatches ?? []).map((match) => [match.fileId, match.patterns]));
+      const codeMatched = (snapshot.codeMatches ?? []).flatMap((match) => {
+        const file = filesById.get(match.fileId);
+        return file && isTextSourcePath(file.path) ? [file] : [];
+      });
+      const files = [...new Map([...codeMatched, ...rankTreeFiles(snapshot.files, terms, 800)].map((file) => [file.id, file])).values()].slice(0, 800);
+      return { source: treeSource(snapshot), files: files.map((file) => fileChoice(file, patternsById.get(file.id))) };
+    }),
+  ];
+  const share = Math.floor((FILE_LIST_LIMIT - ranked.length - 1) / ranked.length);
+  let omitted = 0;
+  const groups = ranked.map(({ source, files }) => {
+    const kept: FileChoice[] = [];
+    let size = JSON.stringify({ source, files: [] }).length;
+    for (const file of files) {
+      size += JSON.stringify(file).length + 1;
+      if (size > share) break;
+      kept.push(file);
+    }
+    omitted += files.length - kept.length;
+    return { source, files: kept };
+  });
+  return {
+    trees: snapshots.map((snapshot) => ({
+      candidateId: snapshot.candidate.id,
+      source: treeSource(snapshot),
+      commitSha: snapshot.commitSha,
+      commitDate: snapshot.commitDate ?? null,
+      lastActivityAt: snapshot.candidate.lastActivityAt ?? null,
+      treeTruncated: snapshot.treeTruncated,
+    })),
+    groups,
+    offered: groups.flatMap((group) => group.files.map((file) => ({ id: file.fileId }))),
+    omitted,
+  };
+}
+
+function fileChoice(file: TreeFile, patterns?: string[]): FileChoice {
+  return { fileId: file.id, path: file.path, size: file.size, roleHint: pathRoleHint(file.path), ...(patterns ? { codeMatch: patterns.join(", ") } : {}) };
+}
+
+function treeSource(snapshot: RepositorySnapshot): string {
+  return `${snapshot.candidate.provider}:${snapshot.candidate.fullName}`;
+}
+
+function fileSelectionPrompt(brief: IntakeBrief, answers: ResolvedAnswer[], choices: FileChoices): string {
   return [
     "Choose up to fifteen local or remote production and test files that can answer specific design questions in the brief.",
-    "Use only supplied file IDs and choose role production or test. Select relevant implementation and tests. The host separately reads a bounded project manifest, license, and CI file when present. A remote file ID resolves only to the exact SHA shown in the repository tree. Never invent paths or claim to have read files.",
+    "Use only supplied file IDs and choose role production or test. Select relevant implementation and tests. The host separately reads a bounded project manifest, license, and CI file when present. A remote file ID resolves only to the exact SHA shown for its source in the commit-pinned trees. Never invent paths or claim to have read files.",
     "A codeMatch value lists literal patterns that the host's code search found at that path in Grep's index of the default branch. The path exists in the pinned tree, but the file is not evidence until the host reads it at the pinned commit.",
     "Return only the requested JSON.",
     "CLARIFIED BRIEF:",
     JSON.stringify({ summary: brief.summary, requirements: brief.requirements, answers }),
     "COMMIT-PINNED TREES:",
-    JSON.stringify(snapshots),
+    JSON.stringify(choices.trees),
     "ACTUAL FILE ID AND PATH LIST:",
-    JSON.stringify(files),
+    JSON.stringify(choices.groups),
   ].join("\n\n");
 }
 
@@ -771,7 +910,7 @@ function buildRepositoryChoices(
     const hostExclusion = hostById.get(candidate.id);
     const hostReasons = hostExclusion?.reasons;
     const resolution = hostExclusion?.resolution;
-    const licenseEvidence: RepositoryChoice["licenseEvidence"] = candidate.signals?.licenseSpdxId
+    const licenseEvidence: RepositoryChoice["licenseEvidence"] = identifiedLicenseId(candidate.signals)
       ? "metadata"
       : snapshot?.licensePath || resolution?.licensePath
         ? "tree"
@@ -807,6 +946,18 @@ function buildRepositoryChoices(
   });
 }
 
+// A selected comparator counts only when the planner received an excerpt of its production or test source.
+function hasComparatorSource(snapshot: RepositorySnapshot, evidence: LoadedEvidence): boolean {
+  const sourceIds = new Set(evidence.sources
+    .filter((source) => source.kind === "remote"
+      && source.provider === snapshot.candidate.provider
+      && source.repository === snapshot.candidate.fullName
+      && source.commitSha === snapshot.commitSha
+      && source.roles.some((role) => role === "production" || role === "test"))
+    .map((source) => source.id));
+  return evidence.excerpts.some((excerpt) => sourceIds.has(excerpt.sourceId));
+}
+
 function parseExcerptMetadata(evidenceData: string): ReturnType<typeof parsePlanExcerptMetadata> {
   return parsePlanExcerptMetadata(evidenceData);
 }
@@ -823,31 +974,78 @@ function parsePlanExcerptMetadata(evidenceData: string) {
   }));
 }
 
-function blockedDraft(brief: IntakeBrief, repositoryChoices: RepositoryChoice[], issues: string[]): PlanDocument {
-  return {
+type PlaceholderReason = "validation" | Exclude<CheckpointStage, "plan">;
+
+// Placeholder plans stand in for a plan that does not exist yet, so each one names its actual reason.
+const PLACEHOLDER_TEXT: Record<PlaceholderReason, { title: string; summary: string; architecture: string; notApplicableReason: string }> = {
+  validation: {
     title: "Draft plan blocked by validation",
     summary: "The generated task map did not pass host validation. This report preserves the brief and the validation findings without presenting an invalid dependency graph as ready work.",
+    architecture: "Unavailable because the generated plan did not pass host validation.",
+    notApplicableReason: "The model design could not be validated.",
+  },
+  evidence: {
+    title: "Evidence checkpoint before plan generation",
+    summary: "This checkpoint was saved after the evidence was collected and before plan generation finished. It preserves the brief, the repository choices, and the evidence.",
+    architecture: "Not generated yet; plan generation had not finished when this checkpoint was saved.",
+    notApplicableReason: "Plan generation had not finished.",
+  },
+  interrupted: {
+    title: "Draft checkpoint after an interrupted run",
+    summary: "The run was interrupted before a plan passed host validation. This checkpoint preserves the brief, the repository choices, and the evidence collected so far.",
+    architecture: "Not generated; the run was interrupted first.",
+    notApplicableReason: "The run was interrupted before a design was generated.",
+  },
+  timed_out: {
+    title: "Draft checkpoint after a model turn timed out",
+    summary: "A model turn timed out before a plan passed host validation. This checkpoint preserves the brief, the repository choices, and the evidence collected so far.",
+    architecture: "Not generated; a model turn timed out first.",
+    notApplicableReason: "A model turn timed out before a design was generated.",
+  },
+  failed: {
+    title: "Draft checkpoint after a failed run",
+    summary: "The run failed before a plan passed host validation. This checkpoint preserves the brief, the repository choices, and the evidence collected so far.",
+    architecture: "Not generated; the run failed first.",
+    notApplicableReason: "The run failed before a design was generated.",
+  },
+  needs_input: {
+    title: "Draft checkpoint while waiting for input",
+    summary: "The run paused for additional input before a plan was generated. This checkpoint preserves the brief, the repository choices, and the evidence collected so far.",
+    architecture: "Not generated; the run is waiting for input.",
+    notApplicableReason: "The run paused for input before a design was generated.",
+  },
+};
+
+function placeholderPlan(brief: IntakeBrief, repositoryChoices: RepositoryChoice[], reason: PlaceholderReason, notes: string[]): PlanDocument {
+  const text = PLACEHOLDER_TEXT[reason];
+  return {
+    title: text.title,
+    summary: text.summary,
     requirements: brief.requirements,
     tasks: [],
     decisions: [],
     design: {
-      architecture: "Unavailable because the generated plan did not pass host validation.",
+      architecture: text.architecture,
       modules: [],
-      dataModel: { entities: [], notApplicableReason: "The model design could not be validated." },
-      invariants: { items: [], notApplicableReason: "The model design could not be validated." },
-      accessControl: { boundaries: [], notApplicableReason: "The model design could not be validated." },
+      dataModel: { entities: [], notApplicableReason: text.notApplicableReason },
+      invariants: { items: [], notApplicableReason: text.notApplicableReason },
+      accessControl: { boundaries: [], notApplicableReason: text.notApplicableReason },
     },
     repositoryChoices,
     referenceComparisons: [],
     risks: [],
     readiness: "draft",
-    readinessNotes: issues,
+    readinessNotes: notes,
   };
 }
 
 function noTrustworthyReferenceMessage(research: ResearchSummary): string {
   const bar = research.qualityBar;
   return `No trustworthy public reference repository was found: ${research.matched} repositories matched the host-built queries, none passed the quality bar (a license, stars ≥ ${bar.minStars}, pushed within ${bar.maxMonthsSincePush} months, created ≥ ${bar.minAgeDays} days ago, not archived, not a fork, test files present) with a readable commit-pinned tree.`;
+}
+
+function emptyEvidence(): LoadedEvidence {
+  return { sources: [], excerpts: [], bytesBySourceId: new Map(), textBySourceId: new Map(), gaps: [] };
 }
 
 function emptyBrief(requirement: string): IntakeBrief {

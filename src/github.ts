@@ -117,6 +117,11 @@ export class GitHubResearcher {
     this.maxCodeSearchCandidates = options.maxCodeSearchCandidates ?? 4;
   }
 
+  // The most candidates one resolveShortlist call tries, so a caller can rank the ones that get checked.
+  get treeResolutionLimit(): number {
+    return this.maxTreeResolutions;
+  }
+
   async discover(
     material: DomainMaterial,
     signal?: AbortSignal,
@@ -254,6 +259,7 @@ export class GitHubResearcher {
       matched: allMatched,
       passedMetadataBar: result.length,
       shortlisted: 0,
+      selected: 0,
       excluded: excluded.length,
       rateLimited,
       trustworthyReferenceFound: false,
@@ -735,7 +741,8 @@ export class GitHubResearcher {
             ? { ...target, category: "timeout" as const, attempts, retryRefused: false }
             : { ...target, category: "network" as const, attempts, retryRefused: false });
         const failure = { ...caughtFailure, attempts };
-        if (failure.category === "rate_limit" || attempt === 2) throw new ProviderRequestError(failure);
+        // A rate limit or an oversized response would fail the same way again, so neither is retried.
+        if (failure.category === "rate_limit" || failure.category === "size_limit" || attempt === 2) throw new ProviderRequestError(failure);
         firstFailure = failure;
       } finally {
         clearTimeout(timeout);
