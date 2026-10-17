@@ -3,11 +3,11 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
-import { loadSelectedEvidence } from "../src/evidence.ts";
+import { EXCERPT_BUDGET, addRequestedEvidence, loadSelectedEvidence, type LoadedEvidence } from "../src/evidence.ts";
 import type { GitHubResearcher } from "../src/github.ts";
 import { extractExistingCommands, LocalReadError, type LocalIndex } from "../src/local.ts";
 import { ProviderRequestError } from "../src/request-failure.ts";
-import type { RepositorySnapshot, TreeFile } from "../src/types.ts";
+import type { EvidenceRequest, RepositorySnapshot, TreeFile } from "../src/types.ts";
 
 function repository(id = "C1", fullName = "org/repo", includeTests = true): RepositorySnapshot {
   const paths = [
@@ -570,6 +570,25 @@ describe("bounded source evidence", () => {
     expect(await excerptOf(forty(6_501))).toEqual([[1, 30, 194_999]]);
   });
 
+  test("keeps the first excerpts within a smaller budget when one is given", async () => {
+    // 40 lines that join to 224,999 characters: whole within the default budget, not within 220,000.
+    const content = Array.from({ length: 40 }, () => "x".repeat(5_624)).join("\n");
+    const excerptsWithin = async (excerptBudget?: number) => {
+      const evidence = await loadSelectedEvidence({
+        local: { root: "/nonexistent-unshit-local", files: [], gaps: [] },
+        repositories: [{ ...repository(), files: [{ id: "C1F1", path: "src/index.ts", size: content.length }] }],
+        modelSelection: [{ fileId: "C1F1", role: "production", rationale: "The only file." }],
+        github: researcher({ content: new Map([["src/index.ts", content]]) }).fake,
+        relevantText: "unrelated words only",
+        ...(excerptBudget === undefined ? {} : { excerptBudget }),
+      });
+      return evidence.excerpts.map((excerpt) => [excerpt.startLine, excerpt.endLine]);
+    };
+
+    expect(await excerptsWithin()).toEqual([[1, 40]]);
+    expect(await excerptsWithin(220_000)).toEqual([[1, 30]]);
+  });
+
   test("keeps the definition that holds the match, not one that ended above it", async () => {
     const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
     lines[199] = "export function outerFlow() {";
@@ -738,5 +757,179 @@ describe("bounded source evidence", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("requested evidence", () => {
+  const request = (kind: EvidenceRequest["kind"], id: string, fields: Partial<EvidenceRequest> = {}): EvidenceRequest =>
+    ({ kind, id, name: "", startLine: 0, endLine: 0, reason: "The plan needs it.", ...fields });
+
+  // Evidence of one remote source S1 whose first `excerptLines` lines are excerpt E1.
+  function oneSource(filePath: string, text: string, excerptLines = text.split("\n").length): LoadedEvidence {
+    const lines = text.split("\n");
+    return {
+      sources: [{ id: "S1", kind: "remote", path: filePath, sha256: "0".repeat(64), lineCount: lines.length, byteCount: text.length, snapshotPath: "sources/S1.txt", roles: ["production"] }],
+      excerpts: [{ id: "E1", sourceId: "S1", startLine: 1, endLine: excerptLines, text: lines.slice(0, excerptLines).join("\n") }],
+      bytesBySourceId: new Map([["S1", new TextEncoder().encode(text)]]),
+      textBySourceId: new Map([["S1", text]]),
+      gaps: [],
+    };
+  }
+
+  // One planned file, src/index.ts, from a tree of the given paths.
+  async function firstRound(content: Map<string, string>, paths: string[]) {
+    const repo: RepositorySnapshot = { ...repository(), files: paths.map((filePath, index) => ({ id: `C1R${index + 1}`, path: filePath, size: 100 })) };
+    const reader = researcher({ content });
+    const loaded = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [repo],
+      modelSelection: [{ fileId: "C1R1", role: "production", rationale: "entry point" }],
+      github: reader.fake,
+      relevantText: "unrelated words only",
+    });
+    return { loaded, repo, reader };
+  }
+
+  test("adds the definition and the lines that requests name, without the lines that excerpts already hold", async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    lines[99] = "const result = approveRefund(order);";
+    lines[199] = "export function approveRefundLater() { return 1; }";
+    lines[249] = "export function approveRefund(order: Order) {";
+    for (let index = 250; index < 279; index += 1) lines[index] = `  const step${index} = ${index};`;
+    lines[279] = "}";
+    const { loaded } = await firstRound(new Map([["src/index.ts", tooLong(lines)]]), ["src/index.ts"]);
+    const source = loaded.sources.find((entry) => entry.path === "src/index.ts")!;
+    expect(loaded.excerpts.map((excerpt) => [excerpt.id, excerpt.startLine, excerpt.endLine])).toEqual([["E1", 1, 30]]);
+
+    const result = await addRequestedEvidence(loaded, [
+      // The definition line wins over the earlier call, and over approveRefundLater, which only starts with the name.
+      request("definition", source.id, { name: "approveRefund" }),
+      request("lines", source.id, { startLine: 20, endLine: 40 }),
+      request("lines", source.id, { startLine: 1, endLine: 10 }),
+      request("definition", source.id, { name: "missingName" }),
+      request("lines", source.id, { startLine: 399, endLine: 402 }),
+      request("definition", "S99", { name: "approveRefund" }),
+    ], { local: localIndex(), repositories: [], unreadFileIds: new Set(), github: researcher().fake, relevantText: "unrelated words only" });
+
+    expect(result.evidence.excerpts.map((excerpt) => [excerpt.id, excerpt.startLine, excerpt.endLine])).toEqual([["E1", 1, 30], ["E2", 250, 280], ["E3", 31, 40]]);
+    expect(result.evidence.excerpts[1]!.text).toBe(lines.slice(249, 280).join("\n"));
+    expect(result.evidence.excerpts[2]!.text).toBe(lines.slice(30, 40).join("\n"));
+    expect([result.added, result.served]).toEqual([2, 3]);
+    expect(result.gaps.map((gap) => [gap.material, gap.message])).toEqual([
+      [false, `The model asked for missingName in ${source.id}; no line of src/index.ts holds missingName.`],
+      [false, `The model asked for lines 399 to 402 of ${source.id}; src/index.ts has lines 1 to 401.`],
+      [false, "The model asked for approveRefund in S99; no source has that ID."],
+    ]);
+  });
+
+  test("reads at most four unread files that requests name, and only files from the unread list", async () => {
+    const paths = ["src/index.ts", "src/extra-1.ts", "tests/extra-2.test.ts", "src/extra-3.ts", "src/extra-4.ts", "src/extra-5.ts", "src/extra-6.ts"];
+    const repo: RepositorySnapshot = { ...repository(), files: paths.map((filePath, index) => ({ id: `C1R${index + 1}`, path: filePath, size: 100 })) };
+    const reader = researcher();
+    const loaded = oneSource("src/index.ts", "export const index = 1;");
+    const extra = repo.files.slice(1);
+    const result = await addRequestedEvidence(loaded, [request("file", "C1R1"), request("file", "C1R2"), ...extra.map((file) => request("file", file.id))], {
+      local: localIndex(),
+      repositories: [repo],
+      unreadFileIds: new Set(extra.map((file) => file.id)),
+      github: reader.fake,
+      relevantText: "unrelated words only",
+    });
+
+    expect(result.evidence.sources.slice(1).map((source) => [source.id, source.path, source.kind, source.commitSha, source.roles])).toEqual([
+      ["S2", "src/extra-1.ts", "remote", "a".repeat(40), ["production"]],
+      ["S3", "tests/extra-2.test.ts", "remote", "a".repeat(40), ["test"]],
+      ["S4", "src/extra-3.ts", "remote", "a".repeat(40), ["production"]],
+      ["S5", "src/extra-4.ts", "remote", "a".repeat(40), ["production"]],
+    ]);
+    expect(result.evidence.excerpts.slice(1).map((excerpt) => [excerpt.id, excerpt.sourceId, excerpt.startLine, excerpt.endLine])).toEqual(
+      [2, 3, 4, 5].map((number) => [`E${number}`, `S${number}`, 1, 1]),
+    );
+    expect(reader.fetched).toEqual(["src/extra-1.ts", "tests/extra-2.test.ts", "src/extra-3.ts", "src/extra-4.ts"]);
+    expect(result.served).toBe(4);
+    expect(result.gaps.map((gap) => gap.message)).toEqual([
+      "The model asked for file C1R1; it is not in the unread file list.",
+      // The second request for C1R2 comes after the first read it.
+      "The model asked for file C1R2; it is not in the unread file list.",
+      "The model asked for file C1R6; at most 4 unread files can be added.",
+      "The model asked for file C1R7; at most 4 unread files can be added.",
+    ]);
+  });
+
+  test("gives the last requested file at most what is left, and records a file whose first line does not fit", async () => {
+    // 10,881 characters are left. Each file of 7,999 characters gets an equal share of what is left among the files
+    // still to read, at most four in all, so each gives only its 30-line head; wide.ts is one line of 20,000 characters.
+    const loaded = oneSource("src/flow.ts", Array.from({ length: 360 }, (_, index) => `const filler${String(index).padStart(3, "0")} = "${"x".repeat(670)}";`).join("\n"));
+    const file = Array.from({ length: 100 }, (_, index) => `const line${String(index).padStart(3, "0")} = "${"w".repeat(60)}";`).join("\n");
+    const paths = ["src/one.ts", "src/two.ts", "src/three.ts", "src/wide.ts", "src/four.ts"];
+    const repo: RepositorySnapshot = { ...repository(), files: paths.map((filePath, index) => ({ id: `C1W${index + 1}`, path: filePath, size: 100 })) };
+    const content = new Map(paths.map((filePath) => [filePath, filePath === "src/wide.ts" ? "w".repeat(20_000) : file]));
+    const result = await addRequestedEvidence(loaded, repo.files.map((entry) => request("file", entry.id)), {
+      local: localIndex(),
+      repositories: [repo],
+      unreadFileIds: new Set(repo.files.map((entry) => entry.id)),
+      github: researcher({ content }).fake,
+      relevantText: "unrelated words only",
+    });
+    const used = result.evidence.excerpts.reduce((sum, excerpt) => sum + excerpt.text.length, 0);
+
+    expect(result.evidence.excerpts.slice(1).map((excerpt) => [excerpt.sourceId, excerpt.startLine, excerpt.endLine])).toEqual([["S2", 1, 30], ["S3", 1, 30], ["S4", 1, 30]]);
+    expect(used).toBeLessThanOrEqual(EXCERPT_BUDGET);
+    expect(result.served).toBe(3);
+    expect(result.gaps.map((gap) => gap.message)).toEqual([
+      "The model asked for file C1W4; no excerpt of src/wide.ts fit the 3684 characters of its share.",
+      "The model asked for file C1W5; at most 4 unread files can be added.",
+    ]);
+  });
+
+  test("excerpts a requested file with the brief's code patterns", async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    lines[199] = "export class OrderRefund { approve() { return true; } }";
+    const repo: RepositorySnapshot = { ...repository(), files: [{ id: "C1U1", path: "src/refund.ts", size: 100 }] };
+    const result = await addRequestedEvidence(oneSource("src/index.ts", "export const index = 1;"), [request("file", "C1U1")], {
+      local: localIndex(),
+      repositories: [repo],
+      unreadFileIds: new Set(["C1U1"]),
+      github: researcher({ content: new Map([["src/refund.ts", tooLong(lines)]]) }).fake,
+      relevantText: "unrelated words only",
+      codePatterns: ["OrderRefund"],
+    });
+
+    expect(result.evidence.excerpts.slice(1).map((excerpt) => [excerpt.sourceId, excerpt.startLine, excerpt.endLine])).toEqual([["S2", 1, 30], ["S2", 200, 200]]);
+  });
+
+  test("takes the first window that fits what is left of the budget and skips a request that does not fit", async () => {
+    const lines = Array.from({ length: 360 }, (_, index) => `const filler${String(index).padStart(3, "0")} = "${"x".repeat(670)}";`);
+    lines.push("export function smallHelper() {", "  return 1;", "}");
+    lines.push("export function bigFlow() {", ...Array.from({ length: 298 }, (_, index) => `  step("${"y".repeat(50)}", ${index});`), "}");
+    const loaded = oneSource("src/flow.ts", lines.join("\n"), 360);
+    // About 10,900 characters are left: bigFlow (300 lines) does not fit whole, its first 150 lines do.
+    const result = await addRequestedEvidence(loaded, [
+      request("definition", "S1", { name: "smallHelper" }),
+      request("definition", "S1", { name: "bigFlow" }),
+      request("lines", "S1", { startLine: 600, endLine: 650 }),
+    ], { local: localIndex(), repositories: [], unreadFileIds: new Set(), github: researcher().fake, relevantText: "unrelated words only" });
+    const used = result.evidence.excerpts.reduce((sum, excerpt) => sum + excerpt.text.length, 0);
+
+    expect(result.evidence.excerpts.slice(1).map((excerpt) => [excerpt.startLine, excerpt.endLine])).toEqual([[361, 363], [364, 513]]);
+    expect(used).toBeLessThanOrEqual(EXCERPT_BUDGET);
+    expect(result.gaps.map((gap) => gap.message)).toEqual([`The model asked for lines 600 to 650 of S1; it does not fit the ${EXCERPT_BUDGET - used} characters left.`]);
+  });
+
+  test("gives each requested unread file an equal share of what is left", async () => {
+    // 249,119 characters are used, so 10,881 are left. Two files of 7,999 characters: the first gets half of what is
+    // left and only its head fits; the second gets all that is then left and fits whole.
+    const loaded = oneSource("src/flow.ts", Array.from({ length: 360 }, (_, index) => `const filler${String(index).padStart(3, "0")} = "${"x".repeat(670)}";`).join("\n"));
+    const file = Array.from({ length: 100 }, (_, index) => `const line${String(index).padStart(3, "0")} = "${"w".repeat(60)}";`).join("\n");
+    const repo: RepositorySnapshot = { ...repository(), files: [{ id: "C1U1", path: "src/one.ts", size: 100 }, { id: "C1U2", path: "src/two.ts", size: 100 }] };
+    const result = await addRequestedEvidence(loaded, [request("file", "C1U1"), request("file", "C1U2")], {
+      local: localIndex(),
+      repositories: [repo],
+      unreadFileIds: new Set(["C1U1", "C1U2"]),
+      github: researcher({ content: new Map([["src/one.ts", file], ["src/two.ts", file]]) }).fake,
+      relevantText: "unrelated words only",
+    });
+
+    expect(result.evidence.excerpts.slice(1).map((excerpt) => [excerpt.sourceId, excerpt.startLine, excerpt.endLine])).toEqual([["S2", 1, 30], ["S3", 1, 100]]);
   });
 });

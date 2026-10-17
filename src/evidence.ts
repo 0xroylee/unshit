@@ -6,6 +6,7 @@ import { chooseRootLicensePath, isTestPath, isTextSourcePath, rankTreeFiles, typ
 import { REDACTED_VALUE, chooseLocalReferenceFiles, localReadFailureText, readLocalSource, type LocalIndex } from "./local.ts";
 import type {
   EvidenceExcerpt,
+  EvidenceRequest,
   EvidenceSource,
   FinalSource,
   RepositorySnapshot,
@@ -37,12 +38,18 @@ interface FilePlanInput {
   repository?: RepositorySnapshot;
 }
 
+// All excerpts that a plan turn receives fit in this many characters.
+export const EXCERPT_BUDGET = 260_000;
+
 export async function loadSelectedEvidence(options: {
   local: LocalIndex;
   repositories: RepositorySnapshot[];
   modelSelection: SelectedFile[];
   github: GitHubResearcher;
   relevantText: string;
+  // The characters these excerpts can use, EXCERPT_BUDGET when not given. `runWorkflow` keeps part of the budget for
+  // the excerpts that the model asks for afterwards (`addRequestedEvidence`).
+  excerptBudget?: number;
   // The brief's code patterns. Excerpt scoring uses them in every planned file, local or remote (see `lineScore`).
   codePatterns?: string[];
   domainTerms?: RankedTerm[];
@@ -146,8 +153,7 @@ export async function loadSelectedEvidence(options: {
   const bytesBySourceId = new Map<string, Uint8Array>();
   const textBySourceId = new Map<string, string>();
   let excerptCharacters = 0;
-  const maxContextCharacters = 260_000;
-  let sourceNumber = 0;
+  const maxContextCharacters = options.excerptBudget ?? EXCERPT_BUDGET;
   let excerptNumber = 0;
 
   const items = [...planned.values()];
@@ -157,53 +163,12 @@ export async function loadSelectedEvidence(options: {
       break;
     }
     try {
-      let redactions = 0;
-      let bytes: Uint8Array;
-      if (item.kind === "local") {
-        const local = await readLocalSource(options.local.root, item.file);
-        bytes = local.bytes;
-        redactions = local.redactions;
-      } else {
-        bytes = await options.github.fetchSource(item.repository!, item.file.path, options.signal);
-      }
-      if (bytes.byteLength > (item.kind === "local" ? 256_000 : 1_000_000)) {
-        throw new EvidenceReadError(item.kind === "local" ? "local_size_limit" : "remote_size_limit");
-      }
-      let text: string;
-      try {
-        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-      } catch {
-        throw new EvidenceReadError("invalid_utf8");
-      }
-      if (text.includes("\u0000")) throw new EvidenceReadError("binary");
-      const lines = splitLines(text);
-      const sourceId = `S${++sourceNumber}`;
-      const sha256 = createHash("sha256").update(bytes).digest("hex");
-      const source: EvidenceSource = {
-        id: sourceId,
-        kind: item.kind,
-        path: item.file.path,
-        sha256,
-        lineCount: lines.length,
-        byteCount: bytes.byteLength,
-        snapshotPath: `sources/${sourceId}.txt`,
-        roles: item.roles,
-      };
-      if (item.kind === "remote") {
-        const repository = item.repository!;
-        source.provider = repository.candidate.provider;
-        source.repository = repository.candidate.fullName;
-        source.commitSha = repository.commitSha;
-        if (repository.commitDate) source.commitDate = repository.commitDate;
-        if (repository.candidate.lastActivityAt) source.lastActivityAt = repository.candidate.lastActivityAt;
-        source.permalink = repositoryPermalink(repository, item.file.path);
-      }
+      const { source, bytes, text, lines, redactionGap } = await readSource(item, `S${sources.length + 1}`, options);
+      const sourceId = source.id;
       sources.push(source);
       bytesBySourceId.set(sourceId, bytes);
       textBySourceId.set(sourceId, text);
-      if (redactions > 0) {
-        gaps.push({ kind: "local", message: `Replaced ${redactions} likely secret value(s) in ${item.file.path} with ${REDACTED_VALUE} before any model turn; the saved snapshot and its SHA-256 cover the redacted text.`, material: false });
-      }
+      if (redactionGap) gaps.push(redactionGap);
 
       // Each file gets an equal share of what is left, so a small file passes its unused share to the files after it.
       const share = Math.floor(Math.max(0, maxContextCharacters - excerptCharacters) / (items.length - index));
@@ -233,6 +198,231 @@ export async function loadSelectedEvidence(options: {
   }
 
   return { sources, excerpts, bytesBySourceId, textBySourceId, gaps };
+}
+
+// Reads one file, checks its size and text, and describes it as source `sourceId`. Throws when the file cannot be used.
+async function readSource(
+  item: FileToRead,
+  sourceId: string,
+  options: { local: LocalIndex; github: GitHubResearcher; signal?: AbortSignal },
+): Promise<{ source: EvidenceSource; bytes: Uint8Array; text: string; lines: string[]; redactionGap?: ResearchGap }> {
+  let redactions = 0;
+  let bytes: Uint8Array;
+  if (item.kind === "local") {
+    const local = await readLocalSource(options.local.root, item.file);
+    bytes = local.bytes;
+    redactions = local.redactions;
+  } else {
+    bytes = await options.github.fetchSource(item.repository!, item.file.path, options.signal);
+  }
+  if (bytes.byteLength > (item.kind === "local" ? 256_000 : 1_000_000)) {
+    throw new EvidenceReadError(item.kind === "local" ? "local_size_limit" : "remote_size_limit");
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new EvidenceReadError("invalid_utf8");
+  }
+  if (text.includes("\u0000")) throw new EvidenceReadError("binary");
+  const lines = splitLines(text);
+  const source: EvidenceSource = {
+    id: sourceId,
+    kind: item.kind,
+    path: item.file.path,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    lineCount: lines.length,
+    byteCount: bytes.byteLength,
+    snapshotPath: `sources/${sourceId}.txt`,
+    roles: item.roles,
+  };
+  if (item.kind === "remote") {
+    const repository = item.repository!;
+    source.provider = repository.candidate.provider;
+    source.repository = repository.candidate.fullName;
+    source.commitSha = repository.commitSha;
+    if (repository.commitDate) source.commitDate = repository.commitDate;
+    if (repository.candidate.lastActivityAt) source.lastActivityAt = repository.candidate.lastActivityAt;
+    source.permalink = repositoryPermalink(repository, item.file.path);
+  }
+  const redactionGap: ResearchGap | undefined = redactions > 0
+    ? { kind: "local", message: `Replaced ${redactions} likely secret value(s) in ${item.file.path} with ${REDACTED_VALUE} before any model turn; the saved snapshot and its SHA-256 cover the redacted text.`, material: false }
+    : undefined;
+  return { source, bytes, text, lines, ...(redactionGap ? { redactionGap } : {}) };
+}
+
+// At most this many unread files can be added on request.
+export const MAX_REQUESTED_FILES = 4;
+
+export interface AddedEvidence {
+  // The given evidence with the added sources and excerpts after its own; its `gaps` are the given evidence's.
+  evidence: LoadedEvidence;
+  // A non-material gap for each request that the host could not serve, and for each redacted file it added.
+  gaps: ResearchGap[];
+  // The requests whose source is in the excerpts afterwards, added now or there before.
+  served: number;
+  // The excerpts added.
+  added: number;
+}
+
+// Adds what the model asked for after reading the first excerpts, within what is left of EXCERPT_BUDGET. Requests are
+// served in order. A `definition` request takes the line from `requestedDefinitionLine` and the first of its
+// regionChoices whose lines not yet excerpted fit what is left. A `lines` request takes its range when the lines not
+// yet excerpted fit. A `file` request reads a file from `unreadFileIds`, at most MAX_REQUESTED_FILES of them, and
+// excerpts it with `chooseExcerptRanges` within an equal share of what is left. Lines that are already excerpted are
+// not added again.
+export async function addRequestedEvidence(
+  loaded: LoadedEvidence,
+  requests: EvidenceRequest[],
+  options: {
+    local: LocalIndex;
+    repositories: RepositorySnapshot[];
+    // The IDs of the unread files that the request prompt listed; only these can be read.
+    unreadFileIds: Set<string>;
+    github: GitHubResearcher;
+    relevantText: string;
+    codePatterns?: string[];
+    signal?: AbortSignal;
+  },
+): Promise<AddedEvidence> {
+  const sources = [...loaded.sources];
+  const excerpts = [...loaded.excerpts];
+  const bytesBySourceId = new Map(loaded.bytesBySourceId);
+  const textBySourceId = new Map(loaded.textBySourceId);
+  const gaps: ResearchGap[] = [];
+  let used = excerpts.reduce((sum, excerpt) => sum + excerpt.text.length, 0);
+  let served = 0;
+  let added = 0;
+  let filesRead = 0;
+  const requestedFileIds = new Set<string>();
+  const localById = new Map(options.local.files.map((file) => [file.id, file]));
+  const remoteById = new Map(options.repositories.flatMap((repository) => repository.files.map((file) => [file.id, { file, repository }] as const)));
+  const skip = (request: EvidenceRequest, why: string): void => {
+    gaps.push({ kind: "file", material: false, message: `The model asked for ${describeRequest(request)}; ${why}` });
+  };
+  const addWindows = (sourceId: string, lines: string[], windows: LineWindow[]): void => {
+    for (const window of windows) {
+      const text = lines.slice(window.start, window.end).join("\n");
+      excerpts.push({ id: `E${excerpts.length + 1}`, sourceId, startLine: window.start + 1, endLine: window.end, text });
+      used += text.length;
+      added += 1;
+    }
+  };
+
+  for (const [index, request] of requests.entries()) {
+    if (options.signal?.aborted) break;
+    const left = EXCERPT_BUDGET - used;
+    if (request.kind === "file") {
+      const later = requests.slice(index).filter((entry) => entry.kind === "file").length;
+      if (filesRead === MAX_REQUESTED_FILES) {
+        skip(request, `at most ${MAX_REQUESTED_FILES} unread files can be added.`);
+        continue;
+      }
+      if (!options.unreadFileIds.has(request.id) || requestedFileIds.has(request.id)) {
+        skip(request, "it is not in the unread file list.");
+        continue;
+      }
+      const local = localById.get(request.id);
+      const remote = remoteById.get(request.id);
+      const file = local ?? remote?.file;
+      if (!file) {
+        skip(request, "it is not in the unread file list.");
+        continue;
+      }
+      requestedFileIds.add(request.id);
+      filesRead += 1;
+      const role: SelectedFileRole = isTestPath(file.path) ? "test" : "production";
+      const item: FileToRead = local ? { file, roles: [role], kind: "local" } : { file, roles: [role], kind: "remote", repository: remote!.repository };
+      try {
+        const { source, bytes, text, lines, redactionGap } = await readSource(item, `S${sources.length + 1}`, options);
+        sources.push(source);
+        bytesBySourceId.set(source.id, bytes);
+        textBySourceId.set(source.id, text);
+        if (redactionGap) gaps.push(redactionGap);
+        const share = Math.floor(left / Math.min(later, MAX_REQUESTED_FILES - filesRead + 1));
+        const ranges = chooseExcerptRanges(lines, options.relevantText, share, options.codePatterns ?? []);
+        if (ranges.length === 0) {
+          skip(request, `no excerpt of ${file.path} fit the ${share} characters of its share.`);
+          continue;
+        }
+        addWindows(source.id, lines, ranges.map((range) => ({ start: range.startLine - 1, end: range.endLine })));
+        served += 1;
+      } catch (error) {
+        if (options.signal?.aborted) break;
+        skip(request, `the host could not read it; ${describeReadFailure(error)}.`);
+      }
+      continue;
+    }
+    const source = sources.find((entry) => entry.id === request.id);
+    const text = source ? textBySourceId.get(source.id) : undefined;
+    if (!source || text === undefined) {
+      skip(request, "no source has that ID.");
+      continue;
+    }
+    const lines = splitLines(text);
+    const taken = excerpts.filter((excerpt) => excerpt.sourceId === source.id);
+    let choices: LineWindow[];
+    if (request.kind === "lines") {
+      if (request.startLine < 1 || request.endLine < request.startLine || request.endLine > lines.length) {
+        skip(request, `${source.path} has lines 1 to ${lines.length}.`);
+        continue;
+      }
+      choices = [{ start: request.startLine - 1, end: request.endLine }];
+    } else {
+      const hit = requestedDefinitionLine(lines, request.name);
+      if (hit === undefined) {
+        skip(request, `no line of ${source.path} holds ${request.name}.`);
+        continue;
+      }
+      choices = regionChoices(lines, hit);
+    }
+    const parts = choices.map((choice) => uncoveredParts(choice, taken));
+    if (parts[0]!.length === 0) {
+      served += 1;
+      continue;
+    }
+    const cost = (windows: LineWindow[]): number => windows.reduce((sum, window) => sum + lines.slice(window.start, window.end).join("\n").length, 0);
+    const fitting = parts.find((windows) => cost(windows) <= left);
+    if (!fitting) {
+      skip(request, `it does not fit the ${left} characters left.`);
+      continue;
+    }
+    addWindows(source.id, lines, fitting);
+    served += 1;
+  }
+  return { evidence: { sources, excerpts, bytesBySourceId, textBySourceId, gaps: loaded.gaps }, gaps, served, added };
+}
+
+function describeRequest(request: EvidenceRequest): string {
+  if (request.kind === "file") return `file ${request.id}`;
+  if (request.kind === "lines") return `lines ${request.startLine} to ${request.endLine} of ${request.id}`;
+  return `${request.name} in ${request.id}`;
+}
+
+// The line that a definition request points at: the first line that matches BLOCK_START and holds `name` as a whole
+// word, or else the first line that holds it as a whole word. A word here is a run of letters, digits, `_` and `$`.
+function requestedDefinitionLine(lines: string[], name: string): number | undefined {
+  const word = new RegExp(`(?<![\\w$])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w$])`);
+  let mention: number | undefined;
+  for (const [index, line] of lines.entries()) {
+    if (!word.test(line)) continue;
+    if (BLOCK_START.test(line)) return index;
+    mention ??= index;
+  }
+  return mention;
+}
+
+// The parts of `window` that no range in `taken` holds, in line order.
+function uncoveredParts(window: LineWindow, taken: Array<{ startLine: number; endLine: number }>): LineWindow[] {
+  const parts: LineWindow[] = [];
+  let start = window.start;
+  for (const range of [...taken].sort((left, right) => left.startLine - right.startLine)) {
+    if (range.endLine <= start || range.startLine - 1 >= window.end) continue;
+    if (range.startLine - 1 > start) parts.push({ start, end: range.startLine - 1 });
+    start = Math.max(start, range.endLine);
+  }
+  if (start < window.end) parts.push({ start, end: window.end });
+  return parts;
 }
 
 export function finalSources(sources: EvidenceSource[], excerpts: EvidenceExcerpt[]): FinalSource[] {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CANDIDATE_RANKING_SCHEMA, INTAKE_SCHEMA, ModelOutputError, REFINED_BRIEF_SCHEMA, parseCandidateRanking, parseFileSelection, parseIntake, parsePlan, parseRefinedBrief, stableMaterialQuestionId } from "../src/model-schema.ts";
+import { CANDIDATE_RANKING_SCHEMA, EVIDENCE_REQUEST_SCHEMA, INTAKE_SCHEMA, ModelOutputError, REFINED_BRIEF_SCHEMA, parseCandidateRanking, parseEvidenceRequests, parseFileSelection, parseIntake, parsePlan, parseRefinedBrief, stableMaterialQuestionId } from "../src/model-schema.ts";
 import type { EvidenceExcerpt, EvidenceSource, IntakeBrief, RepositorySnapshot } from "../src/types.ts";
 
 const brief = parseIntake({
@@ -298,5 +298,35 @@ describe("host plan validation", () => {
     cyclic.tasks.push({ ...cyclic.tasks[0]!, id: "T2", dependencies: ["T1"], acceptance: [{ ...cyclic.tasks[0]!.acceptance[0]!, requirementId: "R1" }] });
     cyclic.tasks[0]!.dependencies = ["T2"];
     expect(() => parsePlan(cyclic, brief, excerpts, [], [repoA], sources)).toThrow(/cycle/);
+  });
+});
+
+describe("evidence requests", () => {
+  const item = (fields: Record<string, unknown>) => ({ kind: "definition", id: "S1", name: "approveRefund", startLine: 0, endLine: 0, reason: "The plan needs it.", ...fields });
+
+  test("reads definition, lines and file requests and keeps only the fields of each kind", () => {
+    expect(parseEvidenceRequests({
+      requests: [
+        item({ startLine: 4, endLine: 9 }),
+        item({ kind: "lines", name: "ignored", startLine: 20, endLine: 40 }),
+        item({ kind: "file", id: "C1F7", name: "ignored", startLine: 3, endLine: 5 }),
+      ],
+    })).toEqual([
+      { kind: "definition", id: "S1", name: "approveRefund", startLine: 0, endLine: 0, reason: "The plan needs it." },
+      { kind: "lines", id: "S1", name: "", startLine: 20, endLine: 40, reason: "The plan needs it." },
+      { kind: "file", id: "C1F7", name: "", startLine: 0, endLine: 0, reason: "The plan needs it." },
+    ]);
+    expect(parseEvidenceRequests({ requests: [] })).toEqual([]);
+    expect((EVIDENCE_REQUEST_SCHEMA.properties as { requests: { maxItems: number } }).requests.maxItems).toBe(8);
+  });
+
+  test("rejects more than eight requests, an unknown kind, a definition without a name and lines that are not whole numbers", () => {
+    expect(() => parseEvidenceRequests({ requests: Array.from({ length: 9 }, () => item({})) })).toThrow(ModelOutputError);
+    expect(() => parseEvidenceRequests({ requests: [item({ kind: "symbol" })] })).toThrow("Unsupported request kind: symbol.");
+    expect(() => parseEvidenceRequests({ requests: [item({ name: "" })] })).toThrow(ModelOutputError);
+    expect(() => parseEvidenceRequests({ requests: [item({ name: "approve refund" })] })).toThrow("requests[1].name must not contain whitespace.");
+    expect(() => parseEvidenceRequests({ requests: [item({ kind: "lines", startLine: 1.5, endLine: 4 })] })).toThrow("requests[1] needs whole line numbers.");
+    expect(() => parseEvidenceRequests({ requests: [item({ reason: "" })] })).toThrow(ModelOutputError);
+    expect(() => parseEvidenceRequests({ requests: [item({ id: "" })] })).toThrow(ModelOutputError);
   });
 });

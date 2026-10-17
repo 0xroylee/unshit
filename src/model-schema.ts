@@ -16,6 +16,7 @@ import type {
   SelectedFile,
   SelectedFileRole,
   EvidenceExcerpt,
+  EvidenceRequest,
   ExistingCommand,
   VerificationKind,
 } from "./types.ts";
@@ -87,6 +88,21 @@ export const FILE_SELECTION_SCHEMA: JsonSchema = object({
     type: "array",
     maxItems: 15,
     items: object({ fileId: string, role: { type: "string", enum: ["production", "test"] }, rationale: string }),
+  },
+});
+
+export const EVIDENCE_REQUEST_SCHEMA: JsonSchema = object({
+  requests: {
+    type: "array",
+    maxItems: 8,
+    items: object({
+      kind: { type: "string", enum: ["definition", "lines", "file"] },
+      id: string,
+      name: string,
+      startLine: { type: "integer" },
+      endLine: { type: "integer" },
+      reason: string,
+    }),
   },
 });
 
@@ -420,6 +436,32 @@ export function parseFileSelection(value: unknown, allowedFiles: TreeFileLike[])
 }
 
 interface TreeFileLike { id: string; }
+
+const REQUEST_KINDS = new Set<EvidenceRequest["kind"]>(["definition", "lines", "file"]);
+
+// At most 8 requests. A definition request needs a name of 1 to 120 characters without whitespace; a lines request
+// needs whole line numbers; the other fields of a request are ignored.
+export function parseEvidenceRequests(value: unknown): EvidenceRequest[] {
+  const result = asObject(value, "Evidence requests");
+  return asArray(result.requests, "requests", 0, 8).map((entry, index) => {
+    const label = `requests[${index + 1}]`;
+    const item = asObject(entry, label);
+    const kind = asString(item.kind, `${label}.kind`, 20) as EvidenceRequest["kind"];
+    if (!REQUEST_KINDS.has(kind)) throw new ModelOutputError(`Unsupported request kind: ${kind}.`);
+    const id = asString(item.id, `${label}.id`, 160);
+    const reason = asString(item.reason, `${label}.reason`);
+    if (kind === "definition") {
+      const name = asString(item.name, `${label}.name`, 120);
+      if (/\s/.test(name)) throw new ModelOutputError(`${label}.name must not contain whitespace.`);
+      return { kind, id, name, startLine: 0, endLine: 0, reason };
+    }
+    if (kind === "lines") {
+      if (!Number.isInteger(item.startLine) || !Number.isInteger(item.endLine)) throw new ModelOutputError(`${label} needs whole line numbers.`);
+      return { kind, id, name: "", startLine: item.startLine as number, endLine: item.endLine as number, reason };
+    }
+    return { kind, id, name: "", startLine: 0, endLine: 0, reason };
+  });
+}
 
 function parseEvidence(value: unknown, label: string, min = 0, max = 8): PlanTask["evidence"] {
   return asArray(value, label, min, max).map((value, index) => {
