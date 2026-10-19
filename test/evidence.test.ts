@@ -529,8 +529,34 @@ describe("bounded source evidence", () => {
     const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
     lines[249] = "export const approveOne = () => { return OrderRefund.ok(); };";
     lines[299] = "export const approveTwo = (order: Order) => OrderRefund.check(order);";
+    // A parameter list without inner parentheses may hold quotes.
+    lines[389] = 'export const approveFive = (label = "refund") => OrderRefund.label(label);';
 
-    expect(await excerptRangesFor(tooLong(lines), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [250, 250], [300, 300]]);
+    expect(await excerptRangesFor(tooLong(lines), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [250, 250], [300, 300], [390, 390]]);
+  });
+
+  test("does not treat a declaration as a definition when a string or a comment in it holds parentheses and an arrow", async () => {
+    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    lines[249] = 'const label = ("() ) => OrderRefund");';
+    lines[299] = "const total = (/*() ) => */ OrderRefund.total);";
+    lines[349] = "const value /* = (order = f()) => OrderRefund */ = 1;";
+    lines[379] = 'const { "x = (order = f()) => OrderRefund": key } = object;';
+
+    expect(await excerptRangesFor(tooLong(lines), "unrelated words only", ["OrderRefund"])).toEqual([[1, 30], [230, 389]]);
+  });
+
+  test("handles 99,000-character lines whose return type holds an equals sign in under a second", async () => {
+    // Such a return type is not recognized. Each line is still tested as a possible definition start.
+    const lines = Array.from({ length: 400 }, (_, index) => `const filler${index} = ${index};`);
+    const spaces = " ".repeat(99_000);
+    lines[249] = `const approveOne = (order: Order):${spaces}{ "x=y": number } => OrderRefund.check(order);`;
+    lines[299] = `const approveTwo = (order = makeOrder()):${spaces}{ "x=y": number } => OrderRefund.check(order);`;
+    const started = performance.now();
+
+    const ranges = await excerptRangesFor(tooLong(lines), "unrelated words only", ["OrderRefund"]);
+
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(ranges).toEqual([[1, 30]]);
   });
 
   test("ends a Python function by indentation, not by a dict in its body", async () => {
