@@ -403,10 +403,13 @@ export class AppServerClient {
 
       if (!finish && started) {
         this.currentTurn.started = true;
+        const turnEnd = new AbortController();
         const ended = await Promise.race([
-          this.waitForTurnEnd(buffer, isForTurn, () => lastActivityAt, turnStartedAt).then((outcome) => ({ kind: "ended" as const, outcome })),
+          this.waitForTurnEnd(buffer, isForTurn, () => lastActivityAt, turnStartedAt, turnEnd.signal).then((outcome) => ({ kind: "ended" as const, outcome })),
           control.canceled.then((reason) => ({ kind: "cancelled" as const, reason })),
         ]);
+        // The wait that lost the race stops here, and its timer with it.
+        turnEnd.abort();
         if (ended.kind === "cancelled" && ended.reason.kind === "transport_failure") {
           // No interrupt and no wait after a transport failure; only the held completion counts.
           finish = completionOf(turnId);
@@ -415,7 +418,7 @@ export class AppServerClient {
           finish = await this.waitForCompletion(buffer, isForTurn, this.options.interruptGraceMs);
         } else if ("notification" in ended.outcome) {
           finish = ended.outcome.notification;
-        } else {
+        } else if ("limit" in ended.outcome) {
           timedOut = ended.outcome.limit;
           await this.interrupt(threadId, turnId);
           finish = await this.waitForCompletion(buffer, isForTurn, this.options.interruptGraceMs);
@@ -628,25 +631,29 @@ export class AppServerClient {
     buffer: NotificationBuffer,
     isForTurn: (notification: Notification) => boolean,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<Notification | undefined> {
-    const result = await buffer.waitFor((notification) => isForTurn(notification) && notification.method === "turn/completed", timeoutMs);
+    const result = await buffer.waitFor((notification) => isForTurn(notification) && notification.method === "turn/completed", timeoutMs, signal);
     return isNotification(result) ? result : undefined;
   }
 
-  // Resolves with turn/completed or with the limit that ran out first. Activity resets only the idle limit.
+  // Resolves with turn/completed, with the limit that ran out first, or with `stopped` once `signal` aborts; an abort
+  // also clears the pending wait's timer. Activity resets only the idle limit.
   private async waitForTurnEnd(
     buffer: NotificationBuffer,
     isForTurn: (notification: Notification) => boolean,
     lastActivityAt: () => number,
     turnStartedAt: number,
-  ): Promise<{ notification: Notification } | { limit: TurnTimeoutLimit }> {
+    signal: AbortSignal,
+  ): Promise<{ notification: Notification } | { limit: TurnTimeoutLimit } | { stopped: true }> {
     for (;;) {
+      if (signal.aborted) return { stopped: true };
       const now = Date.now();
       const totalLeft = turnStartedAt + this.options.turnTotalTimeoutMs - now;
       if (totalLeft <= 0) return { limit: "total" };
       const idleLeft = lastActivityAt() + this.options.turnIdleTimeoutMs - now;
       if (idleLeft <= 0) return { limit: "idle" };
-      const notification = await this.waitForCompletion(buffer, isForTurn, Math.min(idleLeft, totalLeft));
+      const notification = await this.waitForCompletion(buffer, isForTurn, Math.min(idleLeft, totalLeft), signal);
       if (notification) return { notification };
     }
   }
