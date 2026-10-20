@@ -739,6 +739,388 @@ describe("model turn time limits", () => {
   });
 });
 
+describe("completions that arrive before the connection ends", () => {
+  type Layout = "answered in one chunk" | "answered in separate chunks" | "start never answered" | "answered after the completion" | "answered without turn/started";
+  const LAYOUTS: Layout[] = ["answered in one chunk", "answered in separate chunks", "start never answered", "answered after the completion", "answered without turn/started"];
+
+  function completed(threadId: string, turnId: string, turn: Record<string, unknown> = {}): MockRpcMessage {
+    return notification("turn/completed", {
+      threadId,
+      turn: { id: turnId, status: "completed", items: [{ type: "agentMessage", phase: "final_answer", text: "MARKER_FINAL_ANSWER" }], ...turn },
+    });
+  }
+
+  function endConnection(process: MockAppServerProcess, close: "exit" | "disconnect"): void {
+    if (close === "exit") process.exit(1);
+    else process.disconnect();
+  }
+
+  // Codex sends the turn's events and its completion, then the connection ends. `layout` orders the turn/start answer.
+  function completingServer(layout: Layout, close: "exit" | "disconnect", turn: Record<string, unknown> = {}) {
+    return createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-done")) return;
+        if (message.method !== "turn/start") return;
+        const started = notification("turn/started", { threadId: "thread-done", turnId: "turn-done" });
+        const answer = response(message, { turn: { id: "turn-done" } });
+        if (layout === "answered in one chunk") process.sendJsonChunk(answer, started, completed("thread-done", "turn-done", turn));
+        else if (layout === "answered in separate chunks") {
+          process.sendJsonChunk(answer);
+          process.sendJsonChunk(started);
+          process.sendJsonChunk(completed("thread-done", "turn-done", turn));
+        } else if (layout === "start never answered") process.sendJsonChunk(started, completed("thread-done", "turn-done", turn));
+        else if (layout === "answered after the completion") process.sendJsonChunk(started, completed("thread-done", "turn-done", turn), answer);
+        else process.sendJsonChunk(answer, completed("thread-done", "turn-done", turn));
+        endConnection(process, close);
+      },
+    }));
+  }
+
+  async function turnResult(fixture: ReturnType<typeof createMockSpawner>, limits: { requestTimeoutMs: number; turnStartTimeoutMs: number; interruptGraceMs: number; turnIdleTimeoutMs?: number }, signal?: AbortSignal): Promise<ModelTurnResult> {
+    const client = new AppServerClient({ spawn: fixture.spawn, ...limits });
+    try {
+      return await client.turn("Finish, then end the connection.", { type: "object" }, signal ? { signal } : {});
+    } finally {
+      await client.close();
+    }
+  }
+
+  test("returns the completion that Codex sent before the process exited or closed its output", async () => {
+    for (const layout of LAYOUTS) {
+      for (const close of ["exit", "disconnect"] as const) {
+        const fixture = completingServer(layout, close);
+
+        const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+        expect({ layout, close, result }).toEqual({ layout, close, result: { status: "completed", text: "MARKER_FINAL_ANSWER", threadId: "thread-done", turnId: "turn-done" } });
+        expect(fixture.processes[0]!.isExited).toBe(true);
+      }
+    }
+  });
+
+  test("returns the failed or interrupted status of a completion sent before the process exited", async () => {
+    const failed = completingServer("start never answered", "exit", { status: "failed", items: [], error: { message: "The model stopped.", codexErrorInfo: "other", additionalDetails: null } });
+    const interrupted = completingServer("answered in separate chunks", "exit", { status: "interrupted", items: [] });
+    const limits = { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 };
+
+    expect(await turnResult(failed, limits)).toMatchObject({ status: "failed", message: "Codex turn ended with status failed: The model stopped. (other)", turnId: "turn-done" });
+    expect(await turnResult(interrupted, limits)).toMatchObject({ status: "interrupted", message: "Codex turn ended with status interrupted.", turnId: "turn-done" });
+  });
+
+  test("fails, without taking it, when the completion that came before the exit belongs to another turn", async () => {
+    for (const order of ["after turn/started", "before turn/started"] as const) {
+      for (const close of ["exit", "disconnect"] as const) {
+        const fixture = createMockSpawner(() => ({
+          onClientMessage(message, process) {
+            if (answerHandshake(message, process, "thread-done")) return;
+            if (message.method !== "turn/start") return;
+            const started = notification("turn/started", { threadId: "thread-done", turnId: "turn-done" });
+            const other = completed("thread-done", "turn-other");
+            process.sendJsonChunk(...(order === "after turn/started" ? [started, other] : [other, started]));
+            endConnection(process, close);
+          },
+        }));
+
+        const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+        expect({ order, close, result }).toEqual({ order, close, result: { status: "failed", message: "Codex App Server disconnected during the active turn.", threadId: "thread-done", turnId: "turn-done" } });
+      }
+    }
+  });
+
+  test("keeps the completion and its final message when 500 notifications of another thread follow them before the connection ends", async () => {
+    const foreign = Array.from({ length: 500 }, (_, index) => notification("item/completed", { threadId: "thread-foreign", turnId: "turn-foreign", item: { type: "agentMessage", phase: "commentary", text: `Note ${index}.` } }));
+    for (const answered of [false, true]) {
+      for (const close of ["exit", "disconnect"] as const) {
+        for (const finalIn of ["the completion", "an item/completed notification"] as const) {
+          const fixture = createMockSpawner(() => ({
+            onClientMessage(message, process) {
+              if (answerHandshake(message, process, "thread-done")) return;
+              if (message.method !== "turn/start") return;
+              const started = notification("turn/started", { threadId: "thread-done", turnId: "turn-done" });
+              const finalItem = { type: "agentMessage", phase: "final_answer", text: "MARKER_FINAL_ANSWER" };
+              const events = finalIn === "the completion"
+                ? [started, completed("thread-done", "turn-done")]
+                : [started, notification("item/completed", { threadId: "thread-done", turnId: "turn-done", item: finalItem }), completed("thread-done", "turn-done", { items: [] })];
+              process.sendJsonChunk(...(answered ? [response(message, { turn: { id: "turn-done" } })] : []), ...events, ...foreign);
+              endConnection(process, close);
+            },
+          }));
+
+          const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+          expect({ answered, close, finalIn, result }).toEqual({ answered, close, finalIn, result: { status: "completed", text: "MARKER_FINAL_ANSWER", threadId: "thread-done", turnId: "turn-done" } });
+        }
+      }
+    }
+  });
+
+  test("keeps the active turn's completion when completions of 500 other turns follow it before the exit", async () => {
+    const others = Array.from({ length: 500 }, (_, index) => completed("thread-done", `turn-other-${index}`));
+    for (const answered of [false, true]) {
+      const fixture = createMockSpawner(() => ({
+        onClientMessage(message, process) {
+          if (answerHandshake(message, process, "thread-done")) return;
+          if (message.method !== "turn/start") return;
+          const answer = answered ? [response(message, { turn: { id: "turn-done" } })] : [];
+          process.sendJsonChunk(...answer, notification("turn/started", { threadId: "thread-done", turnId: "turn-done" }), completed("thread-done", "turn-done"), ...others);
+          process.exit(1);
+        },
+      }));
+
+      const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+      expect({ answered, result }).toEqual({ answered, result: { status: "completed", text: "MARKER_FINAL_ANSWER", threadId: "thread-done", turnId: "turn-done" } });
+    }
+  });
+
+  test("keeps the final message of a completion without items when completions of 500 other turns follow before the connection ends", async () => {
+    const others = Array.from({ length: 500 }, (_, index) => completed("thread-done", `turn-other-${index}`));
+    const finalItem = { type: "agentMessage", phase: "final_answer", text: "MARKER_FINAL_ANSWER" };
+    for (const answered of [false, true]) {
+      for (const close of ["exit", "disconnect"] as const) {
+        const fixture = createMockSpawner(() => ({
+          onClientMessage(message, process) {
+            if (answerHandshake(message, process, "thread-done")) return;
+            if (message.method !== "turn/start") return;
+            process.sendJsonChunk(
+              ...(answered ? [response(message, { turn: { id: "turn-done" } })] : []),
+              notification("turn/started", { threadId: "thread-done", turnId: "turn-done" }),
+              notification("item/completed", { threadId: "thread-done", turnId: "turn-done", item: finalItem }),
+              completed("thread-done", "turn-done", { items: [] }),
+              ...others,
+            );
+            endConnection(process, close);
+          },
+        }));
+
+        const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+        expect({ answered, close, result }).toEqual({ answered, close, result: { status: "completed", text: "MARKER_FINAL_ANSWER", threadId: "thread-done", turnId: "turn-done" } });
+      }
+    }
+  });
+
+  test("keeps the error detail of a failed completion when completions of 500 other turns follow before the exit", async () => {
+    const others = Array.from({ length: 500 }, (_, index) => completed("thread-done", `turn-other-${index}`));
+    const fixture = createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-done")) return;
+        if (message.method !== "turn/start") return;
+        process.sendJsonChunk(
+          notification("turn/started", { threadId: "thread-done", turnId: "turn-done" }),
+          notification("error", { threadId: "thread-done", turnId: "turn-done", willRetry: false, error: { message: "The model stopped.", codexErrorInfo: "other", additionalDetails: null } }),
+          completed("thread-done", "turn-done", { status: "failed", items: [], error: null }),
+          ...others,
+        );
+        process.exit(1);
+      },
+    }));
+
+    const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+    expect(result).toEqual({ status: "failed", message: "Codex turn ended with status failed: The model stopped. (other)", threadId: "thread-done", turnId: "turn-done" });
+  });
+
+  test("returns the latest of two final messages of the same kind", async () => {
+    const fixture = createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-done")) return;
+        if (message.method !== "turn/start") return;
+        process.sendJsonChunk(
+          response(message, { turn: { id: "turn-done" } }),
+          notification("turn/started", { threadId: "thread-done", turnId: "turn-done" }),
+          notification("item/completed", { threadId: "thread-done", turnId: "turn-done", item: { type: "agentMessage", phase: "final_answer", text: "An earlier answer." } }),
+          notification("item/completed", { threadId: "thread-done", turnId: "turn-done", item: { type: "agentMessage", phase: "final_answer", text: "MARKER_FINAL_ANSWER" } }),
+          completed("thread-done", "turn-done", { items: [] }),
+        );
+      },
+    }));
+
+    const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+    expect(result).toEqual({ status: "completed", text: "MARKER_FINAL_ANSWER", threadId: "thread-done", turnId: "turn-done" });
+  });
+
+  test("takes the final message only from the turn's own thread", async () => {
+    const fixture = createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-done")) return;
+        if (message.method !== "turn/start") return;
+        process.sendJsonChunk(
+          response(message, { turn: { id: "turn-done" } }),
+          notification("turn/started", { threadId: "thread-done", turnId: "turn-done" }),
+          notification("item/completed", { threadId: "thread-done", turnId: "turn-done", item: { type: "agentMessage", phase: "final_answer", text: "MARKER_FINAL_ANSWER" } }),
+          notification("item/completed", { threadId: "thread-foreign", turnId: "turn-done", item: { type: "agentMessage", phase: "final_answer", text: "An answer on another thread." } }),
+          completed("thread-done", "turn-done", { items: [] }),
+        );
+      },
+    }));
+
+    const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+    expect(result).toEqual({ status: "completed", text: "MARKER_FINAL_ANSWER", threadId: "thread-done", turnId: "turn-done" });
+  });
+
+  test("ranks a final answer over a message without phase over a plan, from the completion and from item notifications", async () => {
+    const agentMessage = (phase: string | null, text: string) => ({ type: "agentMessage", phase, text });
+    const plan = (text: string) => ({ type: "plan", text });
+    const cases: Array<{ name: string; inCompletion: unknown[]; inItems: unknown[]; text: string }> = [
+      { name: "a message without phase in an item", inCompletion: [], inItems: [agentMessage(null, "MARKER_NULL_PHASE")], text: "MARKER_NULL_PHASE" },
+      { name: "a message without phase in the completion", inCompletion: [agentMessage(null, "MARKER_NULL_PHASE")], inItems: [], text: "MARKER_NULL_PHASE" },
+      { name: "a plan in an item", inCompletion: [], inItems: [plan("MARKER_PLAN")], text: "MARKER_PLAN" },
+      { name: "a message without phase over a later plan", inCompletion: [], inItems: [agentMessage(null, "MARKER_NULL_PHASE"), plan("A later plan.")], text: "MARKER_NULL_PHASE" },
+      { name: "a final answer in the completion over a message without phase in an item", inCompletion: [agentMessage("final_answer", "MARKER_FINAL_ANSWER")], inItems: [agentMessage(null, "A message without phase.")], text: "MARKER_FINAL_ANSWER" },
+    ];
+    for (const entry of cases) {
+      const fixture = createMockSpawner(() => ({
+        onClientMessage(message, process) {
+          if (answerHandshake(message, process, "thread-done")) return;
+          if (message.method !== "turn/start") return;
+          process.sendJsonChunk(
+            response(message, { turn: { id: "turn-done" } }),
+            notification("turn/started", { threadId: "thread-done", turnId: "turn-done" }),
+            ...entry.inItems.map((item) => notification("item/completed", { threadId: "thread-done", turnId: "turn-done", item })),
+            completed("thread-done", "turn-done", { items: entry.inCompletion }),
+          );
+        },
+      }));
+
+      const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+      expect({ name: entry.name, result }).toEqual({ name: entry.name, result: { status: "completed", text: entry.text, threadId: "thread-done", turnId: "turn-done" } });
+    }
+  });
+
+  test("names the started turn in the failure when an answered start ends with a disconnect and no completion", async () => {
+    for (const close of ["exit", "disconnect"] as const) {
+      const fixture = createMockSpawner(() => ({
+        onClientMessage(message, process) {
+          if (answerHandshake(message, process, "thread-done")) return;
+          if (message.method !== "turn/start") return;
+          process.sendJsonChunk(response(message, { turn: { id: "turn-done" } }));
+          endConnection(process, close);
+        },
+      }));
+
+      const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500 });
+
+      expect({ close, result }).toEqual({ close, result: { status: "failed", message: "Codex App Server disconnected during the active turn.", threadId: "thread-done", turnId: "turn-done" } });
+    }
+  });
+
+  test("ends a turn without a completion as not announced when 500 later notifications push turn/started out, and as an idle timeout when 499 do", async () => {
+    const kinds = {
+      "commentary items": (index: number) => notification("item/completed", { threadId: "thread-done", turnId: "turn-done", item: { type: "agentMessage", phase: "commentary", text: `Note ${index}.` } }),
+      "items of another thread": (index: number) => notification("item/completed", { threadId: "thread-foreign", turnId: "turn-foreign", item: { type: "agentMessage", phase: "commentary", text: `Note ${index}.` } }),
+      "error notifications": (index: number) => notification("error", { threadId: "thread-done", turnId: "turn-done", willRetry: true, error: { message: `Retry ${index}.`, codexErrorInfo: null, additionalDetails: null } }),
+    };
+    for (const [kind, make] of Object.entries(kinds)) {
+      for (const count of [499, 500]) {
+        const fixture = createMockSpawner(() => ({
+          onClientMessage(message, process) {
+            if (answerHandshake(message, process, "thread-done")) return;
+            if (message.method !== "turn/start") return;
+            process.sendJsonChunk(
+              response(message, { turn: { id: "turn-done" } }),
+              notification("turn/started", { threadId: "thread-done", turnId: "turn-done" }),
+              ...Array.from({ length: count }, (_, index) => make(index)),
+            );
+          },
+        }));
+
+        const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 40, interruptGraceMs: 40, turnIdleTimeoutMs: 120 });
+
+        const expected = count === 500
+          ? { status: "failed", message: "Codex App Server did not announce the active turn." }
+          : { status: "timed_out", limit: "idle" };
+        expect({ kind, count, result }).toMatchObject({ kind, count, result: expected });
+      }
+    }
+  });
+
+  test("times out a silent turn although another thread reports activity every 40 ms", async () => {
+    let ticker: ReturnType<typeof setInterval> | undefined;
+    const fixture = createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, "thread-done")) return;
+        if (message.method === "turn/start") {
+          process.sendJsonChunk(response(message, { turn: { id: "turn-done" } }), notification("turn/started", { threadId: "thread-done", turnId: "turn-done" }));
+          ticker = setInterval(() => process.sendJsonChunk(notification("item/agentMessage/delta", { threadId: "thread-foreign", turnId: "turn-foreign", delta: "more" })), 40);
+        } else if (message.method === "turn/interrupt") {
+          clearInterval(ticker);
+          process.sendJsonChunk(response(message, {}), completed("thread-done", "turn-done", { status: "interrupted", items: [] }));
+        }
+      },
+    }));
+    try {
+      const result = await turnResult(fixture, { requestTimeoutMs: 500, turnStartTimeoutMs: 500, interruptGraceMs: 500, turnIdleTimeoutMs: 150 });
+
+      expect(result).toMatchObject({ status: "timed_out", limit: "idle", limitMs: 150, threadId: "thread-done", turnId: "turn-done" });
+    } finally {
+      clearInterval(ticker);
+    }
+  });
+
+  test("keeps a timeout, a cancellation, an input request or a blocked tool that came before the completion and the exit", async () => {
+    const afterInterrupt = (threadId: string) => createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, threadId)) return;
+        if (message.method === "turn/start") {
+          process.sendJsonChunk(response(message, { turn: { id: "turn-late" } }), notification("turn/started", { threadId, turnId: "turn-late" }));
+        } else if (message.method === "turn/interrupt") {
+          process.sendJsonChunk(response(message, {}), completed(threadId, "turn-late"));
+          process.exit(1);
+        }
+      },
+    }));
+    const sameChunk = (threadId: string, before: MockRpcMessage) => createMockSpawner(() => ({
+      onClientMessage(message, process) {
+        if (answerHandshake(message, process, threadId)) return;
+        if (message.method !== "turn/start") return;
+        process.sendJsonChunk(response(message, { turn: { id: "turn-late" } }), notification("turn/started", { threadId, turnId: "turn-late" }), before, completed(threadId, "turn-late"));
+        process.exit(1);
+      },
+    }));
+    const limits = { requestTimeoutMs: 300, turnStartTimeoutMs: 300, interruptGraceMs: 300 };
+
+    expect(await turnResult(afterInterrupt("thread-idle-done"), { ...limits, turnIdleTimeoutMs: 60 })).toMatchObject({ status: "timed_out", limit: "idle" });
+
+    const abort = new AbortController();
+    setTimeout(() => abort.abort(), 50);
+    expect(await turnResult(afterInterrupt("thread-cancel-done"), limits, abort.signal)).toMatchObject({ status: "interrupted", message: "The run was interrupted." });
+
+    const question = serverRequest("question-request-9", "item/tool/requestUserInput", { threadId: "thread-input-done", turnId: "turn-late", questions: [{ id: "Q-SCOPE", question: "Which scope applies?" }] });
+    expect(await turnResult(sameChunk("thread-input-done", question), limits)).toMatchObject({ status: "needs_input", questions: [{ id: "Q-SCOPE", question: "Which scope applies?" }] });
+
+    const tool = notification("item/started", { threadId: "thread-tool-done", turnId: "turn-late", item: { type: "commandExecution", id: "item-1" } });
+    expect(await turnResult(sameChunk("thread-tool-done", tool), limits)).toMatchObject({ status: "failed", message: "Codex attempted a commandExecution tool action. The action was blocked and the turn was interrupted." });
+  });
+
+  test("fails within half a second when the connection ends at turn/start or during the turn, whatever the limits", async () => {
+    for (const moment of ["at turn/start", "with turn/started", "20 ms after turn/started"] as const) {
+      for (const close of ["exit", "disconnect"] as const) {
+        const fixture = createMockSpawner(() => ({
+          onClientMessage(message, process) {
+            if (answerHandshake(message, process, "thread-gone")) return;
+            if (message.method !== "turn/start") return;
+            if (moment === "at turn/start") return endConnection(process, close);
+            process.sendJsonChunk(response(message, { turn: { id: "turn-gone" } }), notification("turn/started", { threadId: "thread-gone", turnId: "turn-gone" }));
+            if (moment === "with turn/started") endConnection(process, close);
+            else setTimeout(() => endConnection(process, close), 20);
+          },
+        }));
+        const startedAt = Date.now();
+
+        const result = await turnResult(fixture, { requestTimeoutMs: 10_000, turnStartTimeoutMs: 10_000, interruptGraceMs: 10_000, turnIdleTimeoutMs: 10_000 });
+
+        expect({ moment, close, status: result.status, message: result.status === "failed" ? result.message : "" }).toEqual({ moment, close, status: "failed", message: "Codex App Server disconnected during the active turn." });
+        expect(Date.now() - startedAt).toBeLessThan(500);
+      }
+    }
+  });
+});
+
 async function waitForProcess(fixture: ReturnType<typeof createMockSpawner>): Promise<MockAppServerProcess> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (fixture.processes[0]) return fixture.processes[0];
