@@ -1267,6 +1267,23 @@ describe("Grep code search", () => {
     expect(discovery.excluded.find((entry) => entry.candidate.fullName === "org/archived")?.reasons).toContain("archived");
   });
 
+  test("reports how many repositories code search matched", async () => {
+    const { fetch } = codeSearchFetch({
+      grep: () => grepResponse([{ repository: "org/one", path: "src/refunds.ts" }, { repository: "org/two", path: "src/refund-service.ts" }]),
+      github: (url) => {
+        if (url.searchParams.get("q")?.startsWith("repo:")) return json({ items: [] });
+        if (url.origin === "https://gitlab.com") return json([]);
+        return json({ items: [] });
+      },
+    });
+    const researcher = new GitHubResearcher({ fetch, now: () => NOW, codeSearch: true, searchTiers: [{ tier: 0, minStars: 200, maxMonthsSincePush: 12 }] });
+    const messages: string[] = [];
+
+    await researcher.discover({ ...material, codePatterns: ["OrderRefund"] }, undefined, (message) => messages.push(message));
+
+    expect(messages).toContain("Code search matched 2 repositories outside example and documentation paths.");
+  });
+
   test("skips the GitLab fallback when a Grep-added candidate passes", async () => {
     let gitlabRequests = 0;
     const { fetch } = codeSearchFetch({

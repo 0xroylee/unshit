@@ -190,6 +190,15 @@ describe("partial evidence persistence", () => {
         excluded: 0,
         rateLimited: false,
         trustworthyReferenceFound: false,
+        // Grep query records are optional; both manifests must keep them.
+        codeSearch: {
+          queries: [{ provider: "grep", purpose: "discovery", query: "OrderRefund", status: "ok", resultCount: 2 }],
+          requests: 1,
+          budget: 12,
+          repositoriesMatched: 2,
+          repositoriesScreened: 1,
+          metadataRequests: 1,
+        },
       };
       const input = {
         brief,

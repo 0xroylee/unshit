@@ -74,7 +74,16 @@ type CancelReason =
 
 // After the process exits, the reader gets this long to reach EOF before pending requests fail.
 const EXIT_DRAIN_MS = 1_000;
+// Before a turn's ID is known, `turn` holds the result evidence of at most this many turn IDs on its thread.
+const MAX_HELD_TURNS = 500;
 
+// What a turn's result needs: its turn/completed notification, the latest item/completed of each final-message rank
+// (see `finalMessageRank`), in arrival order, and the latest error notification.
+interface HeldEvidence {
+  completion?: Notification;
+  finals: Notification[];
+  error?: Notification;
+}
 
 class RequestAbortedError extends Error {
   constructor() {
@@ -251,10 +260,29 @@ export class AppServerClient {
     const buffer = new NotificationBuffer();
     const turnStartedAt = Date.now();
     let lastActivityAt = turnStartedAt;
+    // Result evidence by turn ID, apart from the rolling buffer, which can push it out. Once the active turn's ID is
+    // known, only its entry changes; before that, the oldest entry goes when more than MAX_HELD_TURNS turn IDs are held.
+    const held = new Map<string, HeldEvidence>();
+    const completionOf = (id: string | undefined): Notification | undefined => (id ? held.get(id)?.completion : undefined);
     const unsubscribe = this.subscribe((notification) => {
-      // Any notification on this thread is activity: reasoning, message deltas, token counts, retries.
-      if (notificationThreadId(notification) === threadId) lastActivityAt = Date.now();
       if (isTurnNotification(notification)) buffer.push(notification);
+      // Any notification on this thread is activity: reasoning, message deltas, token counts, retries. The held
+      // evidence below takes only this thread's notifications.
+      if (notificationThreadId(notification) !== threadId) return;
+      lastActivityAt = Date.now();
+      const rank = notification.method === "item/completed" ? finalMessageRank(notification.params.item) : undefined;
+      const evidence = notification.method === "turn/completed" || notification.method === "error" || rank !== undefined;
+      const heldId = evidence ? notificationTurnId(notification) : undefined;
+      const activeId = this.currentTurn?.turnId;
+      if (heldId && (!activeId || heldId === activeId)) {
+        const entry = held.get(heldId) ?? { finals: [] };
+        if (notification.method === "turn/completed") entry.completion = notification;
+        else if (notification.method === "error") entry.error = notification;
+        else entry.finals = [...entry.finals.filter((final) => finalMessageRank(final.params.item) !== rank), notification];
+        held.delete(heldId);
+        held.set(heldId, entry);
+        if (held.size > MAX_HELD_TURNS) held.delete(held.keys().next().value!);
+      }
     });
     const control = new TurnControl();
     const abortListener = (): void => control.cancel({ kind: "signal", message: "The run was interrupted." });
@@ -279,15 +307,28 @@ export class AppServerClient {
         outputSchema,
         ...(this.options.effort ? { effort: this.options.effort } : {}),
       });
-      const startOutcome = await Promise.race([
+      let startOutcome = await Promise.race([
         startRequest.then((response) => ({ kind: "response" as const, response })),
         control.canceled.then((reason) => ({ kind: "cancelled" as const, reason })),
       ]);
       if (startOutcome.kind === "cancelled" && startOutcome.reason.kind === "transport_failure") {
-        // Codex can answer with an error and then close the connection. A disconnect settles every pending request, so
-        // waiting is brief, and the answer wins over the disconnect.
-        const answer = await startRequest.then(() => undefined, (error: unknown) => error);
-        if (answer instanceof RequestRejectedError) throw answer;
+        // Codex can answer and then close the connection. A disconnect settles every pending request, so waiting is
+        // brief, and the answer wins over the disconnect: a rejection ends the turn, a response continues it.
+        const answer = await startRequest.then(
+          (response) => ({ kind: "response" as const, response }),
+          (error: unknown) => ({ kind: "error" as const, error }),
+        );
+        if (answer.kind === "error" && answer.error instanceof RequestRejectedError) throw answer.error;
+        if (answer.kind === "response") startOutcome = answer;
+      }
+      if (startOutcome.kind === "cancelled" && startOutcome.reason.kind === "transport_failure") {
+        // After a transport failure the turn does not wait for more messages: the held completion of the active turn,
+        // if there is one, is the turn's result.
+        turnId = activeTurn.turnId;
+        await this.terminateProcess();
+        const completion = completionOf(turnId);
+        if (completion) return this.completionResult(completion, held.get(turnId!), threadId, turnId!, undefined);
+        return this.cancelResult(startOutcome.reason, threadId, turnId);
       }
       if (startOutcome.kind === "cancelled") {
         const belongsToActiveTurn = (notification: Notification): boolean => {
@@ -333,18 +374,23 @@ export class AppServerClient {
       if (initial.kind === "cancelled") {
         initialController.abort();
         if (initial.reason.kind === "transport_failure") {
-          await this.terminateProcess();
-          return { status: "failed", message: initial.reason.message, threadId, turnId };
-        }
-        const afterCancel = await buffer.waitFor(isStartedOrCompleted, Math.min(this.options.interruptGraceMs, 2_000));
-        if (isNotification(afterCancel) && afterCancel.method === "turn/completed") finish = afterCancel;
-        else if (isNotification(afterCancel) && afterCancel.method === "turn/started") {
-          started = true;
-          await this.interrupt(threadId, turnId);
-          finish = await this.waitForCompletion(buffer, isForTurn, this.options.interruptGraceMs);
+          // A completion that the rolling buffer pushed out is not found by the wait above; the held one still counts.
+          finish = completionOf(turnId);
+          if (!finish) {
+            await this.terminateProcess();
+            return { status: "failed", message: initial.reason.message, threadId, turnId };
+          }
         } else {
-          await this.terminateProcess();
-          return this.cancelResult(control.reason!, threadId, turnId);
+          const afterCancel = await buffer.waitFor(isStartedOrCompleted, Math.min(this.options.interruptGraceMs, 2_000));
+          if (isNotification(afterCancel) && afterCancel.method === "turn/completed") finish = afterCancel;
+          else if (isNotification(afterCancel) && afterCancel.method === "turn/started") {
+            started = true;
+            await this.interrupt(threadId, turnId);
+            finish = await this.waitForCompletion(buffer, isForTurn, this.options.interruptGraceMs);
+          } else {
+            await this.terminateProcess();
+            return this.cancelResult(control.reason!, threadId, turnId);
+          }
         }
       } else if (initial.notification === undefined || initial.notification === "aborted") {
         await this.terminateProcess();
@@ -361,7 +407,10 @@ export class AppServerClient {
           this.waitForTurnEnd(buffer, isForTurn, () => lastActivityAt, turnStartedAt).then((outcome) => ({ kind: "ended" as const, outcome })),
           control.canceled.then((reason) => ({ kind: "cancelled" as const, reason })),
         ]);
-        if (ended.kind === "cancelled") {
+        if (ended.kind === "cancelled" && ended.reason.kind === "transport_failure") {
+          // No interrupt and no wait after a transport failure; only the held completion counts.
+          finish = completionOf(turnId);
+        } else if (ended.kind === "cancelled") {
           await this.interrupt(threadId, turnId);
           finish = await this.waitForCompletion(buffer, isForTurn, this.options.interruptGraceMs);
         } else if ("notification" in ended.outcome) {
@@ -377,24 +426,15 @@ export class AppServerClient {
       if (control.reason?.kind === "needs_input") return { status: "needs_input", questions: control.reason.questions, threadId, turnId };
       if (control.reason?.kind === "tool_forbidden") return { status: "failed", message: control.reason.message, threadId, turnId };
       if (control.reason?.kind === "signal") return this.cancelResult(control.reason, threadId, turnId);
-      if (control.reason?.kind === "transport_failure") return timedOut ? this.timeoutResult(timedOut, threadId, turnId) : { status: "failed", message: control.reason.message, threadId, turnId };
-      if (!finish) return timedOut ? this.timeoutResult(timedOut, threadId, turnId) : { status: "failed", message: "Codex App Server did not complete the active turn before the timeout.", threadId, turnId };
-
-      const completedTurn = asRecord(asRecord(finish.params, "turn/completed params").turn, "completed turn");
-      const completedId = typeof completedTurn.id === "string" ? completedTurn.id : "";
-      const status = completedTurn.status;
-      if (finish.method !== "turn/completed" || notificationThreadId(finish) !== threadId || completedId !== turnId) {
-        return { status: "failed", message: "Codex App Server completion did not match the active turn.", threadId, turnId };
-      }
-      if (status !== "completed") {
+      if (control.reason?.kind === "transport_failure") {
+        await this.terminateProcess();
+        // After a transport failure, a completion that the turn already has is its result, unless a time limit ran out
+        // first.
         if (timedOut) return this.timeoutResult(timedOut, threadId, turnId);
-        if (status === "interrupted") return { status: "interrupted", message: "Codex turn ended with status interrupted.", threadId, turnId };
-        const detail = turnFailureDetail(completedTurn, buffer, threadId, turnId);
-        return { status: "failed", message: `Codex turn ended with status ${String(status)}${detail ? `: ${detail}` : "."}`, threadId, turnId };
+        if (!finish) return { status: "failed", message: control.reason.message, threadId, turnId };
       }
-      const text = authoritativeFinalText(completedTurn, buffer, threadId, turnId);
-      if (!text) return { status: "failed", message: "Codex completed without an authoritative final assistant message.", threadId, turnId };
-      return { status: "completed", text, threadId, turnId };
+      if (!finish) return timedOut ? this.timeoutResult(timedOut, threadId, turnId) : { status: "failed", message: "Codex App Server did not complete the active turn before the timeout.", threadId, turnId };
+      return this.completionResult(finish, held.get(turnId), threadId, turnId, timedOut);
     } catch (error) {
       if (turnStartRequested) await this.terminateProcess();
       if (control.reason?.kind === "needs_input") return { status: "needs_input", questions: control.reason.questions, threadId, ...(turnId ?? activeTurn.turnId ? { turnId: turnId ?? activeTurn.turnId } : {}) };
@@ -626,6 +666,28 @@ export class AppServerClient {
     return { status: "interrupted", message: reason.message, threadId, ...(turnId ? { turnId } : {}) };
   }
 
+  // The result of a turn/completed notification. A notification for another turn fails. Status `completed` gives the
+  // authoritative final text, or a failure without one. Any other status gives the timeout when `timedOut` is set;
+  // otherwise `interrupted` stays interrupted and every other status is a failure that names it.
+  // The final text and the error detail come from `evidence`, the turn's held notifications.
+  private completionResult(finish: Notification, evidence: HeldEvidence | undefined, threadId: string, turnId: string, timedOut: TurnTimeoutLimit | undefined): ModelTurnResult {
+    const completedTurn = asRecord(asRecord(finish.params, "turn/completed params").turn, "completed turn");
+    const completedId = typeof completedTurn.id === "string" ? completedTurn.id : "";
+    const status = completedTurn.status;
+    if (finish.method !== "turn/completed" || notificationThreadId(finish) !== threadId || completedId !== turnId) {
+      return { status: "failed", message: "Codex App Server completion did not match the active turn.", threadId, turnId };
+    }
+    if (status !== "completed") {
+      if (timedOut) return this.timeoutResult(timedOut, threadId, turnId);
+      if (status === "interrupted") return { status: "interrupted", message: "Codex turn ended with status interrupted.", threadId, turnId };
+      const detail = turnFailureDetail(completedTurn, evidence?.error);
+      return { status: "failed", message: `Codex turn ended with status ${String(status)}${detail ? `: ${detail}` : "."}`, threadId, turnId };
+    }
+    const text = authoritativeFinalText(completedTurn, evidence?.finals ?? []);
+    if (!text) return { status: "failed", message: "Codex completed without an authoritative final assistant message.", threadId, turnId };
+    return { status: "completed", text, threadId, turnId };
+  }
+
   private timeoutResult(limit: TurnTimeoutLimit, threadId: string, turnId?: string): ModelTurnResult {
     const limitMs = limit === "idle" ? this.options.turnIdleTimeoutMs : this.options.turnTotalTimeoutMs;
     const message = limit === "idle"
@@ -737,16 +799,19 @@ function keyList(value: unknown): string[] {
   return Object.keys(value).filter((id) => id.length > 0 && id.length < 120);
 }
 
+// The notifications that the rolling buffer takes, from every thread: the waits read turn/started and turn/completed,
+// the forbidden-item scan reads item/started, and item/completed and error notifications take their places as well, so
+// the buffer pushes notifications out at the same points as before held evidence. What a turn's result needs is held
+// apart (`HeldEvidence`).
 function isTurnNotification(notification: Notification): boolean {
   return notification.method === "turn/started" || notification.method === "turn/completed" || notification.method === "item/started" || notification.method === "item/completed" || notification.method === "error";
 }
 
 // The failed turn's own error comes first; otherwise the last error notification Codex sent for this turn.
-function turnFailureDetail(completedTurn: JsonRecord, buffer: NotificationBuffer, threadId: string, turnId: string): string | undefined {
+function turnFailureDetail(completedTurn: JsonRecord, error: Notification | undefined): string | undefined {
   const fromTurn = describeTurnError(completedTurn.error);
   if (fromTurn) return fromTurn;
-  const notification = buffer.find((entry) => entry.method === "error" && notificationThreadId(entry) === threadId && notificationTurnId(entry) === turnId);
-  return notification ? describeTurnError(notification.params.error) : undefined;
+  return error ? describeTurnError(error.params.error) : undefined;
 }
 
 function describeTurnError(value: unknown): string | undefined {
@@ -791,27 +856,27 @@ function notificationTurnId(notification: { method: string; params: JsonRecord }
   return undefined;
 }
 
-function authoritativeFinalText(completedTurn: JsonRecord, buffer: NotificationBuffer, threadId: string, turnId: string): string | undefined {
+function authoritativeFinalText(completedTurn: JsonRecord, finals: readonly Notification[]): string | undefined {
   const candidates: Array<{ text: string; priority: number; sequence: number }> = [];
   let sequence = 0;
   const items = Array.isArray(completedTurn.items) ? completedTurn.items : [];
-  for (const item of items) {
-    if (!isRecord(item) || typeof item.text !== "string") continue;
-    if (item.type === "agentMessage" && item.phase === "final_answer") candidates.push({ text: item.text, priority: 3, sequence: sequence++ });
-    else if (item.type === "agentMessage" && item.phase === null) candidates.push({ text: item.text, priority: 2, sequence: sequence++ });
-    else if (item.type === "plan") candidates.push({ text: item.text, priority: 1, sequence: sequence++ });
-  }
-  for (const notification of buffer.all()) {
-    if (notification.method !== "item/completed" || notificationThreadId(notification) !== threadId || notificationTurnId(notification) !== turnId) continue;
-    const item = isRecord(notification.params.item) ? notification.params.item : undefined;
-    if (!item || typeof item.text !== "string") continue;
-    if (item.type === "agentMessage" && item.phase === "final_answer") candidates.push({ text: item.text, priority: 3, sequence: sequence++ });
-    else if (item.type === "agentMessage" && item.phase === null) candidates.push({ text: item.text, priority: 2, sequence: sequence++ });
-    else if (item.type === "plan") candidates.push({ text: item.text, priority: 1, sequence: sequence++ });
+  for (const item of [...items, ...finals.map((notification) => notification.params.item)]) {
+    const priority = finalMessageRank(item);
+    if (priority !== undefined) candidates.push({ text: (item as JsonRecord).text as string, priority, sequence: sequence++ });
   }
   candidates.sort((left, right) => right.priority - left.priority || right.sequence - left.sequence);
   const text = candidates[0]?.text.trim();
   return text || undefined;
+}
+
+// An item's rank as a turn's final message: 3 for an agentMessage in phase final_answer, 2 for an agentMessage whose
+// phase is null, 1 for a plan; undefined for any other item and for an item without text.
+function finalMessageRank(item: unknown): number | undefined {
+  if (!isRecord(item) || typeof item.text !== "string") return undefined;
+  if (item.type === "agentMessage" && item.phase === "final_answer") return 3;
+  if (item.type === "agentMessage" && item.phase === null) return 2;
+  if (item.type === "plan") return 1;
+  return undefined;
 }
 
 function parseServerQuestions(params: JsonRecord): ServerInputQuestion[] {

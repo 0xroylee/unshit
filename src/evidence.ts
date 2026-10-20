@@ -544,7 +544,7 @@ const SCAN_LINES = 600;
 // first word, after an optional `export`, on a line whose last non-blank character is `{`; and some `const`, `let` or
 // `var` lines whose value is a function (the pattern gives the exact forms). This keyword list differs from
 // DEFINITION_LINE's.
-const BLOCK_START = /^\s*(?:(?:export|default|abstract|async|public|private|protected|static|pub|final|override)\s+)*(?:class|def|function|func|fn|interface|struct|enum|impl|trait)\b|^\s*(?:export\s+)?type\b.*\{\s*$|^\s*(?:export\s+)?(?:const|let|var)\b[^=]*=\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*(?::\s*[^=]+)?=>|[A-Za-z_$][\w$]*\s*=>)/;
+const BLOCK_START = /^\s*(?:(?:export|default|abstract|async|public|private|protected|static|pub|final|override)\s+)*(?:class|def|function|func|fn|interface|struct|enum|impl|trait)\b|^\s*(?:export\s+)?type\b.*\{\s*$|^\s*(?:export\s+)?(?:const|let|var)\b[^=]*=\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*(?::[^=]+)?=>|[A-Za-z_$][\w$]*\s*=>)/;
 
 // Lines `start` to `end - 1` of a file, counted from 0.
 interface LineWindow {
