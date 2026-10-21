@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CANDIDATE_RANKING_SCHEMA, EVIDENCE_REQUEST_SCHEMA, INTAKE_SCHEMA, ModelOutputError, REFINED_BRIEF_SCHEMA, parseCandidateRanking, parseEvidenceRequests, parseFileSelection, parseIntake, parsePlan, parseRefinedBrief, stableMaterialQuestionId } from "../src/model-schema.ts";
+import { CANDIDATE_RANKING_SCHEMA, EVIDENCE_REQUEST_SCHEMA, FILE_SELECTION_SCHEMA, INTAKE_SCHEMA, ModelOutputError, REFINED_BRIEF_SCHEMA, parseCandidateRanking, parseEvidenceRequests, parseFileSelection, parseIntake, parsePlan, parseRefinedBrief, stableMaterialQuestionId } from "../src/model-schema.ts";
 import type { EvidenceExcerpt, EvidenceSource, IntakeBrief, RepositorySnapshot } from "../src/types.ts";
 
 const brief = parseIntake({
@@ -266,6 +266,15 @@ describe("file selection", () => {
     expect(parseFileSelection({ files: [choice("B"), choice("X"), choice("A"), choice("B")] }, offered)).toEqual({ files: [choice("B"), choice("A")], ignored: 2 });
     expect(parseFileSelection({ files: [choice("X")] }, offered)).toEqual({ files: [], ignored: 1 });
     expect(() => parseFileSelection({ files: [{ fileId: "A", role: "owner", rationale: "Relevant." }] }, offered)).toThrow(ModelOutputError);
+  });
+
+  test("chooses at most 20 files", () => {
+    const offered = Array.from({ length: 21 }, (_, index) => ({ id: `F${index + 1}` }));
+    const choices = offered.map((file) => ({ fileId: file.id, role: "production" as const, rationale: "Relevant." }));
+
+    expect(parseFileSelection({ files: choices.slice(0, 20) }, offered).files).toHaveLength(20);
+    expect(() => parseFileSelection({ files: choices }, offered)).toThrow("files must contain 0 to 20 items.");
+    expect(FILE_SELECTION_SCHEMA).toMatchObject({ properties: { files: { maxItems: 20 } } });
   });
 });
 

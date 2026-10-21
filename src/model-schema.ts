@@ -83,10 +83,13 @@ export const REPOSITORY_SELECTION_SCHEMA: JsonSchema = object({
   },
 });
 
+// The most files that one file-selection turn can choose.
+export const MAX_SELECTED_FILES = 20;
+
 export const FILE_SELECTION_SCHEMA: JsonSchema = object({
   files: {
     type: "array",
-    maxItems: 15,
+    maxItems: MAX_SELECTED_FILES,
     items: object({ fileId: string, role: { type: "string", enum: ["production", "test"] }, rationale: string }),
   },
 });
@@ -414,7 +417,7 @@ const FILE_ROLES = new Set<SelectedFileRole>(["production", "test", "manifest", 
 // the run.
 export function parseFileSelection(value: unknown, allowedFiles: TreeFileLike[]): { files: SelectedFile[]; ignored: number } {
   const result = asObject(value, "File selection");
-  const chosen = asArray(result.files, "files", 0, 15).map((value, index) => {
+  const chosen = asArray(result.files, "files", 0, MAX_SELECTED_FILES).map((value, index) => {
     const item = asObject(value, `files[${index + 1}]`);
     const role = asString(item.role, `files[${index + 1}].role`, 20) as SelectedFileRole;
     if (!FILE_ROLES.has(role)) throw new ModelOutputError(`Unsupported file role: ${role}.`);

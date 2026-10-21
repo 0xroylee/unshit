@@ -1520,7 +1520,7 @@ describe("workflow gates and readiness", () => {
       expect(finalReport).toContain("Only named refund managers.");
       const requiredPrompts = [
         "Select zero to three public repository",
-        "Choose up to fifteen local or remote",
+        "Choose up to 20 local or remote",
         "Produce a detailed implementation plan",
         "Repair the prior plan output",
         "Independently review this plan",
@@ -1533,7 +1533,7 @@ describe("workflow gates and readiness", () => {
         expect(prompt).toContain(question.whyMaterial);
         expect(prompt).toContain("Only named refund managers.");
       }
-      for (const start of ["Select zero to three public repository", "Choose up to fifteen local or remote"]) {
+      for (const start of ["Select zero to three public repository", "Choose up to 20 local or remote"]) {
         expectPhaseModules(observedPrompts.find((item) => item.startsWith(start))!, "research");
       }
       for (const start of ["Produce a detailed implementation plan", "Repair the prior plan output", "Repair the current plan"]) {
@@ -1783,7 +1783,7 @@ describe("workflow gates and readiness", () => {
       expect(selectionPrompt).toContain("\"codeMatchedFiles\":1");
       expect(selectionPrompt).toContain("\"codePatterns\":[\"createRefund\"]");
       expect(selectionPrompt).toContain("Use them as relevance hints, not as evidence.");
-      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to 20 local or remote"))!;
       expect(filePrompt).toContain("\"fileId\":\"C1F1\",\"path\":\"src/index.ts\"");
       expect(filePrompt).toContain("\"codeMatch\":\"createRefund\"");
       expect(filePrompt).toContain("the file is not evidence until the host reads it at the pinned commit.");
@@ -1848,7 +1848,7 @@ describe("workflow gates and readiness", () => {
       });
 
       expect(outcome.status).toBe("completed");
-      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to 20 local or remote"))!;
       const actualFileList = filePrompt.split("ACTUAL FILE ID AND PATH LIST:\n\n")[1]?.split("\n\nBEGIN HOST-PROVIDED MODULE")[0] ?? "";
       expect(actualFileList).toContain("\"fileId\":\"C1F7\",\"path\":\"src/refund_match.ts\"");
       expect(actualFileList).toContain("\"codeMatch\":\"OrderRefund\"");
@@ -1882,7 +1882,7 @@ describe("workflow gates and readiness", () => {
         researcher: researcher({ snapshots: [snapshot] }).value,
       });
       expect(outcome.status).toBe("completed");
-      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to 20 local or remote"))!;
       expect(filePrompt).toContain("\"fileId\":\"C1Z1\",\"path\":\"vendor/legacy/deep/path/refund_hook.ts\"");
       expect(filePrompt).toContain("\"codeMatch\":\"refund_hook\"");
     } finally {
@@ -1942,7 +1942,7 @@ describe("workflow gates and readiness", () => {
       });
 
       expect(outcome.status).toBe("completed");
-      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to 20 local or remote"))!;
       const trees = filePrompt.split("COMMIT-PINNED TREES:\n\n")[1]!.split("\n\nACTUAL FILE ID AND PATH LIST:")[0]!;
       expect(JSON.parse(trees)).toEqual([
         { candidateId: "C1", source: "github:org/refunds", commitSha: "a".repeat(40), commitDate: "2025-12-01T00:00:00Z", lastActivityAt: "2026-01-01T00:00:00Z", treeTruncated: false },
@@ -1997,7 +1997,7 @@ describe("workflow gates and readiness", () => {
         },
       });
 
-      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to fifteen local or remote"))!;
+      const filePrompt = prompts.find((prompt) => prompt.startsWith("Choose up to 20 local or remote"))!;
       const list = filePrompt.split("ACTUAL FILE ID AND PATH LIST:\n\n")[1]!.split("\n\nBEGIN HOST-PROVIDED MODULE")[0]!;
       const groups = groupsOf(filePrompt);
       const share = Math.floor((300_000 - groups.length - 1) / groups.length);
@@ -2156,6 +2156,7 @@ describe("evidence requests", () => {
       expect(planIndex).toBeGreaterThan(requestIndex);
       expect(prompts[requestIndex]).not.toContain("settle-ledger-marker");
       expect(prompts[requestIndex]).toContain("ledgerFiller0000");
+      expect(prompts[requestIndex]).toContain("Ask first for the unread files and definitions that the plan would otherwise list as missing context.");
       expect(prompts[planIndex]).toContain("settle-ledger-marker");
       expectPhaseModules(prompts[requestIndex]!, "research");
       expect(sessions[requestIndex]).toBe(sessions[planIndex]!);

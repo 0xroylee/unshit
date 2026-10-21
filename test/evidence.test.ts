@@ -848,8 +848,8 @@ describe("requested evidence", () => {
     ]);
   });
 
-  test("reads at most four unread files that requests name, and only files from the unread list", async () => {
-    const paths = ["src/index.ts", "src/extra-1.ts", "tests/extra-2.test.ts", "src/extra-3.ts", "src/extra-4.ts", "src/extra-5.ts", "src/extra-6.ts"];
+  test("reads at most six unread files that requests name, and only files from the unread list", async () => {
+    const paths = ["src/index.ts", "src/extra-1.ts", "tests/extra-2.test.ts", "src/extra-3.ts", "src/extra-4.ts", "src/extra-5.ts", "src/extra-6.ts", "src/extra-7.ts", "src/extra-8.ts"];
     const repo: RepositorySnapshot = { ...repository(), files: paths.map((filePath, index) => ({ id: `C1R${index + 1}`, path: filePath, size: 100 })) };
     const reader = researcher();
     const loaded = oneSource("src/index.ts", "export const index = 1;");
@@ -867,27 +867,31 @@ describe("requested evidence", () => {
       ["S3", "tests/extra-2.test.ts", "remote", "a".repeat(40), ["test"]],
       ["S4", "src/extra-3.ts", "remote", "a".repeat(40), ["production"]],
       ["S5", "src/extra-4.ts", "remote", "a".repeat(40), ["production"]],
+      ["S6", "src/extra-5.ts", "remote", "a".repeat(40), ["production"]],
+      ["S7", "src/extra-6.ts", "remote", "a".repeat(40), ["production"]],
     ]);
     expect(result.evidence.excerpts.slice(1).map((excerpt) => [excerpt.id, excerpt.sourceId, excerpt.startLine, excerpt.endLine])).toEqual(
-      [2, 3, 4, 5].map((number) => [`E${number}`, `S${number}`, 1, 1]),
+      [2, 3, 4, 5, 6, 7].map((number) => [`E${number}`, `S${number}`, 1, 1]),
     );
-    expect(reader.fetched).toEqual(["src/extra-1.ts", "tests/extra-2.test.ts", "src/extra-3.ts", "src/extra-4.ts"]);
-    expect(result.served).toBe(4);
+    expect(reader.fetched).toEqual(["src/extra-1.ts", "tests/extra-2.test.ts", "src/extra-3.ts", "src/extra-4.ts", "src/extra-5.ts", "src/extra-6.ts"]);
+    expect(result.served).toBe(6);
     expect(result.gaps.map((gap) => gap.message)).toEqual([
       "The model asked for file C1R1; it is not in the unread file list.",
       // The second request for C1R2 comes after the first read it.
       "The model asked for file C1R2; it is not in the unread file list.",
-      "The model asked for file C1R6; at most 4 unread files can be added.",
-      "The model asked for file C1R7; at most 4 unread files can be added.",
+      "The model asked for file C1R8; at most 6 unread files can be added.",
+      "The model asked for file C1R9; at most 6 unread files can be added.",
     ]);
   });
 
-  test("gives the last requested file at most what is left, and records a file whose first line does not fit", async () => {
-    // 10,881 characters are left. Each file of 7,999 characters gets an equal share of what is left among the files
-    // still to read, at most four in all, so each gives only its 30-line head; wide.ts is one line of 20,000 characters.
+  test("gives the last file within the limit at most what is left, and records a file whose first line does not fit", async () => {
+    // 10,881 characters are left for eight requested files, and at most six can be read. Each file of 7,999 characters
+    // gets an equal share of what is left among the files still to read, counting no more files than the limit still
+    // allows: the first three give the first 22 or 23 lines of their head; wide.ts is one line of 20,000 characters and
+    // gives nothing; four.ts and five.ts give their whole 30-line heads; the last two requests are over the limit.
     const loaded = oneSource("src/flow.ts", Array.from({ length: 360 }, (_, index) => `const filler${String(index).padStart(3, "0")} = "${"x".repeat(670)}";`).join("\n"));
     const file = Array.from({ length: 100 }, (_, index) => `const line${String(index).padStart(3, "0")} = "${"w".repeat(60)}";`).join("\n");
-    const paths = ["src/one.ts", "src/two.ts", "src/three.ts", "src/wide.ts", "src/four.ts"];
+    const paths = ["src/one.ts", "src/two.ts", "src/three.ts", "src/wide.ts", "src/four.ts", "src/five.ts", "src/six.ts", "src/seven.ts"];
     const repo: RepositorySnapshot = { ...repository(), files: paths.map((filePath, index) => ({ id: `C1W${index + 1}`, path: filePath, size: 100 })) };
     const content = new Map(paths.map((filePath) => [filePath, filePath === "src/wide.ts" ? "w".repeat(20_000) : file]));
     const result = await addRequestedEvidence(loaded, repo.files.map((entry) => request("file", entry.id)), {
@@ -899,12 +903,13 @@ describe("requested evidence", () => {
     });
     const used = result.evidence.excerpts.reduce((sum, excerpt) => sum + excerpt.text.length, 0);
 
-    expect(result.evidence.excerpts.slice(1).map((excerpt) => [excerpt.sourceId, excerpt.startLine, excerpt.endLine])).toEqual([["S2", 1, 30], ["S3", 1, 30], ["S4", 1, 30]]);
+    expect(result.evidence.excerpts.slice(1).map((excerpt) => [excerpt.sourceId, excerpt.startLine, excerpt.endLine])).toEqual([["S2", 1, 22], ["S3", 1, 22], ["S4", 1, 23], ["S6", 1, 30], ["S7", 1, 30]]);
     expect(used).toBeLessThanOrEqual(EXCERPT_BUDGET);
-    expect(result.served).toBe(3);
+    expect(result.served).toBe(5);
     expect(result.gaps.map((gap) => gap.message)).toEqual([
-      "The model asked for file C1W4; no excerpt of src/wide.ts fit the 3684 characters of its share.",
-      "The model asked for file C1W5; at most 4 unread files can be added.",
+      "The model asked for file C1W4; no excerpt of src/wide.ts fit the 1841 characters of its share.",
+      "The model asked for file C1W7; at most 6 unread files can be added.",
+      "The model asked for file C1W8; at most 6 unread files can be added.",
     ]);
   });
 
