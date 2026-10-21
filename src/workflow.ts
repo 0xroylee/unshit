@@ -16,6 +16,7 @@ import {
   REVIEW_SCHEMA,
   ModelOutputError,
   createPlanDocument,
+  MAX_SELECTED_FILES,
   parseEvidenceRequests,
   parseFileSelection,
   parseCandidateRanking,
@@ -866,6 +867,7 @@ function unreadFileChoices(
 function evidenceRequestPrompt(brief: IntakeBrief, answers: ResolvedAnswer[], evidence: LoadedEvidence, unread: FileChoices["groups"], left: number): string {
   return [
     "Before the plan is written, compare the excerpts below with the brief, and name the source that the plan needs and the excerpts do not show.",
+    "Ask first for the unread files and definitions that the plan would otherwise list as missing context.",
     `Ask for at most 8 items. Kind definition: id is the sourceId of a file already read, and name is the name of a function, class, type or variable in it. Kind lines: id is a sourceId, and startLine and endLine give a 1-based line range of that file. Kind file: id is a fileId from the unread file list, at most ${MAX_REQUESTED_FILES} files.`,
     "Set name to an empty string unless the kind is definition, and startLine and endLine to 0 unless the kind is lines. Give a short reason for each item.",
     `The host adds the items in the order of the list while they fit in ${left} characters, and skips the others. Return an empty list if the plan needs nothing more.`,
@@ -883,7 +885,7 @@ function evidenceRequestPrompt(brief: IntakeBrief, answers: ResolvedAnswer[], ev
 
 function fileSelectionPrompt(brief: IntakeBrief, answers: ResolvedAnswer[], choices: FileChoices): string {
   return [
-    "Choose up to fifteen local or remote production and test files that can answer specific design questions in the brief.",
+    `Choose up to ${MAX_SELECTED_FILES} local or remote production and test files that can answer specific design questions in the brief.`,
     "Use only supplied file IDs and choose role production or test. Select relevant implementation and tests. The host separately reads a bounded project manifest, license, and CI file when present. A remote file ID resolves only to the exact SHA shown for its source in the commit-pinned trees. Never invent paths or claim to have read files.",
     "A codeMatch value lists literal patterns that the host's code search found at that path in Grep's index of the default branch. The path exists in the pinned tree, but the file is not evidence until the host reads it at the pinned commit.",
     "Return only the requested JSON.",

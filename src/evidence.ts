@@ -252,7 +252,7 @@ async function readSource(
 }
 
 // At most this many unread files can be added on request.
-export const MAX_REQUESTED_FILES = 4;
+export const MAX_REQUESTED_FILES = 6;
 
 export interface AddedEvidence {
   // The given evidence with the added sources and excerpts after its own; its `gaps` are the given evidence's.
