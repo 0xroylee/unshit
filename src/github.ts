@@ -420,11 +420,14 @@ export class GitHubResearcher {
         summary.requests += 1;
         return true;
       }, { body: grepRequestBody(this.nextCodeSearchId++, query) });
-      const hits = parseGrepResponse(new TextDecoder().decode(response.bytes), response.headers.get("content-type"));
-      if (!hits) throw new ProviderRequestError({ ...target, category: "invalid_response", attempts: response.attempts, retryRefused: false });
+      const contentType = response.headers.get("content-type");
+      const parsed = parseGrepResponse(new TextDecoder().decode(response.bytes), contentType);
+      if ("problem" in parsed) {
+        throw new ProviderRequestError({ ...target, category: "invalid_response", responseProblem: parsed.problem, contentType: contentType ?? undefined, rpcErrorCode: parsed.rpcErrorCode, attempts: response.attempts, retryRefused: false });
+      }
       record.status = "ok";
-      record.resultCount = hits.length;
-      return hits;
+      record.resultCount = parsed.hits.length;
+      return parsed.hits;
     } catch (error) {
       if (signal?.aborted) return [];
       const failure = requestFailureOf(error, target);
