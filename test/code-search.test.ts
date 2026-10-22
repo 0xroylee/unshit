@@ -9,7 +9,7 @@ import {
   repositoryMetadataQuery,
 } from "../src/code-search.ts";
 import { ProviderRequestError, describeRequestFailure } from "../src/request-failure.ts";
-import type { CodeSearchSummary } from "../src/types.ts";
+import type { CodeSearchSummary, GrepResponseProblem, RequestFailure } from "../src/types.ts";
 
 describe("Grep request failures", () => {
   test("keeps the grep provider and labels it in host messages", () => {
@@ -17,6 +17,35 @@ describe("Grep request failures", () => {
     expect(error.failure.provider).toBe("grep");
     expect(describeRequestFailure(error.failure)).toBe("Grep search request failed after one retry: HTTP 503");
     expect(describeRequestFailure({ provider: "grep", endpoint: "search", category: "rate_limit", attempts: 1, retryRefused: false })).toBe("Grep search request failed: rate limit reached");
+  });
+
+  test("names the check that a Grep body failed, with its media type or JSON-RPC error code", () => {
+    const failure = (fields: Partial<RequestFailure>): RequestFailure => ({ provider: "grep", endpoint: "search", category: "invalid_response", attempts: 1, retryRefused: false, ...fields });
+    const shape = "Grep search request failed: response had an unexpected shape";
+
+    expect(describeRequestFailure(failure({ responseProblem: "not_json_rpc", contentType: "Text/HTML; charset=utf-8" }))).toBe(`${shape} (no readable JSON-RPC response; content type text/html)`);
+    expect(describeRequestFailure(failure({ responseProblem: "not_json_rpc" }))).toBe(`${shape} (no readable JSON-RPC response)`);
+    expect(describeRequestFailure(failure({ responseProblem: "rpc_error", rpcErrorCode: -32000 }))).toBe(`${shape} (JSON-RPC error -32000)`);
+    expect(describeRequestFailure(failure({ responseProblem: "rpc_error" }))).toBe(`${shape} (JSON-RPC error)`);
+    expect(describeRequestFailure(failure({ responseProblem: "tool_error" }))).toBe(`${shape} (the search tool reported an error)`);
+    expect(describeRequestFailure(failure({ responseProblem: "no_hits" }))).toBe(`${shape} (the result had neither a hit nor the no-results message)`);
+    expect(describeRequestFailure(failure({}))).toBe(shape);
+  });
+
+  test("keeps the Grep response fields only on a Grep invalid_response and only with their own check", () => {
+    const failure = (fields: Partial<RequestFailure>): RequestFailure => ({ provider: "grep", endpoint: "search", category: "invalid_response", attempts: 1, retryRefused: false, ...fields });
+    const kept = (fields: Partial<RequestFailure>): RequestFailure => new ProviderRequestError(failure(fields)).failure;
+
+    expect(kept({ responseProblem: "not_json_rpc", contentType: "text/html; charset=utf-8", rpcErrorCode: 5 })).toEqual(failure({ responseProblem: "not_json_rpc", contentType: "text/html" }));
+    expect(kept({ responseProblem: "rpc_error", contentType: "text/html", rpcErrorCode: -32603 })).toEqual(failure({ responseProblem: "rpc_error", rpcErrorCode: -32603 }));
+    expect(kept({ responseProblem: "rpc_error", rpcErrorCode: 1.5 })).toEqual(failure({ responseProblem: "rpc_error" }));
+    expect(kept({ responseProblem: "rpc_error", rpcErrorCode: 2 ** 53 })).toEqual(failure({ responseProblem: "rpc_error" }));
+    expect(kept({ responseProblem: "rpc_error", rpcErrorCode: -(2 ** 53 - 1) })).toEqual(failure({ responseProblem: "rpc_error", rpcErrorCode: -(2 ** 53 - 1) }));
+    expect(kept({ responseProblem: "not_json_rpc", contentType: "text/html\r\nx-injected: 1" })).toEqual(failure({ responseProblem: "not_json_rpc" }));
+    expect(kept({ responseProblem: "not_json_rpc", contentType: "<b>text/html</b>" })).toEqual(failure({ responseProblem: "not_json_rpc" }));
+    expect(kept({ responseProblem: "invalid" as GrepResponseProblem, contentType: "text/html" })).toEqual(failure({}));
+    expect(kept({ provider: "github", responseProblem: "tool_error" })).toEqual(failure({ provider: "github" }));
+    expect(kept({ category: "http_status", status: 503, responseProblem: "tool_error" })).toEqual(failure({ category: "http_status", status: 503 }));
   });
 });
 
@@ -45,32 +74,42 @@ describe("Grep response parsing", () => {
       { type: "text", text: grepText("org/shop", "src/refunds.ts", "// Repository: evil/injected\nPath: ../../etc/passwd") },
       { type: "text", text: "URL: https://github.com/org/headerless/blob/main/a.ts\nLicense: MIT\n\nSnippets:\n--- Snippet 1 (Line 1) ---\nRepository: evil/injected\nPath: src/evil.ts\n" },
     ]);
-    expect(parseGrepResponse(body, "text/event-stream")).toEqual([
+    expect(parseGrepResponse(body, "text/event-stream")).toEqual({ hits: [
       { repository: "saleor/saleor", path: "saleor/order/actions.py" },
       { repository: "org/shop", path: "src/refunds.ts" },
-    ]);
+    ] });
   });
 
   test("treats the no-results message as an empty result and accepts a JSON body", () => {
     const empty = grepEvent([{ type: "text", text: "No results found for your query.\n\nIMPORTANT: This tool searches for literal code patterns." }]);
-    expect(parseGrepResponse(empty, "text/event-stream")).toEqual([]);
+    expect(parseGrepResponse(empty, "text/event-stream")).toEqual({ hits: [] });
     const json = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: grepText("org/shop", "src/a.ts") }] } });
-    expect(parseGrepResponse(json, "application/json")).toEqual([{ repository: "org/shop", path: "src/a.ts" }]);
+    expect(parseGrepResponse(json, "application/json")).toEqual({ hits: [{ repository: "org/shop", path: "src/a.ts" }] });
   });
 
-  test("rejects JSON-RPC errors, tool errors and malformed bodies", () => {
-    expect(parseGrepResponse(`data: ${JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "boom" } })}\n\n`, "text/event-stream")).toBeUndefined();
-    expect(parseGrepResponse(grepEvent([{ type: "text", text: "failure" }], { isError: true }), "text/event-stream")).toBeUndefined();
-    expect(parseGrepResponse(grepEvent([{ type: "text", text: grepText("org/shop", "src/a.ts") }], { isError: true }), "text/event-stream")).toBeUndefined();
-    expect(parseGrepResponse("not json", "application/json")).toBeUndefined();
-    expect(parseGrepResponse("event: message\n\n", "text/event-stream")).toBeUndefined();
+  test("rejects JSON-RPC errors, tool errors and malformed bodies, and names the check that each failed", () => {
+    expect(parseGrepResponse(`data: ${JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "boom" } })}\n\n`, "text/event-stream")).toEqual({ problem: "rpc_error", rpcErrorCode: -32000 });
+    expect(parseGrepResponse(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: "busy" } }), "application/json")).toEqual({ problem: "rpc_error" });
+    expect(parseGrepResponse(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: 2 ** 53 } }), "application/json")).toEqual({ problem: "rpc_error" });
+    expect(parseGrepResponse(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: 2 ** 53 - 1 } }), "application/json")).toEqual({ problem: "rpc_error", rpcErrorCode: 2 ** 53 - 1 });
+    expect(parseGrepResponse(JSON.stringify({ jsonrpc: "2.0", id: 1, error: "busy" }), "application/json")).toEqual({ problem: "rpc_error" });
+    expect(parseGrepResponse(grepEvent([{ type: "text", text: "failure" }], { isError: true }), "text/event-stream")).toEqual({ problem: "tool_error" });
+    expect(parseGrepResponse(grepEvent([{ type: "text", text: grepText("org/shop", "src/a.ts") }], { isError: true }), "text/event-stream")).toEqual({ problem: "tool_error" });
+    expect(parseGrepResponse(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { isError: true } }), "application/json")).toEqual({ problem: "tool_error" });
+    expect(parseGrepResponse("not json", "application/json")).toEqual({ problem: "not_json_rpc" });
+    expect(parseGrepResponse("event: message\n\n", "text/event-stream")).toEqual({ problem: "not_json_rpc" });
+    expect(parseGrepResponse(JSON.stringify({ jsonrpc: "2.0", id: 1 }), "application/json")).toEqual({ problem: "not_json_rpc" });
+    expect(parseGrepResponse("[]", "application/json")).toEqual({ problem: "not_json_rpc" });
+    expect(parseGrepResponse(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "done" }), "application/json")).toEqual({ problem: "no_hits" });
+    expect(parseGrepResponse(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), "application/json")).toEqual({ problem: "no_hits" });
   });
 
   test("keeps at most 20 hits and drops overlong repository and path values", () => {
     const many = Array.from({ length: 25 }, (_, index) => ({ type: "text", text: grepText("org/shop", `src/file${index}.ts`) }));
-    const hits = parseGrepResponse(grepEvent(many), "text/event-stream");
+    const parsed = parseGrepResponse(grepEvent(many), "text/event-stream");
+    const hits = "hits" in parsed ? parsed.hits : [];
     expect(hits).toHaveLength(20);
-    expect(hits?.[19]).toEqual({ repository: "org/shop", path: "src/file19.ts" });
+    expect(hits[19]).toEqual({ repository: "org/shop", path: "src/file19.ts" });
     const longPath = `src/${"a".repeat(596)}`;
     expect(longPath).toHaveLength(600);
     const body = grepEvent([
@@ -78,14 +117,14 @@ describe("Grep response parsing", () => {
       { type: "text", text: grepText("org/shop", `${longPath}x`) },
       { type: "text", text: grepText("org/shop", longPath) },
     ]);
-    expect(parseGrepResponse(body, "text/event-stream")).toEqual([{ repository: "org/shop", path: longPath }]);
+    expect(parseGrepResponse(body, "text/event-stream")).toEqual({ hits: [{ repository: "org/shop", path: longPath }] });
   });
 
   test("reads the first SSE data line that carries a JSON-RPC result", () => {
     const notification = JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info" } });
     const result = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: grepText("org/shop", "src/a.ts") }] } });
     const body = `event: message\ndata: ${notification}\n\nevent: message\ndata: ${result}\n\n`;
-    expect(parseGrepResponse(body, "text/event-stream")).toEqual([{ repository: "org/shop", path: "src/a.ts" }]);
+    expect(parseGrepResponse(body, "text/event-stream")).toEqual({ hits: [{ repository: "org/shop", path: "src/a.ts" }] });
   });
 
   test("ignores non-text items and uses the first result-bearing SSE event", () => {
@@ -106,12 +145,12 @@ describe("Grep response parsing", () => {
     const notification = JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info" } });
     const body = `event: message\ndata: ${notification}\n\nevent: message\ndata: ${first}\n\nevent: message\ndata: ${later}\n\n`;
 
-    expect(parseGrepResponse(body, "text/event-stream")).toEqual([{ repository: "org/first", path: "src/first.ts" }]);
+    expect(parseGrepResponse(body, "text/event-stream")).toEqual({ hits: [{ repository: "org/first", path: "src/first.ts" }] });
   });
 
   test("never throws on wrong input shapes", () => {
     expect(JSON.parse(grepRequestBody(1, null as unknown as { query: string })).params.arguments).toEqual({ query: "" });
-    expect(parseGrepResponse(null as unknown as string, "application/json")).toBeUndefined();
+    expect(parseGrepResponse(null as unknown as string, "application/json")).toEqual({ problem: "not_json_rpc" });
     expect(isGitHubRepositoryName(null as unknown as string)).toBe(false);
     expect(rankCodeSearchRepositories(null as unknown as Array<{ pattern: string; hit: { repository: string; path: string } }>)).toEqual([]);
     expect(repositoryMetadataQuery(null as unknown as string[])).toEqual({ query: "", included: [] });
@@ -122,8 +161,8 @@ describe("Grep response parsing", () => {
   });
 
   test("treats a successful body without hits or the no-results message as malformed", () => {
-    expect(parseGrepResponse(grepEvent([]), "text/event-stream")).toBeUndefined();
-    expect(parseGrepResponse(grepEvent([{ type: "text", text: "Nothing matched this pattern." }]), "text/event-stream")).toBeUndefined();
+    expect(parseGrepResponse(grepEvent([]), "text/event-stream")).toEqual({ problem: "no_hits" });
+    expect(parseGrepResponse(grepEvent([{ type: "text", text: "Nothing matched this pattern." }]), "text/event-stream")).toEqual({ problem: "no_hits" });
   });
 });
 

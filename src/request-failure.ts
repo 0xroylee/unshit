@@ -1,4 +1,4 @@
-import type { RequestEndpoint, RequestFailure, RequestFailureCategory } from "./types.ts";
+import type { GrepResponseProblem, RequestEndpoint, RequestFailure, RequestFailureCategory } from "./types.ts";
 
 export type RequestTarget = Pick<RequestFailure, "provider" | "endpoint"> & { page?: number };
 
@@ -26,6 +26,7 @@ const CATEGORIES = [
   "invalid_request",
   "internal",
 ] as const;
+const RESPONSE_PROBLEMS = ["not_json_rpc", "rpc_error", "tool_error", "no_hits"] as const;
 
 export class ProviderRequestError extends Error {
   readonly failure: RequestFailure;
@@ -87,7 +88,7 @@ export function describeRequestFailure(failure: RequestFailure): string {
       case "invalid_json":
         return `${label} failed${retry}: response was not valid JSON${retryRefused}`;
       case "invalid_response":
-        return `${label} failed${retry}: response had an unexpected shape${retryRefused}`;
+        return `${label} failed${retry}: response had an unexpected shape${describeResponseProblem(safeFailure)}${retryRefused}`;
       case "network":
         return `${label} failed${retry}: no response (network failure)${retryRefused}`;
       case "cancelled":
@@ -105,8 +106,23 @@ export function describeRequestFailure(failure: RequestFailure): string {
   }
 }
 
+function describeResponseProblem(failure: RequestFailure): string {
+  switch (failure.responseProblem) {
+    case "not_json_rpc":
+      return ` (no readable JSON-RPC response${failure.contentType === undefined ? "" : `; content type ${failure.contentType}`})`;
+    case "rpc_error":
+      return ` (JSON-RPC error${failure.rpcErrorCode === undefined ? "" : ` ${failure.rpcErrorCode}`})`;
+    case "tool_error":
+      return " (the search tool reported an error)";
+    case "no_hits":
+      return " (the result had neither a hit nor the no-results message)";
+    default:
+      return "";
+  }
+}
+
 function normalizeFailure(failure: RequestFailure): RequestFailure {
-  let read: Record<"provider" | "endpoint" | "category" | "status" | "limitBytes" | "page" | "attempts" | "retryRefused", unknown>;
+  let read: Record<"provider" | "endpoint" | "category" | "status" | "limitBytes" | "page" | "responseProblem" | "contentType" | "rpcErrorCode" | "attempts" | "retryRefused", unknown>;
   try {
     const source = failure as unknown as Record<string, unknown> | null | undefined;
     read = {
@@ -116,6 +132,9 @@ function normalizeFailure(failure: RequestFailure): RequestFailure {
       status: source?.status,
       limitBytes: source?.limitBytes,
       page: source?.page,
+      responseProblem: source?.responseProblem,
+      contentType: source?.contentType,
+      rpcErrorCode: source?.rpcErrorCode,
       attempts: source?.attempts,
       retryRefused: source?.retryRefused,
     };
@@ -143,6 +162,12 @@ function normalizeFailure(failure: RequestFailure): RequestFailure {
     normalized.limitBytes = read.limitBytes as number;
   }
   if (endpoint === "tree" && provider === "gitlab" && isValidPage(read.page)) normalized.page = read.page;
+  if (category === "invalid_response" && provider === "grep" && isResponseProblem(read.responseProblem)) {
+    normalized.responseProblem = read.responseProblem;
+    const mediaType = read.responseProblem === "not_json_rpc" ? mediaTypeOf(read.contentType) : undefined;
+    if (mediaType !== undefined) normalized.contentType = mediaType;
+    if (read.responseProblem === "rpc_error" && Number.isSafeInteger(read.rpcErrorCode)) normalized.rpcErrorCode = read.rpcErrorCode as number;
+  }
   return Object.freeze(normalized);
 }
 
@@ -160,4 +185,15 @@ function isCategory(value: unknown): value is RequestFailureCategory {
 
 function isValidPage(value: unknown): value is number {
   return Number.isInteger(value) && typeof value === "number" && value >= 1;
+}
+
+function isResponseProblem(value: unknown): value is GrepResponseProblem {
+  return typeof value === "string" && (RESPONSE_PROBLEMS as readonly string[]).includes(value);
+}
+
+// The type and subtype of a Content-Type value in lower case, when both are RFC 6838 restricted names.
+function mediaTypeOf(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const mediaType = value.split(";")[0]!.trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/.test(mediaType) ? mediaType : undefined;
 }

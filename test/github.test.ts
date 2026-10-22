@@ -396,6 +396,9 @@ describe("GitHub and GitLab repository research", () => {
       { field: "status", base: { provider: "github", endpoint: "search", category: "http_status", status: 503, attempts: 1, retryRefused: false } },
       { field: "limitBytes", base: { provider: "github", endpoint: "source", category: "size_limit", limitBytes: 1_000_001, attempts: 1, retryRefused: false } },
       { field: "page", base: { provider: "gitlab", endpoint: "tree", category: "network", page: 2, attempts: 1, retryRefused: false } },
+      { field: "responseProblem", base: { provider: "grep", endpoint: "search", category: "invalid_response", responseProblem: "tool_error", attempts: 1, retryRefused: false } },
+      { field: "contentType", base: { provider: "grep", endpoint: "search", category: "invalid_response", responseProblem: "not_json_rpc", contentType: "text/html", attempts: 1, retryRefused: false } },
+      { field: "rpcErrorCode", base: { provider: "grep", endpoint: "search", category: "invalid_response", responseProblem: "rpc_error", rpcErrorCode: -32000, attempts: 1, retryRefused: false } },
       { field: "attempts", base: { provider: "github", endpoint: "search", category: "network", attempts: 2, retryRefused: false } },
       { field: "retryRefused", base: { provider: "github", endpoint: "search", category: "network", attempts: 2, retryRefused: true } },
     ];
@@ -1774,9 +1777,35 @@ describe("Grep code search", () => {
 
     expect(grepCalls).toHaveLength(1);
     expect(discovery.research.codeSearch?.queries.map((query) => query.status)).toEqual(["failed", "skipped"]);
-    expect(discovery.research.codeSearch?.queries[0]?.failure?.category).toBe("invalid_response");
-    expect(discovery.research.codeSearch?.queries[0]?.failure?.provider).toBe("grep");
-    expect(discovery.gaps).toEqual([{ kind: "search", material: false, message: "Grep search request failed: response had an unexpected shape; code search stopped for this run." }]);
+    expect(discovery.research.codeSearch?.queries[0]?.failure).toEqual({ provider: "grep", endpoint: "search", category: "invalid_response", responseProblem: "not_json_rpc", contentType: "text/event-stream", attempts: 1, retryRefused: false });
+    expect(discovery.gaps).toEqual([{ kind: "search", material: false, message: "Grep search request failed: response had an unexpected shape (no readable JSON-RPC response; content type text/event-stream); code search stopped for this run." }]);
+  });
+
+  test("records why a Grep body failed, and none of its text, in the query record and the gap", async () => {
+    const marker = "MARKER_VALUE_0123456789";
+    const event = (payload: Record<string, unknown>): string => `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: 1, ...payload })}\n\n`;
+    const cases: Array<{ body: string; contentType: string; failure: Partial<RequestFailure>; reason: string }> = [
+      { body: `<html>${marker}</html>`, contentType: "text/html; charset=utf-8", failure: { responseProblem: "not_json_rpc", contentType: "text/html" }, reason: "no readable JSON-RPC response; content type text/html" },
+      { body: event({ error: { code: -32603, message: marker } }), contentType: "text/event-stream", failure: { responseProblem: "rpc_error", rpcErrorCode: -32603 }, reason: "JSON-RPC error -32603" },
+      { body: event({ result: { isError: true, content: [{ type: "text", text: marker }] } }), contentType: "text/event-stream", failure: { responseProblem: "tool_error" }, reason: "the search tool reported an error" },
+      { body: event({ result: { content: [{ type: "text", text: marker }] } }), contentType: "text/event-stream", failure: { responseProblem: "no_hits" }, reason: "the result had neither a hit nor the no-results message" },
+    ];
+
+    for (const entry of cases) {
+      const { fetch, grepCalls } = codeSearchFetch({
+        grep: () => new Response(entry.body, { status: 200, headers: { "content-type": entry.contentType } }),
+        github: () => json({ items: [searchItem("org/refunds-a", 250, "Refund workflow service")] }),
+      });
+      const researcher = new GitHubResearcher({ fetch, now: () => NOW, codeSearch: true, minimumPassing: 1, searchTiers: [{ tier: 0, minStars: 200, maxMonthsSincePush: 12 }] });
+
+      const discovery = await researcher.discover({ ...material, codePatterns: ["OrderRefund", "refund_amount"] });
+
+      expect(grepCalls).toHaveLength(1);
+      expect(discovery.research.codeSearch?.queries.map((query) => query.status)).toEqual(["failed", "skipped"]);
+      expect(discovery.research.codeSearch?.queries[0]?.failure).toEqual({ provider: "grep", endpoint: "search", category: "invalid_response", ...entry.failure, attempts: 1, retryRefused: false });
+      expect(discovery.gaps).toEqual([{ kind: "search", material: false, message: `Grep search request failed: response had an unexpected shape (${entry.reason}); code search stopped for this run.` }]);
+      expect(JSON.stringify(discovery)).not.toContain(marker);
+    }
   });
 
   test("keeps at most 20 code matches for one repository", async () => {
