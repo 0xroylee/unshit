@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stderr, stdout } from "node:process";
@@ -9,6 +10,7 @@ import { runWorkflow } from "./workflow.ts";
 import { createRunId, writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts } from "./storage.ts";
 import { REFERENCE_POLICY_HASH } from "./instructions.ts";
 import { stableMaterialQuestionId } from "./model-schema.ts";
+import { SKILL_NAME, defaultSkillTargets, installSkill, type SkillTarget } from "./skill-install.ts";
 import type { MaterialQuestion, ProgressEvent, RunOutcome } from "./types.ts";
 
 interface CliArguments {
@@ -22,6 +24,9 @@ interface CliArguments {
   json: boolean;
   jsonl: boolean;
   help: boolean;
+  installSkill: boolean;
+  skillDir?: string;
+  force: boolean;
 }
 
 class CliError extends Error {
@@ -41,6 +46,9 @@ export function parseCliArguments(argv: string[]): CliArguments {
   let json = false;
   let jsonl = false;
   let help = false;
+  let installSkillFlag = false;
+  let skillDir: string | undefined;
+  let force = false;
   const positional: string[] = [];
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -51,8 +59,10 @@ export function parseCliArguments(argv: string[]): CliArguments {
     }
     if (token === "--json") { json = true; continue; }
     if (token === "--jsonl") { jsonl = true; continue; }
+    if (token === "--install-skill") { installSkillFlag = true; continue; }
+    if (token === "--force") { force = true; continue; }
     const [name, inlineValue] = token.startsWith("--") && token.includes("=") ? [token.slice(0, token.indexOf("=")), token.slice(token.indexOf("=") + 1)] : [token, undefined];
-    if (["--cwd", "--out", "--answers", "--model", "--effort", "--turn-timeout"].includes(name)) {
+    if (["--cwd", "--out", "--answers", "--model", "--effort", "--turn-timeout", "--skill-dir"].includes(name)) {
       const value = inlineValue ?? argv[++index];
       if (!value || value.startsWith("--")) throw new CliError(`${name} needs a value.`);
       if (name === "--cwd") cwd = value;
@@ -61,6 +71,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
       if (name === "--model") model = value;
       if (name === "--effort") effort = value;
       if (name === "--turn-timeout") turnTimeoutSeconds = parseTurnTimeout(value);
+      if (name === "--skill-dir") skillDir = value;
       continue;
     }
     if (token.startsWith("-")) throw new CliError(`Unknown option: ${token}`);
@@ -68,6 +79,14 @@ export function parseCliArguments(argv: string[]): CliArguments {
   }
 
   if (json && jsonl) throw new CliError("Use either --json or --jsonl, not both.");
+  if (installSkillFlag) {
+    if (positional.length > 0 || cwd || out || answers || model || effort || turnTimeoutSeconds !== undefined) {
+      throw new CliError("--install-skill runs on its own; it does not take a requirement or planning options.");
+    }
+    if (jsonl) throw new CliError("Use --json with --install-skill.");
+    return { requirement: "", json, jsonl, help, installSkill: true, ...(skillDir ? { skillDir } : {}), force };
+  }
+  if (skillDir || force) throw new CliError("--skill-dir and --force work only with --install-skill.");
   if (effort && !["minimal", "low", "medium", "high", "xhigh"].includes(effort)) {
     throw new CliError("--effort must be minimal, low, medium, high, or xhigh.");
   }
@@ -75,7 +94,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
   if (["resume", "refs", "export"].includes(positional[0]?.toLowerCase() ?? "")) {
     throw new CliError("This CLI accepts one software requirement and produces a plan. Start with a quoted requirement.");
   }
-  return { requirement: positional.join(" "), cwd, out, answers, model, effort, turnTimeoutSeconds, json, jsonl, help };
+  return { requirement: positional.join(" "), cwd, out, answers, model, effort, turnTimeoutSeconds, json, jsonl, help, installSkill: false, force: false };
 }
 
 function parseTurnTimeout(value: string): number {
@@ -103,6 +122,26 @@ export function exitCodeFor(outcome: RunOutcome, aborted: boolean): number {
   return 0;
 }
 
+async function runInstallSkill(args: CliArguments): Promise<number> {
+  const targets: SkillTarget[] = args.skillDir
+    ? [{ agent: "custom", skillsRoot: path.resolve(args.skillDir) }]
+    : await defaultSkillTargets(os.homedir(), process.env);
+  if (targets.length === 0) {
+    return writeCliError("No Claude Code (~/.claude) or Codex (~/.codex, ~/.agents) folder was found. Pass --skill-dir <skills folder> to choose one.", args.json, false);
+  }
+  const results = await installSkill(targets, { force: args.force });
+  const failed = results.some((result) => result.status === "failed");
+  if (args.json) {
+    stdout.write(`${JSON.stringify({ status: failed ? "error" : "ok", skill: SKILL_NAME, results })}\n`);
+  } else {
+    for (const result of results) {
+      const line = `${result.status.padEnd(9)} ${result.agent.padEnd(6)} ${result.path}${result.reason ? ` (${result.reason})` : ""}\n`;
+      (result.status === "failed" ? stderr : stdout).write(line);
+    }
+  }
+  return failed ? 1 : 0;
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   let args: CliArguments;
   try {
@@ -114,6 +153,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     stdout.write(helpText());
     return 0;
   }
+  if (args.installSkill) return runInstallSkill(args);
 
   const cwd = path.resolve(args.cwd ?? process.cwd());
   try {
@@ -335,6 +375,15 @@ export function helpText(): string {
     "  --json                Emit one JSON result object",
     "  --jsonl               Emit progress and result as JSON Lines",
     "  --help                Show this help",
+    "",
+    "unshit --install-skill [--skill-dir <dir>] [--force] [--json]",
+    "",
+    "Install the unshit agent skill (how to run unshit and implement from its plans)",
+    "into ~/.claude/skills/unshit (Claude Code), and into $CODEX_HOME/skills/unshit",
+    "(default ~/.codex/skills) and ~/.agents/skills/unshit (Codex), for the agent",
+    "folders found on this machine.",
+    "  --skill-dir <dir>     Install into this skills folder instead",
+    "  --force               Replace an existing unshit skill that unshit did not install",
     "",
     "The default report and evidence manifest are saved under .unshit/<run-id>/.",
     "Missing material answers return needs_input with exit code 2. A model turn that times out returns 124. Ctrl+C returns 130.",

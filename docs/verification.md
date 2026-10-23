@@ -237,6 +237,17 @@ Codex 先回应错误、随后进程退出、而回应仍在 stdout 缓冲区时
 
 这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求。
 
+## agent skill 安装验证（2026-10-22）
+
+`install.sh` 和 `unshit --install-skill` 来自 2026-10-12 未提交的 stale-puma 工作区，这次移植到当前代码。skill 写入 Claude Code 的 skills 目录，以及 Codex 的 `$CODEX_HOME/skills`（默认 `~/.codex/skills`）和 `~/.agents/skills`；skill 文字补上退出码 124、`--turn-timeout`、`research.selected` 和 Grep 需要的网络访问。README 只写克隆仓库后运行 `./install.sh`。测试只在临时目录里安装 skill；`install.sh` 只测试了语法、可执行权限、`--help` 和参数错误，生产安装和开发安装需要联网和 `bun install`，这次没有运行。
+
+| 检查 | 结果 |
+| --- | --- |
+| `bun run check` | 332 项通过，0 失败，1835 次 expect |
+| 变异测试 | `run-mutants.ts` 对 313 个变异逐一运行，313 个 KILLED |
+
+这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求，也没有在真实的 home 目录安装 skill。
+
 ## 未执行的环境
 
 Linux 原生运行尚未验证。读取上游源码和测试文件不代表执行了上游测试，也不代表已验证目标业务系统。

@@ -18,6 +18,7 @@ turn / interrupt                                  v
 | 文件 | 职责 |
 | --- | --- |
 | [cli.ts](../src/cli.ts) | 参数、终端澄清、ASCII 进度、JSON/JSONL 和退出码 |
+| [skill-install.ts](../src/skill-install.ts) | 内嵌 unshit agent skill（`src/resources/unshit-skill/SKILL.md`），写入 Claude Code 的 skills 目录和 Codex 的两个 skills 目录（`$CODEX_HOME/skills`、`~/.agents/skills`）；先写临时文件再改名；不覆盖非 unshit 安装的同名 skill（除非 `--force`）；`unshit` 文件夹或 `SKILL.md` 是符号链接时不跟随，skills 目录本身或更上层的符号链接照常跟随 |
 | [workflow.ts](../src/workflow.ts) | 需求门槛、答复后的 brief 重建、候选预排序、筛选与选择、读取、计划生成、独立复核与有界修正、超时结果与检查点 |
 | [app-server.ts](../src/app-server.ts) | 原生双向 RPC、活动回合关联、最终文本、取消、空闲与总时长超时、失败原因和进程清理 |
 | [github.ts](../src/github.ts) | host-built GitHub 查询、Grep 代码搜索、质量门槛、固定提交树验证与 GitLab 官方 API 回退 |
