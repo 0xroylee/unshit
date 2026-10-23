@@ -8,6 +8,7 @@
     "unshit": "dist/unshit"
   },
   "scripts": {
+    "dev": "bun src/cli.ts",
     "check": "bun run typecheck && bun test",
     "typecheck": "tsc --noEmit",
     "test": "bun test",

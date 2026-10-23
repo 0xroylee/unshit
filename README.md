@@ -24,6 +24,30 @@ prompt
 
 模型通过本机 Codex App Server 使用已有登录。CLI 负责读取参考代码、校验证据与保存结果，Codex 负责模型回合和会话。输出的是实施计划。
 
+## 安装
+
+需要 git、Bun 1.3 或更新版本，以及已登录的 Codex CLI（`codex login`）。
+
+```sh
+git clone https://github.com/0xroylee/unshit.git
+cd unshit
+
+# 生产安装：从 --ref（默认 main）的干净克隆构建 unshit，并安装到 ~/.local/bin
+./install.sh
+
+# 开发安装：在这个仓库里安装依赖、运行检查，并安装直接运行源码的 unshit-dev
+./install.sh --dev
+```
+
+两种模式安装完成后都会执行 `--install-skill`，安装 unshit 的 agent skill：Claude Code 的目录存在时装到 `~/.claude/skills/unshit`（或 `$CLAUDE_CONFIG_DIR/skills/unshit`）；Codex 的目录存在时装到 `$CODEX_HOME/skills/unshit`（默认 `~/.codex/skills`）；Codex 的目录或 `~/.agents` 存在时，也装到 `~/.agents/skills/unshit`。之后在 Claude Code 或 Codex 中提出“用 unshit 规划一个售票系统”，agent 可以按 skill 的说明运行 unshit，把澄清问题交给你，再按计划和固定版本的参考代码实施。`./install.sh --help` 列出 `--ref`、`--bin-dir`、`--no-skill` 等选项。
+
+也可以单独安装或更新 skill：
+
+```sh
+unshit --install-skill                     # 本机已有的 agent
+unshit --install-skill --skill-dir <目录>   # 指定 skills 目录
+```
+
 ## 从源码运行
 
 需要 Bun 和已登录的 Codex CLI。已验证环境记录见 [验证报告](docs/verification.md)。
@@ -36,6 +60,14 @@ bun run build
 ```
 
 编译后的 `dist/unshit` 内含 Bun 运行时和规划规则。可将这个文件放入自己的 PATH；运行时仍需能找到本机 `codex`。
+
+开发时不必构建，可直接运行源码：
+
+```sh
+bun run dev "构建一个面向单团队的活动售票系统" --cwd ../my-project
+```
+
+`bun run dev` 在仓库根目录执行，所以要用 `--cwd` 指定目标项目；`--cwd` 和 `--answers` 的相对路径按仓库根目录解析，`--out` 的相对路径按 `--cwd` 解析。要在任意目录直接运行源码，用 `./install.sh --dev` 安装的 `unshit-dev`。
 
 ## 使用
 
@@ -88,8 +120,9 @@ bun run build
 ## 开发与核验
 
 ```sh
-bun run check
-bun run build
+bun run dev "<需求>" --cwd <目标项目>   # 直接运行源码
+bun run check                           # 类型检查与测试
+bun run build                           # 编译 dist/unshit
 ```
 
 协议、需求门槛、源码校验、失败处理和机器输出通过公开接口夹具测试。真实登录与模型 smoke 单独记录，以免把测试夹具等同于真实服务验证。
