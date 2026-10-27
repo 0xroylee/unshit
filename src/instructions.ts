@@ -18,6 +18,7 @@ Workflow limits:
 - Keep repository discovery bounded to the supplied public GitHub or GitLab search results. The host resolves exact commits, tree paths, files, hashes, line ranges, and links.
 - The host may run grep.app code searches itself. A codeMatch, codeMatchedFiles, or codePatterns value only marks where to look; a file becomes evidence only after the host reads it at the pinned commit.
 - Verification commands may only use host-supplied command IDs for commands found in the target project's inspected files. New commands must be marked as work to create.
+- The host handles brief approval. When a run starts from an answers file in which the user approved the brief, the host uses that brief as approved. Otherwise, only in an interactive terminal run does the host show the final requirements and acceptance criteria to the user and record whether they approved them; in other runs the host asks nothing, keeps the plan Draft, and saves the brief in an answers file where the user can approve it for a rerun. Do not ask for the host's brief approval as a material question.
 - Do not implement or modify the target application. Include the needed architecture, module/interface, and data design in the evidence-backed implementation plan.`;
 
 export type ReferencePlanPhase = "intake" | "research" | "planning" | "review";

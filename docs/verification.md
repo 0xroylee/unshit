@@ -248,6 +248,73 @@ Codex 先回应错误、随后进程退出、而回应仍在 stdout 缓冲区时
 
 这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求，也没有在真实的 home 目录安装 skill。
 
+## Trusted, not checked 一节验证（2026-10-25）
+
+plan.md 在“Checks performed”之后新增“Trusted, not checked”一节，写明计划信任但 host 没有核对的内容，参照 PDD Kit PR 的 Trusted 与 Limitations 两行。“Checks performed”原来写“validated citations against source line ranges”，实际只核对摘录 ID 和参考比较的仓库提交，现在改成实际做的检查。这一项本身没有新增存储字段，也没有改规则包；其他几项新增的字段、加进这一节的行和规则包的变化见各自一节。
+
+复核后补的测试：模型没有选中的候选仓库（`decidedBy: "model"`、`outcome: "rejected"`）和 host 排除的仓库一样不出现在这一节；只有 `production` 角色计为实现文件，许可证、manifest 和 ci 文件不计入；GitLab 仓库按提供方和仓库匹配读取的文件，同路径的 GitHub 仓库的文件不计入；GitLab 报告了创建日期时照写；错误实现个数跨任务累加，参考测试摘录个数跨模式累加。措辞也改了三处：引用一行与“Checks performed”一致，写明引用的参考测试还要来自 host 读作测试的文件；测试路径数来自 host 收到的文件树列表，列表被截断时（另有缺口记录）只是下限；本地源码的 SHA-256 是遮蔽凭证之后的内容的哈希。
+
+这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求。
+
+## 具名错误实现验证（2026-10-25）
+
+借鉴 PDD Kit PR #4 的做法：14 个单子句变异各自让对应子句失败，说明没有空转的子句。现在计划的每个验证方法为它覆盖的每条验收写出至少一个错误实现和预期的失败，host 校验覆盖关系、数量和长度并编号；plan.md 在验证下面列出，每个任务有一句 Done when，“Trusted, not checked”写出错误实现的个数并说明没有应用或运行。新测试为每条规则命名了要拒绝的变异；例如把 `rejectsMutants` 的最少项数从 1 改成 0，空数组仍会因为 A1 没有错误实现而失败，所以测试断言完整的错误消息。
+
+复核后补的测试：缺少错误实现的验收排在覆盖列表的第一位或中间时同样被拒绝，同一验收写两次不能顶替另一条；错误消息里的验证序号是它的实际位置；existing 命令验证下面同样列出错误实现；复核提示和复核修正提示里的计划 JSON 带 host 编号的 `rejectsMutants`。规划提示写明 host 的上限：每个验证最多 24 个错误实现，两段文字各最多 500 个字符，`acceptanceId` 必须是这个验证覆盖的 A* ID，`untestedReason` 最多 700 个字符，`testEvidence` 只引用同一参考仓库固定提交里角色为 test 的来源。
+
+这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求；计划里的错误实现也没有被应用或运行。
+
+## 参考测试引用验证（2026-10-25）
+
+- 计划 schema 的采用模式加入 `testEvidence` 和 `untestedReason`。新测试检查：测试摘录来自同一仓库、同一提交，而且 host 记为测试文件时，解析保留它；生产文件摘录、另一个参考仓库的测试摘录都被拒绝，错误信息写明原因；两者都没有、两者都有、原因只有空白或测试引用超过 6 个时也被拒绝。schema 测试固定了 `testEvidence` 每一项的结构，与生产证据引用相同。
+- 所有采用模式都没有引用参考测试时，计划为 Draft，缺口列表和 readinessNotes 都有这条重大缺口，第一次复核的提示里能看到它。这两个 Draft 测试都批准了 brief，readinessNotes 只有这一条，Draft 只来自这条缺口。复核修正引用了参考测试后，后续复核看不到这条缺口，计划为 Ready；修正后仍没有引用时，后续复核仍然看到它，缺口只记一次。复核中途被中断或超时时，保存的检查点的缺口列表与计划的 readinessNotes 一致，都有或都没有这条缺口；正常结束时最后的检查点只记一次。第二个参考比较里有一个模式引用了测试就够了。没有参考比较时不加这条缺口。
+- 原先结束于 Ready 的 workflow 测试仍为 Ready：夹具计划的采用模式引用参考仓库测试文件的摘录 E2；读取失败、E2 不是测试摘录的测试改用 `untestedReason`。
+- 模型把生产文件选为测试时，host 不给它 `test` 角色；计划把这个文件的摘录作为参考测试引用时被校验拒绝，拒绝原因记入校验历史。规划、复核和复核修正收到的来源登记都带每个来源的 `roles`。
+- 报告在每个采用模式下写出 `Reference test (read, not run)` 加引用，或 `No reference test` 加原因，有参考测试的模式下面没有 `No reference test`；“Trusted, not checked”写出引用的不同参考测试摘录个数，同一摘录引用多次只算一个，并说明 host 只按路径名认定测试文件。
+- 规则包摘要改变，旧的补答文件需要重新生成。
+
+这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求。参考测试只读取，没有运行。
+
+## brief 批准与要求来源验证（2026-10-25）
+
+PDD Kit 的意图对照表把起草的性质和“你说的原话”并列，规格获批后才进入证明；Chopin 只允许人批准草稿。现在 brief 定稿后、参考检索之前由人批准要求与验收，每条要求标出原话或推断，`Ready` 需要这条批准。测试用假模型和假研究器验证：终端批准发生在补答之后、本地扫描之前，批准记录带摘要、方式和注入的时间；拒绝时返回 `needs_input`，没有发出搜索；脚本运行完成为 Draft 并写出 `approveBrief: false` 的补答文件；带 `approveBrief: true` 的补答文件跳过需求提取、补答和重建，可以达到 Ready；引文只有归一化后至少 4 个码位且出现在用户文本里才算原话。原先结束于 Ready 的测试加上终端批准后仍为 Ready。brief 重建块缩进了两格，旧变异目录里的 WT12 按新的缩进更新了查找文本。
+
+复核后的修改：`approveBrief` 为 true 而 request 里有问题没有答案时，读取补答文件失败，并列出没有答案的问题 ID；`approveBrief` 为 true 而没有 brief 时也失败。从补答文件批准的运行，plan.md 的范围一节写 `Approved brief (from the answers file)`，不再把批准的摘要标成初始摘要；终端批准在“Brief approval”和“Trusted, not checked”两节写成在交互终端输入的 yes，host 分辨不出是谁。新测试还检查：完成结果的补答文件写入失败时结果仍为完成；引文先去掉首尾空白再算码位；带 brief 的补答文件同样按目录绑定；终端显示和可编辑 brief 带上非空的排除项和假设。
+
+终端里的批准提示没有在真实终端中运行。从 `main()` 抽出的部分有测试：`terminalPrompts` 只在交互运行时提供补答提问和批准（`--json`、`--jsonl`、stdin 或 stderr 不是终端时都没有）；`createBriefApprover` 只认 `yes`，显示的 brief 含摘要、带来源标签的 R*/A*、排除项和假设；`createTerminalAsk` 在内存流上的终端 readline 里，按 Ctrl+C（提示处或两次提示之间）或输入结束时中断运行，等待中的提问随即失败，运行自己关闭提示时不中断；两次提问共用一个 readline，运行关闭提示时它随之关闭；输入在一次回答之后结束时，下一次提问中断运行并以 AbortError 失败；`runWithAnswers` 把读入的答案交给 workflow 和之后的补答文件。workflow 测试在补答提问或批准提示处中止时结果为 `interrupted`，没有发出搜索。批准只由 host 执行：workflow 测试在未批准、终端批准和补答文件批准三种运行里检查，计划生成、两次复核和复核修正的提示词都只带对应的那句批准状态，并要求模型不为批准设 `shouldDraft` 或报告问题；规则包测试检查每个提到批准的句子都由 host 负责，入口 SKILL.md 阶段表的 intake 一行仍是原来的“The business decision gate has passed”，没有把批准列为继续条件；intake 和 plan 模块的改动使规则包摘要改变。`main()` 换上假的 workflow 测试：`--json` 下 stdin 和 stderr 都设为终端时也不提供补答提问和批准，未批准的 Draft 计划写出补答文件，stdout 上唯一的 JSON 结果带 `answersFile`；`--jsonl`（两个流都设为终端）同样不提供，唯一的 JSONL 结果行带 `answersFile`；不带这两个参数时，stdin 或 stderr 的 isTTY 为 undefined 都不提供，两个都是终端才提供；stdin 不是终端时，计划写到 stdout，stderr 上只有一行，写明没有人批准、计划为 Draft，并给出补答文件路径和批准做法。`main()` 其余的接线（创建 readline、进程 SIGINT 处理、终端运行的 stdout 和 stderr 输出）没有测试。这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求。
+
+## 复核存活错误实现验证（2026-10-25）
+
+独立复核为每条验收标准 A* 尝试构造一个所有计划检查仍会通过的错误实现，写入 `survivingMutants`。测试用假模型脚本化两次复核：第一次复核报告、不需要决定的错误实现进入修正提示，第二次复核干净时计划为 Ready；第二次复核仍报告时为 Draft；只在第一次复核报告的待定决定，在第二次复核干净后仍是 Draft 原因，也没有出现在修正提示里。
+
+复核后的修改：存活错误实现不再能让运行失败。`parseReview` 仍严格校验 `findings`；存活错误实现中空白的 `decisionNeeded` 当作没有决定，`acceptanceId` 不是 brief 中 A* ID 的项、不是对象或文字超长的项、第 12 项之后的项都被丢弃，字段不是列表时按没有处理；每次丢弃在计划的缺口列表和 manifest 的 `gaps` 里记一条信息性缺口，就绪状态不变。复核提示写明 `acceptanceId` 用 brief 的 A* ID 而不是 T1-A1 这样的任务验收 ID，最多 12 项，并要求 brief 没有定下的业务选择只作为带 `decisionNeeded` 的存活错误实现报告，不写成问题或修正建议。待决事项的说明引用验收标准原文，并按 brief 的批准方式给出做法。修正通过校验而后续复核没有完成时，计划为 Draft，原因写明没有完成的复核覆盖修正后的计划，第一次复核的问题和不需要决定的存活错误实现不再写成 Draft 原因，任何一次复核的待决事项仍是 Draft 原因；修正本身失败时仍写 `The bounded review repair did not complete.`。“Trusted, not checked”多了一行：存活错误实现和没有存活错误实现都只是复核模型的推理。新测试检查：只有修正后的复核报告的待定决定同样让计划为 Draft；有两条要求时，A2 的存活错误实现转成针对 R2 的完整重大问题；复核提示里 `decisionNeeded` 的条件、先给反例的要求、A* ID 与 12 项上限和业务选择这几句整句固定；两次复核里无法使用的存活错误实现都被丢弃，丢弃记录写进 plan.md 和 manifest，运行照常完成；修正后的复核失败时计划写明没有复核覆盖，去掉第一次复核过时的说明，并保留第一次复核的待决事项；三种批准方式各有对应的待决事项做法；复核 schema 的 `maxItems` 为 12；进度行写出存活错误实现的个数。
+
+这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求。复核者在真实计划上报告多少存活错误实现，要等下一次 CLI 自审实跑记录。
+
+## agent skill 符合性报告验证（2026-10-25）
+
+unshit agent skill 增加了需求摘要批准、“Trusted, not checked”、待决事项和实施后的符合性报告。用 `--json` 运行时 unshit 不能当场请人批准，skill 让 agent 把 brief 按“你说的”和“推断的”交给用户，由用户自己把补答文件的 `approveBrief` 改为 true。符合性报告按任务写出每个具名错误实现（`T1-V1-M1` 等）是否被杀死和实际运行的命令，实际运行的验证命令和计划中的验证分开写，并说明每个参考模式和它的参考测试是否沿用。skill 不在规则包摘要里，补答文件的规则版本校验不受影响。测试检查 skill 带有这些规则的整行文字，并用 host 类型检查 skill 用到的字段名。
+
+复核后的修改：agent 交给用户批准的是整份 brief，包括排除项和假设，与终端提示和批准摘要覆盖的内容一致；“inferred”只表示没有找到用户原话的引文，不再说成 unshit 加的。用户定下待决事项后，决定写进补答文件的 brief、由用户自己设 `approveBrief`，或者 agent 把决定按用户原话加进需求、由用户在终端运行并批准；unshit 重新规划后再实施。终端运行没有 JSON 结果，计划在最新的 `.unshit/<run-id>/plan.md`。符合性报告里每个具名错误实现写明杀死、存活、失败方式与预期不同或没有运行，错误实现在临时副本或单独的 git worktree 里应用；失败方式与预期不同的，在修好测试或改正预期的失败之前不算杀死，这两种修改都要写明原因，不能只为对上看到的失败而改预期；有存活的，先补强测试或如实报告，才算任务完成。结果没有 `answersFile`（补答文件写入失败）时，skill 让 agent 告诉用户，并用相同命令重新运行。计划来自已批准的补答文件时，那个文件的 `approveBrief` 已经是 true，用户重读并保存修改后的 brief 就是批准；agent 写进去的决定，要等用户读过并接受后才重新运行。待决事项的说明也写明这两点：没有保存补答文件时用相同命令重新运行，已批准的文件里 `approveBrief` 已经是 true。plan.md 的“Trusted, not checked”标题和“Open decision for”前缀改由 `TRUSTED_SECTION_HEADING` 和 `OPEN_DECISION_PREFIX` 两个导出常量生成，测试检查 skill 引用的正是这两个值，代码改名而 skill 没跟上时测试失败。测试还检查：提到 `approveBrief` 的行只有三条固定的行，含 approv、type yes 或 yourself（不分大小写）的行只有八条固定的行，含 killed 或 surviv 的行只有两条；新加一行只要含这些词，测试就会失败，不含这些词的新行测不出来；批准一节的标题固定；`brief.summary`、`brief.requirements`、`brief.outOfScope`、`brief.assumptions` 和 `stated`/`inferred` 由 host 类型检查。`main()` 的测试见 brief 批准一节。
+
+这次没有让真实的 agent 按 skill 实施计划，没有运行 unshit，没有调用 Codex，也没有在真实的 home 目录安装 skill。
+
+## PDD Kit 借鉴改动的检查记录
+
+上面六节（2026-10-25）是同一组改动，在同一个工作区里一起实现，复核后的修改也在其中。各节写每项改了什么、由哪些测试覆盖；检查结果只在这里记一次，对应这组改动交付时的代码，不再列各步骤中间状态的数字。下表的 `bun run check` 和技能格式检查于 2026-10-27 在这个工作区运行。
+
+| 检查 | 结果 |
+| --- | --- |
+| `bun run check` | 433 项通过，0 失败，2340 次 expect |
+| 变异目录 | 共 721 个变异，保存在仓库之外：此前各节的 313 个，加上这六项和复核修改新增的 408 个；全部变异的完整运行结果记在本节末尾的“完整变异运行”一行 |
+| 官方技能格式检查 | `skill-creator/scripts/quick_validate.py` 验证 `src/resources/unshit-skill`：Skill is valid! |
+
+最后一轮验收后的修改：共同指令写明从已批准补答文件开始的运行使用该 brief；规则包的 intake 和 plan 模块补上没有 host 程序时由模型自己请用户批准、批准前保持 Draft；`main()` 增加测试，brief 已批准而计划因证据缺口为 Draft 时，stderr 不提示批准，也不写补答文件；skill 要求“失败方式与预期不同”时说明对测试或预期失败的修改及原因，不能只为对上看到的失败而改预期。
+
+这组改动没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求；计划里的错误实现没有被应用或运行，参考测试只读取，没有运行。
+
+完整变异运行：2026-10-27 在这个工作区用 `run-mutants.ts` 逐一运行全部 721 个变异，721 个 KILLED。
+
 ## 未执行的环境
 
 Linux 原生运行尚未验证。读取上游源码和测试文件不代表执行了上游测试，也不代表已验证目标业务系统。

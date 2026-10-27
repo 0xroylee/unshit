@@ -5,10 +5,16 @@ export interface AcceptanceCriterion {
   description: string;
 }
 
+// Host decided: "stated" when the user's requirement or a confirmed answer contains the requirement's userWords.
+export type RequirementOrigin = "stated" | "inferred";
+
 export interface Requirement {
   id: string;
   description: string;
   observableAcceptance: AcceptanceCriterion[];
+  // The user's own words that state the requirement, NFKC- and whitespace-normalized; only when origin is "stated".
+  userWords?: string;
+  origin: RequirementOrigin;
 }
 
 export interface MaterialQuestion {
@@ -55,6 +61,22 @@ export interface ResolvedAnswer {
   question: string;
   whyMaterial: string;
   answer: string;
+}
+
+// A person's approval of the final brief before reference research. briefSha256 hashes the brief's editable form
+// (src/brief-approval.ts). approvedAt is when the host recorded the approval: the reply at the terminal, or the read of
+// an answers file whose approveBrief was true.
+export interface BriefApproval {
+  briefSha256: string;
+  via: "tty" | "answers_file";
+  approvedAt: string;
+}
+
+// The brief of an answers file whose approveBrief is true, after the host checked it again like intake output.
+export interface ApprovedBrief {
+  brief: IntakeBrief;
+  resolvedAnswers: ResolvedAnswer[];
+  approval: BriefApproval;
 }
 
 export interface IntakeBrief {
@@ -240,6 +262,15 @@ export interface TaskAcceptance {
 
 export type VerificationKind = "existing" | "to_create" | "manual";
 
+// A wrong implementation that a planned check must reject, and the failure the check reports on it. The host assigns
+// the ID (T1-V1-M1). unshit never applies these mutants or runs the check; they are for the implementer's mutation runner.
+export interface PlannedMutant {
+  id: string;
+  acceptanceId: string;
+  wrongImplementation: string;
+  observedFailure: string;
+}
+
 export interface VerificationMethod {
   id: string;
   kind: VerificationKind;
@@ -249,6 +280,7 @@ export interface VerificationMethod {
   command?: string;
   commandSource?: { sourceId: string; line: number };
   plannedCommand?: string;
+  rejectsMutants: PlannedMutant[];
 }
 
 export interface PlanTask {
@@ -324,7 +356,9 @@ export interface ReferenceComparison {
   commitDate?: string;
   lastActivityAt?: string;
   selectionRationale: string;
-  adoptedPatterns: Array<{ pattern: string; evidence: EvidenceRef[] }>;
+  // testEvidence cites the comparator's own tests that exercise the pattern (read, not run); untestedReason says why
+  // no read test does. Exactly one of the two is present.
+  adoptedPatterns: Array<{ pattern: string; evidence: EvidenceRef[]; testEvidence: EvidenceRef[]; untestedReason?: string }>;
   rejectedPatterns: Array<{ pattern: string; reason: string; evidence: EvidenceRef[] }>;
   localAdaptation: string;
 }
@@ -351,8 +385,18 @@ export interface ReviewFinding {
   suggestedCorrection: string;
 }
 
+// A wrong implementation of one acceptance criterion that every planned check for it would still pass, in the
+// reviewer's reading. decisionNeeded names the business choice that would rule it out; the planner may not make it.
+export interface SurvivingMutant {
+  acceptanceId: string;
+  wrongImplementation: string;
+  whyPlannedChecksPass: string;
+  decisionNeeded?: string;
+}
+
 export interface ReviewResult {
   findings: ReviewFinding[];
+  survivingMutants: SurvivingMutant[];
 }
 
 export interface ExistingCommand {
@@ -407,8 +451,8 @@ export interface ValidationRecord {
 }
 
 export type RunOutcome =
-  | { status: "needs_input"; questions: MaterialQuestion[]; brief: IntakeBrief; answersFile?: string; checkpointPath?: string }
-  | { status: "completed"; readiness: Readiness; brief: IntakeBrief; initialBrief?: IntakeBrief; research?: ResearchSummary; resolvedAnswers: ResolvedAnswer[]; plan: PlanDocument; sources: FinalSource[]; gaps: ResearchGap[]; reviews: ReviewResult[]; artifacts?: RunArtifacts; validationIssues: string[]; validationHistory: ValidationRecord[] }
+  | { status: "needs_input"; questions: MaterialQuestion[]; brief: IntakeBrief; answersFile?: string; checkpointPath?: string; approvalRequested?: boolean; resolvedAnswers?: ResolvedAnswer[] }
+  | { status: "completed"; readiness: Readiness; brief: IntakeBrief; initialBrief?: IntakeBrief; research?: ResearchSummary; resolvedAnswers: ResolvedAnswer[]; briefApproval?: BriefApproval; answersFile?: string; plan: PlanDocument; sources: FinalSource[]; gaps: ResearchGap[]; reviews: ReviewResult[]; artifacts?: RunArtifacts; validationIssues: string[]; validationHistory: ValidationRecord[] }
   | { status: "interrupted"; message: string; checkpointPath?: string }
   | { status: "timed_out"; message: string; stage: string; limit: "idle" | "total"; limitSeconds: number; checkpointPath?: string }
   | { status: "error"; message: string; checkpointPath?: string };
