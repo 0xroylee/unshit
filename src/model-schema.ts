@@ -7,12 +7,14 @@ import type {
   PlanDesign,
   PlanDocument,
   PlanTask,
+  PlannedMutant,
   ReferenceComparison,
   RepositoryChoice,
   RepositoryCandidate,
   RepositorySnapshot,
   ReviewFinding,
   ReviewResult,
+  SurvivingMutant,
   SelectedFile,
   SelectedFileRole,
   EvidenceExcerpt,
@@ -39,7 +41,7 @@ export const INTAKE_SCHEMA: JsonSchema = object({
     type: "array",
     minItems: 1,
     maxItems: 12,
-    items: object({ description: string, observableAcceptance: { ...stringArray, minItems: 1, maxItems: 8 } }),
+    items: object({ description: string, userWords: { type: ["string", "null"] }, observableAcceptance: { ...stringArray, minItems: 1, maxItems: 8 } }),
   },
   outOfScope: { ...stringArray, maxItems: 12 },
   assumptions: { ...stringArray, maxItems: 12 },
@@ -110,6 +112,14 @@ export const EVIDENCE_REQUEST_SCHEMA: JsonSchema = object({
 });
 
 const evidenceRefSchema = object({ excerptId: string, claim: string });
+// The most acceptance criteria that one verification may cover. A verification names at least one wrong implementation
+// for each criterion it covers, so its rejectsMutants array has the same limit and a valid plan always fits.
+export const MAX_VERIFICATION_ACCEPTANCES = 24;
+// The longest wrong implementation or expected failure in a named mutant.
+export const MUTANT_TEXT_MAX = 500;
+// The longest reason an adopted pattern gives for citing no reference test.
+export const UNTESTED_REASON_MAX = 700;
+const plannedMutantSchema = object({ acceptanceId: string, wrongImplementation: string, observedFailure: string });
 
 export const PLAN_SCHEMA: JsonSchema = object({
   title: string,
@@ -190,10 +200,11 @@ export const PLAN_SCHEMA: JsonSchema = object({
         maxItems: 8,
         items: object({
           kind: { type: "string", enum: ["existing", "to_create", "manual"] },
-          coversAcceptanceIds: { type: "array", minItems: 1, items: string },
+          coversAcceptanceIds: { type: "array", minItems: 1, maxItems: MAX_VERIFICATION_ACCEPTANCES, items: string },
           description: string,
           commandId: { type: ["string", "null"] },
           plannedCommand: { type: ["string", "null"] },
+          rejectsMutants: { type: "array", minItems: 1, maxItems: MAX_VERIFICATION_ACCEPTANCES, items: plannedMutantSchema },
         }),
       },
       evidence: { type: "array", items: evidenceRefSchema, maxItems: 8 },
@@ -219,7 +230,12 @@ export const PLAN_SCHEMA: JsonSchema = object({
         type: "array",
         minItems: 1,
         maxItems: 6,
-        items: object({ pattern: string, evidence: { type: "array", minItems: 1, items: evidenceRefSchema, maxItems: 6 } }),
+        items: object({
+          pattern: string,
+          evidence: { type: "array", minItems: 1, items: evidenceRefSchema, maxItems: 6 },
+          testEvidence: { type: "array", items: evidenceRefSchema, maxItems: 6 },
+          untestedReason: { type: ["string", "null"] },
+        }),
       },
       rejectedPatterns: {
         type: "array",
@@ -237,6 +253,9 @@ export const PLAN_SCHEMA: JsonSchema = object({
   },
 });
 
+// The most surviving mutants that the host keeps from one review.
+export const MAX_SURVIVING_MUTANTS = 12;
+
 export const REVIEW_SCHEMA: JsonSchema = object({
   findings: {
     type: "array",
@@ -247,6 +266,16 @@ export const REVIEW_SCHEMA: JsonSchema = object({
       requirementIds: stringArray,
       evidence: { type: "array", items: evidenceRefSchema, maxItems: 6 },
       suggestedCorrection: string,
+    }),
+  },
+  survivingMutants: {
+    type: "array",
+    maxItems: MAX_SURVIVING_MUTANTS,
+    items: object({
+      acceptanceId: string,
+      wrongImplementation: string,
+      whyPlannedChecksPass: string,
+      decisionNeeded: { type: ["string", "null"] },
     }),
   },
 });
@@ -314,7 +343,9 @@ export function parseModelJson<T>(text: string): T {
   }
 }
 
-export function parseIntake(value: unknown): IntakeBrief {
+// userTexts are the user's own texts that a requirement's userWords must quote: the requirement, and for a rebuilt or
+// approved brief also the confirmed answers. Without them every requirement is inferred.
+export function parseIntake(value: unknown, userTexts: string[] = []): IntakeBrief {
   const input = asObject(value, "Intake result");
   const summary = asString(input.summary, "summary");
   const rawRequirements = asArray(input.requirements, "requirements", 1, 12);
@@ -322,10 +353,14 @@ export function parseIntake(value: unknown): IntakeBrief {
   const requirements = rawRequirements.map((value, index) => {
     const entry = asObject(value, `requirements[${index + 1}]`);
     const descriptions = asStringArray(entry.observableAcceptance, `requirements[${index + 1}].observableAcceptance`, 1, 8);
+    const quoted = entry.userWords ?? null;
+    if (quoted !== null && typeof quoted !== "string") throw new ModelOutputError(`requirements[${index + 1}].userWords must be text or null.`);
+    const userWords = verifiedUserWords(quoted, userTexts);
     return {
       id: `R${index + 1}`,
       description: asString(entry.description, `requirements[${index + 1}].description`),
       observableAcceptance: descriptions.map((description) => ({ id: `A${++acceptanceNumber}`, description })),
+      ...(userWords ? { userWords, origin: "stated" as const } : { origin: "inferred" as const }),
     };
   });
   const rawQuestions = asArray(input.materialQuestions, "materialQuestions", 0, 6);
@@ -356,8 +391,8 @@ export function parseIntake(value: unknown): IntakeBrief {
   };
 }
 
-export function parseRefinedBrief(value: unknown, initial: IntakeBrief): IntakeBrief {
-  const parsed = parseIntake(value);
+export function parseRefinedBrief(value: unknown, initial: IntakeBrief, userTexts: string[] = []): IntakeBrief {
+  const parsed = parseIntake(value, userTexts);
   if (parsed.materialQuestions.length > 0) throw new ModelOutputError("The brief rebuild may not add material questions.");
   return { ...parsed, materialQuestions: initial.materialQuestions };
 }
@@ -366,6 +401,30 @@ export function stableMaterialQuestionId(question: string, whyMaterial: string):
   const normalize = (value: string): string => value.normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
   const semanticText = `question:${normalize(question)}\nwhy:${normalize(whyMaterial)}`;
   return `Q-${createHash("sha256").update(semanticText, "utf8").digest("hex").slice(0, 12)}`;
+}
+
+// The brief of an answers file that a person approved. It passes the intake checks without material questions; the
+// host reassigns the R* and A* IDs and the labels, and keeps the file's questions.
+export function parseApprovedBrief(value: unknown, questions: MaterialQuestion[], userTexts: string[]): IntakeBrief {
+  const input = asObject(value, "Approved brief");
+  if (input.materialQuestions !== undefined) throw new ModelOutputError("The approved brief may not contain material questions.");
+  return { ...parseIntake({ ...input, materialQuestions: [] }, userTexts), materialQuestions: questions };
+}
+
+// The fewest code points that a kept userWords quote has; a shorter quote such as "the" proves nothing.
+export const MIN_USER_WORDS_CODE_POINTS = 4;
+
+// A model's quote of the user's words, kept only when its NFKC- and whitespace-normalized form has at least
+// MIN_USER_WORDS_CODE_POINTS code points and appears in one normalized user text. Returns that normalized form.
+export function verifiedUserWords(userWords: string | null, userTexts: string[]): string | undefined {
+  if (userWords === null) return undefined;
+  const quote = normalizedWords(userWords);
+  if ([...quote].length < MIN_USER_WORDS_CODE_POINTS) return undefined;
+  return userTexts.some((text) => normalizedWords(text).includes(quote)) ? quote : undefined;
+}
+
+function normalizedWords(value: string): string {
+  return value.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
 
 export function parseRepositorySelection(
@@ -474,6 +533,26 @@ function parseEvidence(value: unknown, label: string, min = 0, max = 8): PlanTas
       claim: asString(entry.claim, `${label}[${index + 1}].claim`, 700),
     };
   });
+}
+
+// The wrong implementations that one verification must reject. Each covered acceptance criterion needs at least one;
+// the host assigns the IDs and ignores any the model supplies.
+function parsePlannedMutants(value: unknown, label: string, verificationId: string, covers: string[]): PlannedMutant[] {
+  const mutants = asArray(value, label, 1, MAX_VERIFICATION_ACCEPTANCES).map((value, index) => {
+    const entry = asObject(value, `${label}[${index + 1}]`);
+    const acceptanceId = asString(entry.acceptanceId, `${label}[${index + 1}].acceptanceId`, 20);
+    if (!covers.includes(acceptanceId)) throw new ModelOutputError(`${verificationId} names a wrong implementation for ${acceptanceId}, which it does not cover.`);
+    return {
+      id: `${verificationId}-M${index + 1}`,
+      acceptanceId,
+      wrongImplementation: asString(entry.wrongImplementation, `${label}[${index + 1}].wrongImplementation`, MUTANT_TEXT_MAX),
+      observedFailure: asString(entry.observedFailure, `${label}[${index + 1}].observedFailure`, MUTANT_TEXT_MAX),
+    };
+  });
+  for (const acceptanceId of covers) {
+    if (!mutants.some((mutant) => mutant.acceptanceId === acceptanceId)) throw new ModelOutputError(`${verificationId} names no wrong implementation for ${acceptanceId}.`);
+  }
+  return mutants;
 }
 
 function parseDesign(
@@ -592,7 +671,8 @@ export function parsePlan(
   const acceptanceIds = new Set(brief.requirements.flatMap((requirement) => requirement.observableAcceptance.map((item) => item.id)));
   const sourceById = new Map(evidenceSources.map((source) => [source.id, source]));
   const excerptById = new Map(excerpts.map((excerpt) => [excerpt.id, excerpt]));
-  const validateEvidence = (refs: PlanTask["evidence"], label: string, expectedRepository?: RepositorySnapshot): void => {
+  // With `role`, each cited excerpt must also come from a source that the host read in that role.
+  const validateEvidence = (refs: PlanTask["evidence"], label: string, expectedRepository?: RepositorySnapshot, role?: SelectedFileRole): void => {
     for (const ref of refs) {
       if (!excerptIds.has(ref.excerptId)) throw new ModelOutputError(`${label} refers to unknown evidence excerpt ${ref.excerptId}.`);
       if (!expectedRepository) continue;
@@ -600,6 +680,9 @@ export function parsePlan(
       const source = sourceById.get(excerpt.sourceId);
       if (!source || source.kind !== "remote" || source.provider !== expectedRepository.candidate.provider || source.repository !== expectedRepository.candidate.fullName || source.commitSha !== expectedRepository.commitSha) {
         throw new ModelOutputError(`${label} must cite evidence from ${expectedRepository.candidate.provider}:${expectedRepository.candidate.fullName}@${expectedRepository.commitSha}.`);
+      }
+      if (role && !source.roles.includes(role)) {
+        throw new ModelOutputError(`${label} cites ${ref.excerptId} from ${source.path}, which the host did not read as a ${role} file.`);
       }
     }
   };
@@ -645,7 +728,7 @@ export function parsePlan(
         throw new ModelOutputError(`${id} has an unsupported verification kind.`);
       }
       const kind = kindValue as VerificationKind;
-      const covers = asStringArray(method.coversAcceptanceIds, `${id}.verification.coversAcceptanceIds`, 1, 24, 20);
+      const covers = asStringArray(method.coversAcceptanceIds, `${id}.verification.coversAcceptanceIds`, 1, MAX_VERIFICATION_ACCEPTANCES, 20);
       const taskCoveredIds = new Set(acceptance.flatMap((entry) => entry.coversAcceptanceIds));
       if (covers.some((acceptanceId) => !taskCoveredIds.has(acceptanceId))) {
         throw new ModelOutputError(`${id} verification refers to acceptance outside its task.`);
@@ -659,8 +742,10 @@ export function parsePlan(
       } else if (commandId || plannedCommand) {
         throw new ModelOutputError(`${id} manual verification cannot include a shell command.`);
       }
+      const verificationId = `${id}-V${verificationIndex + 1}`;
+      const rejectsMutants = parsePlannedMutants(method.rejectsMutants, `${id}.verification[${verificationIndex + 1}].rejectsMutants`, verificationId, covers);
       return {
-        id: `${id}-V${verificationIndex + 1}`,
+        id: verificationId,
         kind,
         acceptanceIds: covers,
         description: asString(method.description, `${id}.verification.description`),
@@ -670,6 +755,7 @@ export function parsePlan(
           commandSource: { sourceId: commands.find((command) => command.id === commandId)!.sourceId, line: commands.find((command) => command.id === commandId)!.line },
         } : {}),
         ...(plannedCommand ? { plannedCommand } : {}),
+        rejectsMutants,
       };
     });
     const evidence = parseEvidence(item.evidence, `${id}.evidence`);
@@ -741,7 +827,13 @@ export function parsePlan(
       const pattern = asObject(value, `referenceComparisons[${index + 1}].adoptedPatterns[${patternIndex + 1}]`);
       const evidence = parseEvidence(pattern.evidence, "adopted pattern evidence", 1, 6);
       validateEvidence(evidence, `Adopted pattern for ${candidateId}`, expectedRepository);
-      return { pattern: asString(pattern.pattern, "adopted pattern", 400), evidence };
+      const testEvidence = parseEvidence(pattern.testEvidence, "adopted pattern test evidence", 0, 6);
+      validateEvidence(testEvidence, `Adopted pattern test for ${candidateId}`, expectedRepository, "test");
+      const untestedReason = pattern.untestedReason === null ? undefined : asString(pattern.untestedReason, "adopted pattern untested reason", UNTESTED_REASON_MAX);
+      if ((testEvidence.length > 0) === (untestedReason !== undefined)) {
+        throw new ModelOutputError(`Adopted pattern ${patternIndex + 1} for ${candidateId} needs reference test evidence or an untestedReason, but not both.`);
+      }
+      return { pattern: asString(pattern.pattern, "adopted pattern", 400), evidence, testEvidence, ...(untestedReason ? { untestedReason } : {}) };
     });
     const rejectedPatterns = asArray(item.rejectedPatterns, `referenceComparisons[${index + 1}].rejectedPatterns`, 1, 6).map((value, patternIndex) => {
       const pattern = asObject(value, `referenceComparisons[${index + 1}].rejectedPatterns[${patternIndex + 1}]`);
@@ -798,10 +890,19 @@ function assertAcyclic(tasks: PlanTask[]): void {
   for (const task of tasks) visit(task.id);
 }
 
-export function parseReview(value: unknown, brief: IntakeBrief, excerpts: EvidenceExcerpt[]): ReviewResult {
+// A review and the surviving mutants the host dropped from it, one note each.
+export interface ParsedReview extends ReviewResult {
+  dropped: string[];
+}
+
+// Findings are strict: a malformed one fails the review. Surviving mutants are advisory, so a malformed one never does:
+// the host reads a blank decisionNeeded as null, drops an entry it cannot use and every entry past the cap, and
+// returns a note for each drop.
+export function parseReview(value: unknown, brief: IntakeBrief, excerpts: EvidenceExcerpt[]): ParsedReview {
   const result = asObject(value, "Review");
   const allowedRequirements = new Set(brief.requirements.map((requirement) => requirement.id));
   const allowedExcerpts = new Set(excerpts.map((excerpt) => excerpt.id));
+  const allowedAcceptance = new Set(brief.requirements.flatMap((requirement) => requirement.observableAcceptance.map((item) => item.id)));
   const findings: ReviewFinding[] = asArray(result.findings, "findings", 0, 12).map((value, index) => {
     const item = asObject(value, `findings[${index + 1}]`);
     const severity = asString(item.severity, `findings[${index + 1}].severity`, 20);
@@ -818,7 +919,34 @@ export function parseReview(value: unknown, brief: IntakeBrief, excerpts: Eviden
       suggestedCorrection: asString(item.suggestedCorrection, `findings[${index + 1}].suggestedCorrection`),
     };
   });
-  return { findings };
+  const dropped: string[] = [];
+  const entries = Array.isArray(result.survivingMutants) ? result.survivingMutants : [];
+  if (result.survivingMutants !== undefined && !Array.isArray(result.survivingMutants)) dropped.push("the host read survivingMutants as none because it is not a list.");
+  if (entries.length > MAX_SURVIVING_MUTANTS) dropped.push(`the host dropped ${entries.length - MAX_SURVIVING_MUTANTS} surviving mutant(s) after the first ${MAX_SURVIVING_MUTANTS}.`);
+  const survivingMutants = entries.slice(0, MAX_SURVIVING_MUTANTS).flatMap((value, index): SurvivingMutant[] => {
+    try {
+      return [parseSurvivingMutant(value, `survivingMutants[${index + 1}]`, allowedAcceptance)];
+    } catch (error) {
+      if (!(error instanceof ModelOutputError)) throw error;
+      dropped.push(`the host dropped surviving mutant ${index + 1}: ${error.message}`);
+      return [];
+    }
+  });
+  return { findings, survivingMutants, dropped };
+}
+
+function parseSurvivingMutant(value: unknown, label: string, allowedAcceptance: Set<string>): SurvivingMutant {
+  const item = asObject(value, label);
+  const acceptanceId = asString(item.acceptanceId, `${label}.acceptanceId`, 20);
+  if (!allowedAcceptance.has(acceptanceId)) throw new ModelOutputError(`${acceptanceId} is not an acceptance criterion of the brief.`);
+  const blankDecision = typeof item.decisionNeeded === "string" && !item.decisionNeeded.trim();
+  const decisionNeeded = item.decisionNeeded === null || blankDecision ? undefined : asString(item.decisionNeeded, `${label}.decisionNeeded`, 700);
+  return {
+    acceptanceId,
+    wrongImplementation: asString(item.wrongImplementation, `${label}.wrongImplementation`, 1200),
+    whyPlannedChecksPass: asString(item.whyPlannedChecksPass, `${label}.whyPlannedChecksPass`, 1200),
+    ...(decisionNeeded ? { decisionNeeded } : {}),
+  };
 }
 
 export function createPlanDocument(

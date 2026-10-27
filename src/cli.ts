@@ -1,15 +1,18 @@
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { createInterface } from "node:readline/promises";
+import { createInterface, type Interface } from "node:readline/promises";
 import { stdin, stderr, stdout } from "node:process";
 import { NativeModelGateway, type AppServerClientOptions } from "./app-server.ts";
 import { GitHubResearcher } from "./github.ts";
-import { runWorkflow } from "./workflow.ts";
+import { materialAnswerContext, runWorkflow, type AnswerQuestion, type ApproveBrief, type WorkflowOptions } from "./workflow.ts";
 import { createRunId, writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts } from "./storage.ts";
 import { REFERENCE_POLICY_HASH } from "./instructions.ts";
-import { stableMaterialQuestionId } from "./model-schema.ts";
-import type { MaterialQuestion, ProgressEvent, RunOutcome } from "./types.ts";
+import { parseApprovedBrief, stableMaterialQuestionId } from "./model-schema.ts";
+import { briefSha256, isBriefApproval, renderBriefForApproval } from "./brief-approval.ts";
+import { SKILL_NAME, defaultSkillTargets, installSkill, type SkillTarget } from "./skill-install.ts";
+import type { ApprovedBrief, IntakeBrief, MaterialQuestion, ProgressEvent, ResolvedAnswer, RunOutcome } from "./types.ts";
 
 interface CliArguments {
   requirement: string;
@@ -22,6 +25,9 @@ interface CliArguments {
   json: boolean;
   jsonl: boolean;
   help: boolean;
+  installSkill: boolean;
+  skillDir?: string;
+  force: boolean;
 }
 
 class CliError extends Error {
@@ -41,6 +47,9 @@ export function parseCliArguments(argv: string[]): CliArguments {
   let json = false;
   let jsonl = false;
   let help = false;
+  let installSkillFlag = false;
+  let skillDir: string | undefined;
+  let force = false;
   const positional: string[] = [];
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -51,8 +60,10 @@ export function parseCliArguments(argv: string[]): CliArguments {
     }
     if (token === "--json") { json = true; continue; }
     if (token === "--jsonl") { jsonl = true; continue; }
+    if (token === "--install-skill") { installSkillFlag = true; continue; }
+    if (token === "--force") { force = true; continue; }
     const [name, inlineValue] = token.startsWith("--") && token.includes("=") ? [token.slice(0, token.indexOf("=")), token.slice(token.indexOf("=") + 1)] : [token, undefined];
-    if (["--cwd", "--out", "--answers", "--model", "--effort", "--turn-timeout"].includes(name)) {
+    if (["--cwd", "--out", "--answers", "--model", "--effort", "--turn-timeout", "--skill-dir"].includes(name)) {
       const value = inlineValue ?? argv[++index];
       if (!value || value.startsWith("--")) throw new CliError(`${name} needs a value.`);
       if (name === "--cwd") cwd = value;
@@ -61,6 +72,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
       if (name === "--model") model = value;
       if (name === "--effort") effort = value;
       if (name === "--turn-timeout") turnTimeoutSeconds = parseTurnTimeout(value);
+      if (name === "--skill-dir") skillDir = value;
       continue;
     }
     if (token.startsWith("-")) throw new CliError(`Unknown option: ${token}`);
@@ -68,6 +80,14 @@ export function parseCliArguments(argv: string[]): CliArguments {
   }
 
   if (json && jsonl) throw new CliError("Use either --json or --jsonl, not both.");
+  if (installSkillFlag) {
+    if (positional.length > 0 || cwd || out || answers || model || effort || turnTimeoutSeconds !== undefined) {
+      throw new CliError("--install-skill runs on its own; it does not take a requirement or planning options.");
+    }
+    if (jsonl) throw new CliError("Use --json with --install-skill.");
+    return { requirement: "", json, jsonl, help, installSkill: true, ...(skillDir ? { skillDir } : {}), force };
+  }
+  if (skillDir || force) throw new CliError("--skill-dir and --force work only with --install-skill.");
   if (effort && !["minimal", "low", "medium", "high", "xhigh"].includes(effort)) {
     throw new CliError("--effort must be minimal, low, medium, high, or xhigh.");
   }
@@ -75,7 +95,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
   if (["resume", "refs", "export"].includes(positional[0]?.toLowerCase() ?? "")) {
     throw new CliError("This CLI accepts one software requirement and produces a plan. Start with a quoted requirement.");
   }
-  return { requirement: positional.join(" "), cwd, out, answers, model, effort, turnTimeoutSeconds, json, jsonl, help };
+  return { requirement: positional.join(" "), cwd, out, answers, model, effort, turnTimeoutSeconds, json, jsonl, help, installSkill: false, force: false };
 }
 
 function parseTurnTimeout(value: string): number {
@@ -103,7 +123,28 @@ export function exitCodeFor(outcome: RunOutcome, aborted: boolean): number {
   return 0;
 }
 
-export async function main(argv = process.argv.slice(2)): Promise<number> {
+async function runInstallSkill(args: CliArguments): Promise<number> {
+  const targets: SkillTarget[] = args.skillDir
+    ? [{ agent: "custom", skillsRoot: path.resolve(args.skillDir) }]
+    : await defaultSkillTargets(os.homedir(), process.env);
+  if (targets.length === 0) {
+    return writeCliError("No Claude Code (~/.claude) or Codex (~/.codex, ~/.agents) folder was found. Pass --skill-dir <skills folder> to choose one.", args.json, false);
+  }
+  const results = await installSkill(targets, { force: args.force });
+  const failed = results.some((result) => result.status === "failed");
+  if (args.json) {
+    stdout.write(`${JSON.stringify({ status: failed ? "error" : "ok", skill: SKILL_NAME, results })}\n`);
+  } else {
+    for (const result of results) {
+      const line = `${result.status.padEnd(9)} ${result.agent.padEnd(6)} ${result.path}${result.reason ? ` (${result.reason})` : ""}\n`;
+      (result.status === "failed" ? stderr : stdout).write(line);
+    }
+  }
+  return failed ? 1 : 0;
+}
+
+// `run` is the workflow; a test passes its own to check main's handling of options, files and output.
+export async function main(argv = process.argv.slice(2), run: (options: WorkflowOptions) => Promise<RunOutcome> = runWorkflow): Promise<number> {
   let args: CliArguments;
   try {
     args = parseCliArguments(argv);
@@ -114,6 +155,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     stdout.write(helpText());
     return 0;
   }
+  if (args.installSkill) return runInstallSkill(args);
 
   const cwd = path.resolve(args.cwd ?? process.cwd());
   try {
@@ -123,13 +165,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
 
   const answerPath = args.answers ? path.resolve(process.cwd(), args.answers) : undefined;
-  let answers: Record<string, string> = {};
-  let priorQuestions: MaterialQuestion[] | undefined;
+  let loaded: LoadedAnswers | undefined;
   if (answerPath) {
     try {
-      const loaded = await readAnswerFile(answerPath, { requirement: args.requirement, cwd });
-      answers = loaded.answers;
-      priorQuestions = loaded.questions;
+      loaded = await readAnswerFile(answerPath, { requirement: args.requirement, cwd });
     } catch (error) {
       return writeCliError(error instanceof Error ? error.message : "Could not read the answers file.", args.json, args.jsonl);
     }
@@ -147,35 +186,28 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
 
   const controller = new AbortController();
-  let readlineInterface: ReturnType<typeof createInterface> | undefined;
+  const terminal = createTerminalAsk(() => createInterface({ input: stdin, output: stderr }), () => onSigint(), controller.signal);
   let signalCount = 0;
   const onSigint = (): void => {
     signalCount += 1;
     if (!controller.signal.aborted) {
       controller.abort();
-      readlineInterface?.close();
+      terminal.close();
     } else if (signalCount > 1) {
       process.exitCode = 130;
     }
   };
   process.on("SIGINT", onSigint);
 
-  const interactive = !args.json && !args.jsonl && stdin.isTTY === true && stderr.isTTY === true;
-  const answerQuestion = interactive ? async (question: { id: string; question: string; whyMaterial: string }): Promise<string> => {
-    readlineInterface ??= createInterface({ input: stdin, output: stderr });
-    return readlineInterface.question(`\n${question.id}: ${question.question}\nWhy it matters: ${question.whyMaterial}\n> `);
-  } : undefined;
+  const prompts = terminalPrompts({ json: args.json, jsonl: args.jsonl, stdinIsTTY: stdin.isTTY, stderrIsTTY: stderr.isTTY }, terminal.ask);
   const gateway = new NativeModelGateway(gatewayOptions(args, cwd));
   const researcher = new GitHubResearcher({ githubToken: process.env.GITHUB_TOKEN, gitlabToken: process.env.GITLAB_TOKEN, codeSearch: true });
   const runId = createRunId();
   let flowHeaderPrinted = false;
 
-  let outcome = await runWorkflow({
+  const outcome = await runWithAnswers({
     cwd,
     requirement: args.requirement,
-    answers,
-    ...(priorQuestions ? { priorQuestions } : {}),
-    ...(answerQuestion ? { answerQuestion } : {}),
     signal: controller.signal,
     modelGateway: gateway,
     researcher,
@@ -193,29 +225,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       ...(reportPath ? { reportPath } : {}),
       input: details,
     }),
-  });
+  }, loaded, prompts, run);
 
-  if (outcome.status === "needs_input") {
-    try {
-      const questions = uniqueQuestions([...outcome.brief.materialQuestions, ...outcome.questions]);
-      const answersFile = await writeAnswersTemplate({ cwd, requirement: args.requirement, questions, answers });
-      outcome = { ...outcome, answersFile };
-    } catch (error) {
-      outcome = { status: "error", message: error instanceof Error ? error.message : "Could not save the answers request." };
-    }
-  }
-
-  readlineInterface?.close();
+  terminal.close();
   process.off("SIGINT", onSigint);
   if (outcome.status === "completed" && !args.json && !args.jsonl && outcome.artifacts) {
     const report = await readFile(outcome.artifacts.reportPath, "utf8");
     stdout.write(`${report}\n`);
+    if (outcome.answersFile) stderr.write(`No person approved the brief, so the plan is Draft. Read the brief in ${outcome.answersFile}; to approve it, set approveBrief to true and rerun with --answers ${outcome.answersFile}.\n`);
   } else if (args.json) {
     stdout.write(`${JSON.stringify(outcome)}\n`);
   } else if (outcome.status === "needs_input") {
-    stderr.write("Material answers are required before reference search can start.\n");
-    for (const question of outcome.questions) stderr.write(`- ${question.id}: ${question.question} (${question.whyMaterial})\n`);
-    stderr.write(`Edit ${outcome.answersFile ?? "the generated answers.json"} and rerun with --answers.\n`);
+    stderr.write(needsInputMessage(outcome));
   } else if (outcome.status === "interrupted") {
     stderr.write(`${outcome.message}\n`);
     if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
@@ -232,10 +253,17 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   return exitCodeFor(outcome, controller.signal.aborted);
 }
 
+export interface LoadedAnswers {
+  answers: Record<string, string>;
+  questions?: MaterialQuestion[];
+  approvedBrief?: ApprovedBrief;
+}
+
 export async function readAnswerFile(
   filePath: string,
   expected?: { requirement: string; cwd: string },
-): Promise<{ answers: Record<string, string>; questions?: MaterialQuestion[] }> {
+  now = new Date(),
+): Promise<LoadedAnswers> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(await readFile(filePath, "utf8"));
@@ -266,9 +294,169 @@ export async function readAnswerFile(
       ids.add(raw.id);
       questions.push({ id: raw.id, question: raw.question, whyMaterial: raw.whyMaterial });
     }
-    return { answers: parseAnswerMap(record.answers, ids), questions };
+    const answers = parseAnswerMap(record.answers, ids);
+    if (record.brief === undefined && record.approveBrief === undefined) return { answers, questions };
+    if (!isRecord(record.brief) || typeof record.approveBrief !== "boolean") {
+      throw new CliError("--answers brief must be an object, and approveBrief must be true or false.");
+    }
+    if (!record.approveBrief) return { answers, questions };
+    return { answers, questions, approvedBrief: approvedBriefFrom(record.brief, questions, answers, expected.requirement, now) };
   }
   return { answers: parseAnswerMap(record) };
+}
+
+// The brief of an answers file whose approveBrief is true. Approving the brief does not answer a material question, so
+// every question in the request needs its answer. The brief passes the intake checks again: the host reassigns the
+// R* and A* IDs and labels each requirement against the requirement text and the file's answers. approvedAt is `now`,
+// when the host read the file, because the file does not say when or by whom approveBrief was set.
+export function approvedBriefFrom(
+  value: Record<string, unknown>,
+  questions: MaterialQuestion[],
+  answers: Record<string, string>,
+  requirement: string,
+  now: Date,
+): ApprovedBrief {
+  const unanswered = questions.filter((question) => !answers[question.id]).map((question) => question.id);
+  if (unanswered.length > 0) {
+    throw new CliError(`--answers approveBrief is true, but these questions have no answer: ${unanswered.join(", ")}. Approving the brief does not answer them; write each answer in answers and rerun.`);
+  }
+  const resolvedAnswers = materialAnswerContext({ materialQuestions: questions }, answers);
+  let brief: IntakeBrief;
+  try {
+    brief = parseApprovedBrief(value, questions, [requirement, ...resolvedAnswers.map((answer) => answer.answer)]);
+  } catch (error) {
+    throw new CliError(`--answers brief is invalid: ${error instanceof Error ? error.message : "it could not be read."}`);
+  }
+  return { brief, resolvedAnswers, approval: { briefSha256: briefSha256(brief), via: "answers_file", approvedAt: now.toISOString() } };
+}
+
+// The workflow options that an answers file and the terminal prompts supply.
+export function answerOptions(
+  loaded: LoadedAnswers | undefined,
+  prompts: { answerQuestion?: AnswerQuestion; approveBrief?: ApproveBrief },
+): Pick<WorkflowOptions, "answers" | "priorQuestions" | "approvedBrief" | "answerQuestion" | "approveBrief"> {
+  return {
+    answers: loaded?.answers ?? {},
+    ...(loaded?.questions ? { priorQuestions: loaded.questions } : {}),
+    ...(loaded?.approvedBrief ? { approvedBrief: loaded.approvedBrief } : {}),
+    ...(prompts.answerQuestion ? { answerQuestion: prompts.answerQuestion } : {}),
+    ...(prompts.approveBrief ? { approveBrief: prompts.approveBrief } : {}),
+  };
+}
+
+// Runs the workflow with what the answers file and the terminal supply, then saves the answers file the outcome needs.
+// A later needs_input file keeps the answers this run was given, so a person does not write them again.
+export async function runWithAnswers(
+  options: Omit<WorkflowOptions, keyof ReturnType<typeof answerOptions>>,
+  loaded: LoadedAnswers | undefined,
+  prompts: { answerQuestion?: AnswerQuestion; approveBrief?: ApproveBrief },
+  run: (options: WorkflowOptions) => Promise<RunOutcome> = runWorkflow,
+): Promise<RunOutcome> {
+  const outcome = await run({ ...options, ...answerOptions(loaded, prompts) });
+  return withAnswersFile(outcome, { cwd: options.cwd, requirement: options.requirement, answers: loaded?.answers ?? {} });
+}
+
+// The terminal prompts: each unanswered material question, and the final brief for approval. A run with --json or
+// --jsonl, or whose stdin or stderr is not a terminal, gets neither, so it never waits on stdin: missing answers return
+// needs_input and the plan stays Draft without an approval.
+export function terminalPrompts(
+  mode: { json: boolean; jsonl: boolean; stdinIsTTY: boolean | undefined; stderrIsTTY: boolean | undefined },
+  ask: (prompt: string) => Promise<string>,
+): { answerQuestion?: AnswerQuestion; approveBrief?: ApproveBrief } {
+  if (mode.json || mode.jsonl || mode.stdinIsTTY !== true || mode.stderrIsTTY !== true) return {};
+  return {
+    answerQuestion: (question) => ask(`\n${question.id}: ${question.question}\nWhy it matters: ${question.whyMaterial}\n> `),
+    approveBrief: createBriefApprover(ask),
+  };
+}
+
+// Shows the final brief with its labelled requirements and acceptance criteria, and approves it only on a reply of yes.
+export function createBriefApprover(ask: (prompt: string) => Promise<string>): ApproveBrief {
+  return async (brief) => {
+    const reply = await ask(`\n${renderBriefForApproval(brief)}\nType yes to approve these requirements and acceptance criteria and start the reference search. Any other reply stops here and saves the brief for editing.\n> `);
+    return isBriefApproval(reply);
+  };
+}
+
+// One readline interface for every terminal prompt, opened at the first one. In a terminal, readline takes Ctrl+C
+// itself and only closes, with no process SIGINT, so a pending question never settled and the run hung. Here Ctrl+C,
+// or input that ends while a question waits or before the next question, calls `interrupt`; the aborted signal then
+// rejects the question, and the run ends as interrupted (exit 130).
+export function createTerminalAsk(
+  open: () => Interface,
+  interrupt: () => void,
+  signal: AbortSignal,
+): { ask: (prompt: string) => Promise<string>; close: () => void } {
+  let readline: Interface | undefined;
+  let waiting = false;
+  let closed = false;
+  return {
+    ask: async (prompt) => {
+      // Input that ended between two questions closed the interface. question() would reject with "readline was
+      // closed" and end the run as an error; the run ends as interrupted instead, as when input ends at a question.
+      if (closed && !signal.aborted) interrupt();
+      // Bun's question() throws a TypeError for a signal that is already aborted.
+      signal.throwIfAborted();
+      if (!readline) {
+        readline = open();
+        readline.on("SIGINT", interrupt);
+        readline.on("close", () => {
+          closed = true;
+          if (waiting && !signal.aborted) interrupt();
+        });
+      }
+      waiting = true;
+      try {
+        return await readline.question(prompt, { signal });
+      } finally {
+        waiting = false;
+      }
+    },
+    close: () => readline?.close(),
+  };
+}
+
+// Saves the answers file that a person edits after needs_input or after a plan whose brief nobody approved, and names
+// it in the outcome. A brief that was not approved goes into the file with approveBrief: false.
+export async function withAnswersFile(
+  outcome: RunOutcome,
+  options: { cwd: string; requirement: string; answers: Record<string, string> },
+): Promise<RunOutcome> {
+  if (outcome.status === "needs_input") {
+    try {
+      const questions = uniqueQuestions([...outcome.brief.materialQuestions, ...outcome.questions]);
+      const answersFile = await writeAnswersTemplate(outcome.approvalRequested
+        ? { cwd: options.cwd, requirement: options.requirement, questions, answers: answerMap(outcome.resolvedAnswers ?? []), brief: outcome.brief }
+        : { cwd: options.cwd, requirement: options.requirement, questions, answers: options.answers });
+      return { ...outcome, answersFile };
+    } catch (error) {
+      return { status: "error", message: error instanceof Error ? error.message : "Could not save the answers request." };
+    }
+  }
+  if (outcome.status === "completed" && !outcome.briefApproval) {
+    try {
+      const answersFile = await writeAnswersTemplate({ cwd: options.cwd, requirement: options.requirement, questions: outcome.brief.materialQuestions, answers: answerMap(outcome.resolvedAnswers), brief: outcome.brief });
+      return { ...outcome, answersFile };
+    } catch {
+      // The plan is already saved; only the file for approving its brief is missing.
+      return outcome;
+    }
+  }
+  return outcome;
+}
+
+// What a person reads on stderr when the run stopped for input.
+export function needsInputMessage(outcome: Extract<RunOutcome, { status: "needs_input" }>): string {
+  const file = outcome.answersFile ?? "the generated answers.json";
+  if (outcome.approvalRequested) {
+    return `The brief was not approved, so reference search did not start.\nEdit the brief in ${file} if it needs changes, set approveBrief to true, and rerun with --answers ${file}.\n`;
+  }
+  const lines = [
+    "Material answers are required before reference search can start.",
+    ...outcome.questions.map((question) => `- ${question.id}: ${question.question} (${question.whyMaterial})`),
+    `Edit ${file} and rerun with --answers.`,
+  ];
+  return `${lines.join("\n")}\n`;
 }
 
 function outputProgress(event: ProgressEvent, jsonl: boolean): void {
@@ -293,6 +481,10 @@ function parseAnswerMap(value: Record<string, unknown>, allowedIds?: Set<string>
     answers[id] = answer.trim();
   }
   return answers;
+}
+
+function answerMap(resolved: ResolvedAnswer[]): Record<string, string> {
+  return Object.fromEntries(resolved.map((answer) => [answer.questionId, answer.answer]));
 }
 
 function uniqueQuestions(questions: MaterialQuestion[]): MaterialQuestion[] {
@@ -328,7 +520,7 @@ export function helpText(): string {
     "Options:",
     "  --cwd <directory>     Target project directory (default: current directory)",
     "  --out <file>          Save the Markdown plan at this path",
-    "  --answers <json-file> Use and edit the answers.json template returned by needs_input",
+    "  --answers <json-file> Use and edit the answers.json that needs_input or an unapproved plan returned",
     "  --model <name>        Use a Codex model for this run",
     "  --effort <level>      minimal, low, medium, high, or xhigh",
     "  --turn-timeout <seconds>  End a model turn after this many seconds without Codex activity (30-3600, default 600); a turn may run three times as long in total",
@@ -336,8 +528,18 @@ export function helpText(): string {
     "  --jsonl               Emit progress and result as JSON Lines",
     "  --help                Show this help",
     "",
+    "unshit --install-skill [--skill-dir <dir>] [--force] [--json]",
+    "",
+    "Install the unshit agent skill (how to run unshit and implement from its plans)",
+    "into ~/.claude/skills/unshit (Claude Code), and into $CODEX_HOME/skills/unshit",
+    "(default ~/.codex/skills) and ~/.agents/skills/unshit (Codex), for the agent",
+    "folders found on this machine.",
+    "  --skill-dir <dir>     Install into this skills folder instead",
+    "  --force               Replace an existing unshit skill that unshit did not install",
+    "",
     "The default report and evidence manifest are saved under .unshit/<run-id>/.",
     "Missing material answers return needs_input with exit code 2. A model turn that times out returns 124. Ctrl+C returns 130.",
+    "In an interactive terminal run without --json or --jsonl, unshit shows the final requirements and acceptance criteria and asks for yes before reference search; another reply returns needs_input with exit code 2. Other runs stay Draft until a rerun with --answers whose approveBrief is true.",
     "",
   ].join("\n");
 }

@@ -489,6 +489,22 @@ describe("bounded source evidence", () => {
     expect(fetched).not.toContain("tests/code-matched.test.ts");
   });
 
+  // A reference test citation is valid only for a source with role test, so the model's role alone must not give a
+  // production file that role.
+  test("gives role test only to a file whose path is a test path, whatever role the model chose", async () => {
+    const { fake } = researcher();
+    const evidence = await loadSelectedEvidence({
+      local: localIndex(),
+      repositories: [repository()],
+      modelSelection: [{ fileId: "C1F1", role: "test", rationale: "The model calls the handler a test." }],
+      github: fake,
+      relevantText: "refund",
+    });
+
+    expect(evidence.sources.find((source) => source.path === "src/index.ts")?.roles).toEqual(["production"]);
+    expect(evidence.sources.filter((source) => source.roles.includes("test")).map((source) => source.path)).toEqual(["tests/index.test.ts"]);
+  });
+
   // src/index.ts is the first of six planned files, so its share is 260,000 / 6 = 43,333 characters.
   async function excerptRangesFor(content: string, relevantText: string, patterns: string[]): Promise<number[][]> {
     const { fake } = researcher({ content: new Map([["src/index.ts", content]]) });

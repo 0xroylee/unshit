@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { editableBrief, type EditableBrief } from "./brief-approval.ts";
 import { REFERENCE_POLICY_HASH } from "./instructions.ts";
 import { renderReport, type ReportInput } from "./report.ts";
-import type { CheckpointStage, MaterialQuestion, RunArtifacts } from "./types.ts";
+import type { CheckpointStage, IntakeBrief, MaterialQuestion, RunArtifacts } from "./types.ts";
 
 export async function writePlanArtifacts(options: {
   cwd: string;
@@ -33,6 +34,7 @@ export async function writePlanArtifacts(options: {
     runId,
     generatedAt: new Date().toISOString(),
     readiness: options.input.plan.readiness,
+    briefApproval: options.input.briefApproval ?? null,
     brief: options.input.brief,
     initialBrief: options.input.initialBrief,
     research: options.input.research,
@@ -84,6 +86,7 @@ export async function writeCheckpointArtifacts(options: {
     generatedAt: new Date().toISOString(),
     checkpointStage: options.stage,
     readiness: "draft",
+    briefApproval: options.input.briefApproval ?? null,
     referencePolicySha256: REFERENCE_POLICY_HASH,
     brief: options.input.brief,
     initialBrief: options.input.initialBrief,
@@ -118,6 +121,10 @@ export interface AnswerRequestDocument {
     questions: MaterialQuestion[];
   };
   answers: Record<string, string>;
+  // Only in a file written after the final brief existed: the brief for a person to read and edit, and their decision.
+  // A rerun uses the brief and the answers in place of new intake, answer and rebuild turns only when approveBrief is true.
+  brief?: EditableBrief;
+  approveBrief?: boolean;
 }
 
 export async function writeAnswersTemplate(options: {
@@ -125,6 +132,8 @@ export async function writeAnswersTemplate(options: {
   requirement: string;
   questions: MaterialQuestion[];
   answers?: Record<string, string>;
+  // The final brief for a person to approve; the file then says approveBrief: false until they change it.
+  brief?: IntakeBrief;
 }): Promise<string> {
   const runId = createRunId();
   const directory = path.join(path.resolve(options.cwd), ".unshit", runId);
@@ -140,6 +149,7 @@ export async function writeAnswersTemplate(options: {
       questions: options.questions,
     },
     answers,
+    ...(options.brief ? { brief: editableBrief(options.brief), approveBrief: false } : {}),
   };
   await atomicWrite(target, `${JSON.stringify(document, null, 2)}\n`);
   return target;
