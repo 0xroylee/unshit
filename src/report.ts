@@ -1,8 +1,8 @@
-import { topologicalTasks } from "./model-schema.ts";
+import { MIN_QUOTE_CODE_POINTS, QUOTE_MAX, topologicalTasks } from "./model-schema.ts";
 import { requirementLabel } from "./brief-approval.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import type { ExistingCommand } from "./types.ts";
-import type { BriefApproval, FinalSource, IntakeBrief, PlanDocument, RepositoryChoice, ResearchGap, ResearchSummary, ResolvedAnswer, ReviewResult, RunArtifacts, ValidationRecord } from "./types.ts";
+import type { BriefApproval, FinalSource, IntakeBrief, PlanDocument, QuotedEvidenceRef, RepositoryChoice, ResearchGap, ResearchSummary, ResolvedAnswer, ReviewResult, RunArtifacts, ValidationRecord } from "./types.ts";
 import { describeRequestFailure } from "./request-failure.ts";
 
 export interface ReportInput {
@@ -113,7 +113,7 @@ export function renderReport(input: ReportInput): string {
       lines.push("", "Done when: each wrong implementation named above, applied alone to the finished code, makes its check fail, while the unmodified code passes every check above. unshit has not applied any of them or run any check.");
       if (task.evidence.length > 0) {
         lines.push("", "Source basis:", "");
-        for (const evidence of task.evidence) lines.push(`- ${evidence.claim} (${citation(evidence.excerptId, input, sourceById, excerptById)})`);
+        for (const evidence of task.evidence) lines.push(`- ${evidence.claim} (${quotedCitation(evidence, input, sourceById, excerptById)})`);
       }
       lines.push("");
     }
@@ -176,14 +176,14 @@ export function renderReport(input: ReportInput): string {
     for (const comparison of plan.referenceComparisons) {
       lines.push(`### ${comparison.provider}:${comparison.repository}`, "", `Commit: \`${comparison.commitSha}\`${comparison.commitDate ? `, dated ${comparison.commitDate}` : ""}${comparison.lastActivityAt ? `; last activity reported ${comparison.lastActivityAt}` : ""}`, `Selection reason: ${comparison.selectionRationale}`, "", "Patterns to adopt:", "");
       for (const pattern of comparison.adoptedPatterns) {
-        const refs = pattern.evidence.map((evidence) => citation(evidence.excerptId, input, sourceById, excerptById));
+        const refs = pattern.evidence.map((evidence) => quotedCitation(evidence, input, sourceById, excerptById));
         lines.push(`- ${pattern.pattern} (${refs.join("; ")})`);
-        for (const test of pattern.testEvidence) lines.push(`  - Reference test (read, not run): ${test.claim} (${citation(test.excerptId, input, sourceById, excerptById)})`);
+        for (const test of pattern.testEvidence) lines.push(`  - Reference test (read, not run): ${test.claim} (${quotedCitation(test, input, sourceById, excerptById)})`);
         if (pattern.untestedReason) lines.push(`  - No reference test: ${pattern.untestedReason}`);
       }
       lines.push("", "Patterns to reject:", "");
       for (const pattern of comparison.rejectedPatterns) {
-        const refs = pattern.evidence.map((evidence) => citation(evidence.excerptId, input, sourceById, excerptById));
+        const refs = pattern.evidence.map((evidence) => quotedCitation(evidence, input, sourceById, excerptById));
         lines.push(`- ${pattern.pattern}: ${pattern.reason}${refs.length ? ` (${refs.join("; ")})` : ""}`);
       }
       lines.push("", `Local adaptation: ${comparison.localAdaptation}`, "");
@@ -195,7 +195,7 @@ export function renderReport(input: ReportInput): string {
     for (const decision of plan.decisions) {
       lines.push(`### ${decision.id}: ${decision.title}`, "", decision.decision, "", decision.rationale);
       if (decision.newDesignReason) lines.push("", `New design reason: ${decision.newDesignReason}`);
-      for (const evidence of decision.evidence) lines.push(`- ${evidence.claim} (${citation(evidence.excerptId, input, sourceById, excerptById)})`);
+      for (const evidence of decision.evidence) lines.push(`- ${evidence.claim} (${quotedCitation(evidence, input, sourceById, excerptById)})`);
       lines.push("");
     }
   }
@@ -203,7 +203,7 @@ export function renderReport(input: ReportInput): string {
   if (plan.risks.length > 0) {
     lines.push("## Risks and open evidence", "");
     for (const risk of plan.risks) {
-      const refs = risk.evidence.map((evidence) => citation(evidence.excerptId, input, sourceById, excerptById));
+      const refs = risk.evidence.map((evidence) => quotedCitation(evidence, input, sourceById, excerptById));
       lines.push(`- ${risk.description}${refs.length ? ` (${refs.join("; ")})` : ""}`);
     }
     lines.push("");
@@ -214,7 +214,7 @@ export function renderReport(input: ReportInput): string {
   for (const module of plan.design.modules) {
     lines.push(`- **${module.name}:** ${module.responsibility}`);
     for (const api of module.interfaces) lines.push(`  - Interface: ${api}`);
-    for (const evidence of module.evidence) lines.push(`  - Evidence: ${evidence.claim} (${citation(evidence.excerptId, input, sourceById, excerptById)})`);
+    for (const evidence of module.evidence) lines.push(`  - Evidence: ${evidence.claim} (${quotedCitation(evidence, input, sourceById, excerptById)})`);
     if (module.newDesignReason) lines.push(`  - New design reason: ${module.newDesignReason}`);
   }
   lines.push("", "### Data model", "");
@@ -223,7 +223,7 @@ export function renderReport(input: ReportInput): string {
   } else {
     for (const entity of plan.design.dataModel.entities) {
       lines.push(`- **${entity.name}:** ${entity.fields.join(", ")}`);
-      for (const evidence of entity.evidence) lines.push(`  - Evidence: ${evidence.claim} (${citation(evidence.excerptId, input, sourceById, excerptById)})`);
+      for (const evidence of entity.evidence) lines.push(`  - Evidence: ${evidence.claim} (${quotedCitation(evidence, input, sourceById, excerptById)})`);
       if (entity.newDesignReason) lines.push(`  - New design reason: ${entity.newDesignReason}`);
     }
     lines.push("");
@@ -234,7 +234,7 @@ export function renderReport(input: ReportInput): string {
   } else {
     for (const invariant of plan.design.invariants.items) {
       lines.push(`- ${invariant.statement}`);
-      for (const evidence of invariant.evidence) lines.push(`  - Evidence: ${evidence.claim} (${citation(evidence.excerptId, input, sourceById, excerptById)})`);
+      for (const evidence of invariant.evidence) lines.push(`  - Evidence: ${evidence.claim} (${quotedCitation(evidence, input, sourceById, excerptById)})`);
       if (invariant.newDesignReason) lines.push(`  - New design reason: ${invariant.newDesignReason}`);
     }
     lines.push("");
@@ -245,7 +245,7 @@ export function renderReport(input: ReportInput): string {
   } else {
     for (const boundary of plan.design.accessControl.boundaries) {
       lines.push(`- **${boundary.boundary}:** ${boundary.behavior}`);
-      for (const evidence of boundary.evidence) lines.push(`  - Evidence: ${evidence.claim} (${citation(evidence.excerptId, input, sourceById, excerptById)})`);
+      for (const evidence of boundary.evidence) lines.push(`  - Evidence: ${evidence.claim} (${quotedCitation(evidence, input, sourceById, excerptById)})`);
       if (boundary.newDesignReason) lines.push(`  - New design reason: ${boundary.newDesignReason}`);
     }
     lines.push("");
@@ -289,7 +289,7 @@ export function renderReport(input: ReportInput): string {
     }
   }
 
-  lines.push("## Checks performed", "", "The host read and hashed the listed source files and recorded the line range of every excerpt it cut. It checked that each cited excerpt ID is one it created and that each reference comparison cites only its own repository at the pinned commit, checked requirement and acceptance coverage, checked that existing verification commands come from local files it read, and checked that task dependencies exist and form no cycle. It checked that each verification names at least one wrong implementation for every acceptance criterion it covers, and that each reference test cited under an adopted pattern comes from a file it read as a test from that repository at the pinned commit. It did not check that an excerpt supports the claim next to it, and it did not run target project commands or tests.", "");
+  lines.push("## Checks performed", "", `The host read and hashed the listed source files and recorded the line range of every excerpt it cut. It checked that each cited excerpt ID is one it created and that each reference comparison cites only its own repository at the pinned commit, checked requirement and acceptance coverage, checked that existing verification commands come from local files it read, and checked that task dependencies exist and form no cycle. It checked that each verification names at least one wrong implementation for every acceptance criterion it covers, that each reference test cited under an adopted pattern comes from a file it read as a test from that repository at the pinned commit, and that a pattern citing a reference test also cites an excerpt of a file it read as production from that repository. It checked that the quote of each plan citation, after NFKC and whitespace normalization, has ${MIN_QUOTE_CODE_POINTS} to ${QUOTE_MAX} characters (counted as Unicode code points) and appears in the lines of the excerpt it cites, and it marks each citation whose quote it did not count as found. It did not check that a quote or its excerpt supports the claim next to it, or that a cited test exercises the production code cited with it, and it did not run target project commands or tests.`, "");
   lines.push(`## ${TRUSTED_SECTION_HEADING}`, "", ...trustedLines(input), "");
   lines.push("## Source registry", "");
   if (input.sources.length === 0) lines.push("No source snapshots were prepared.", "");
@@ -324,7 +324,7 @@ function trustedLines(input: ReportInput): string[] {
     ? selected.map((choice) => `- ${trustedComparator(choice, input.sources)}`)
     : ["- No reference repository was selected, so the plan has no reference repository behind it."];
   lines.push(
-    "- The claim next to each citation is written by the model. The host checks only that the excerpt ID exists, and for a reference comparison that the excerpt comes from that repository at the pinned commit and, for a cited reference test, from a file it read as a test; it then shows the line range it recorded when it read the file.",
+    "- The claim next to each citation is written by the model. The host checks only that the excerpt ID exists, that the quote of a plan citation appears in that excerpt, and for a reference comparison that the excerpt comes from that repository at the pinned commit and, for a cited reference test, from a file it read as a test, with an excerpt of a file it read as production cited by the same pattern; it then shows the line range it recorded when it read the file. That the quoted text supports the claim rests on the planner and the independent review.",
     "- Local sources are identified by the SHA-256 of the content this run read, taken after any redaction, not by a commit.",
     "- The independent review is the same model in a fresh session.",
     "- Surviving mutants, and the lack of them, are the reviewer model's reasoning: unshit applied and ran none of them, and a review that reports none does not show that the planned checks reject every wrong implementation.",
@@ -334,7 +334,7 @@ function trustedLines(input: ReportInput): string[] {
   const testExcerptIds = input.plan.referenceComparisons.flatMap((comparison) => comparison.adoptedPatterns.flatMap((pattern) => pattern.testEvidence.map((test) => test.excerptId)));
   // A test excerpt cited more than once, under one pattern or several, counts once.
   const referenceTests = new Set(testExcerptIds).size;
-  if (referenceTests > 0) lines.push(`- The plan cites ${referenceTests} distinct reference test excerpt(s) under adopted patterns. The host recognises a test file by its path name only; it read these at the pinned commit and ran none of them, and that each one exercises its pattern rests on the planner and the independent review.`);
+  if (referenceTests > 0) lines.push(`- The plan cites ${referenceTests} distinct reference test excerpt(s) under adopted patterns. The host recognises a test file by its path name only; it read these at the pinned commit and ran none of them, and that each one exercises the production excerpts cited with it rests on the planner and the independent review.`);
   if (input.briefApproval) lines.push(input.briefApproval.via === "answers_file"
     ? "- The brief approval came from an answers file whose approveBrief was true; the host cannot tell who set it."
     : "- The brief approval is a yes typed at an interactive terminal prompt; the host takes it as the user's and cannot tell who typed it.");
@@ -380,6 +380,37 @@ function citation(
   const lines = `L${excerpt.startLine}-L${excerpt.endLine}`;
   if (finalSource?.permalink) return `[${source.path} ${lines}](${finalSource.permalink}${lineAnchor(finalSource.provider, excerpt.startLine, excerpt.endLine)})`;
   return `\`${source.path}#${lines}\``;
+}
+
+// A plan citation and its quote, or why the host did not count the quote as found in the cited excerpt.
+function quotedCitation(
+  ref: QuotedEvidenceRef,
+  input: ReportInput,
+  sourceById: Map<string, LoadedEvidence["sources"][number]>,
+  excerptById: Map<string, LoadedEvidence["excerpts"][number]>,
+): string {
+  const where = citation(ref.excerptId, input, sourceById, excerptById);
+  return ref.quoteInExcerpt ? `${where}: ${codeSpan(ref.quote)}` : `${where}; ${quoteProblemText(ref)}`;
+}
+
+// One text for each reason that the host did not count a quote as found. A quote over the limit is kept cut to it.
+function quoteProblemText(ref: QuotedEvidenceRef): string {
+  switch (ref.quoteProblem) {
+    case "empty":
+      return `the quote is empty, so the host did not count it as found in ${ref.excerptId}`;
+    case "too_short":
+      return `the quote ${codeSpan(ref.quote)} is shorter than ${MIN_QUOTE_CODE_POINTS} characters, so the host did not count it as found in ${ref.excerptId}`;
+    case "too_long":
+      return `the quote ${codeSpan(`${ref.quote}…`)} is longer than ${QUOTE_MAX} characters, so the host did not count it as found in ${ref.excerptId}`;
+    default:
+      return `the host did not find the quoted ${codeSpan(ref.quote)} in ${ref.excerptId}`;
+  }
+}
+
+// Inline code whose fence is one backtick longer than the longest run of backticks in the text.
+function codeSpan(text: string): string {
+  const fence = "`".repeat(Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length)) + 1);
+  return `${fence} ${text} ${fence}`;
 }
 
 function sourceLocation(sourceId: string, start: number, end: number, input: ReportInput): string {

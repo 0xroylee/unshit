@@ -900,6 +900,19 @@ describe("requested evidence", () => {
     ]);
   });
 
+  test("gives a requested file that is neither a test nor implementation source no production role", async () => {
+    const repo: RepositorySnapshot = { ...repository(), files: [{ id: "C1D1", path: "docs/design.md", size: 100 }, { id: "C1D2", path: "src/extra.ts", size: 100 }] };
+    const result = await addRequestedEvidence(oneSource("src/index.ts", "export const index = 1;"), [request("file", "C1D1"), request("file", "C1D2")], {
+      local: localIndex(),
+      repositories: [repo],
+      unreadFileIds: new Set(["C1D1", "C1D2"]),
+      github: researcher().fake,
+      relevantText: "unrelated words only",
+    });
+
+    expect(result.evidence.sources.slice(1).map((source) => [source.path, source.roles])).toEqual([["docs/design.md", ["config"]], ["src/extra.ts", ["production"]]]);
+  });
+
   test("gives the last file within the limit at most what is left, and records a file whose first line does not fit", async () => {
     // 10,881 characters are left for eight requested files, and at most six can be read. Each file of 7,999 characters
     // gets an equal share of what is left among the files still to read, counting no more files than the limit still
@@ -978,5 +991,25 @@ describe("requested evidence", () => {
     });
 
     expect(result.evidence.excerpts.slice(1).map((excerpt) => [excerpt.sourceId, excerpt.startLine, excerpt.endLine])).toEqual([["S2", 1, 30], ["S3", 1, 100]]);
+  });
+});
+
+describe("pinned source links", () => {
+  test("links each remote source to its commit, not to its default branch", async () => {
+    const github = repository();
+    const gitlab: RepositorySnapshot = { ...repository("C2", "org/lab"), candidate: { ...repository("C2", "org/lab").candidate, provider: "gitlab", providerProjectId: "42", webUrl: "https://gitlab.com/org/lab" } };
+    for (const [repo, expected] of [
+      [github, `https://github.com/org/repo/blob/${"a".repeat(40)}/src/index.ts`],
+      [gitlab, `https://gitlab.com/org/lab/-/blob/${"a".repeat(40)}/src/index.ts`],
+    ] as const) {
+      const evidence = await loadSelectedEvidence({
+        local: localIndex(),
+        repositories: [repo],
+        modelSelection: [{ fileId: `${repo.candidate.id}F1`, role: "production", rationale: "entry point" }],
+        github: researcher().fake,
+        relevantText: "refund request status",
+      });
+      expect(evidence.sources.find((source) => source.path === "src/index.ts")?.permalink).toBe(expected);
+    }
   });
 });

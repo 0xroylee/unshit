@@ -65,6 +65,7 @@ description: Plan a software feature or new application with the unshit CLI befo
 - Before you start, make sure the user has seen the "Trusted, not checked" section and has settled each open decision. Do not implement an acceptance condition whose decision is still open.
 - Follow the plan's tasks in dependency order, with their acceptance conditions and verification steps.
 - For each cited design decision, read the cited file in `.unshit/<run-id>/sources/` (pinned to a commit) and follow that pattern, adapted to the local project. Do not replace a cited pattern with an invented one. If you must deviate, tell the user why.
+- Each citation in the plan carries a `quote` that the model copied from the lines it cites. When `quoteInExcerpt` is true, unshit found the quote in those lines but did not check that it supports the claim: read it in those lines, not on its own. When `quoteInExcerpt` is false, plan.md says why after the citation: read those lines before you rely on the claim, and tell the user which tasks rest on it.
 - When an adopted pattern cites a reference test (`testEvidence`), read that test too and check the same behavior in your test.
 - Each planned verification names the wrong implementations it rejects (`rejectsMutants`, with ids such as `T1-V1-M1`). Write each test so that it fails on them.
 - Check the license of each selected repository in the plan's repository screening. Treat code from GPL or AGPL repositories as a pattern to follow; do not copy it verbatim into a project with a different license.

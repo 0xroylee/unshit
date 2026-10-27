@@ -7,7 +7,7 @@ import { SKILL_MARKER, UNSHIT_SKILL, defaultSkillTargets, installSkill } from ".
 import { TRUSTED_SECTION_HEADING } from "../src/report.ts";
 import type { AnswerRequestDocument } from "../src/storage.ts";
 import { OPEN_DECISION_PREFIX } from "../src/workflow.ts";
-import type { IntakeBrief, PlannedMutant, ReferenceComparison, Requirement, RequirementOrigin, RunOutcome, VerificationMethod } from "../src/types.ts";
+import type { IntakeBrief, PlannedMutant, QuotedEvidenceRef, ReferenceComparison, Requirement, RequirementOrigin, RunOutcome, VerificationMethod } from "../src/types.ts";
 
 const repositoryRoot = path.resolve(import.meta.dir, "..");
 
@@ -110,6 +110,10 @@ describe("unshit agent skill", () => {
     }
   });
 
+  test("has the agent read each citation's quote in the lines it cites, and says what quoteInExcerpt does not show", () => {
+    expect(UNSHIT_SKILL.split("\n")).toContain("- Each citation in the plan carries a `quote` that the model copied from the lines it cites. When `quoteInExcerpt` is true, unshit found the quote in those lines but did not check that it supports the claim: read it in those lines, not on its own. When `quoteInExcerpt` is false, plan.md says why after the citation: read those lines before you rely on the claim, and tell the user which tasks rest on it.");
+  });
+
   test("ends an implementation with a conformance report of the checks that actually ran", () => {
     const lines = UNSHIT_SKILL.split("\n");
     const eachWrongImplementation = "  - Each named wrong implementation (`T1-V1-M1` and so on): killed, survived or failed differently, each with the command you ran, or not run. It is killed only when the named test passed on your code and failed as its `observedFailure` describes with the wrong implementation applied. It survived when the named test still passed with it applied. It failed differently when the named test failed, but not as `observedFailure` describes: say how. That does not count as killed until you fix the test or correct the expected failure; report either change and why, and never rewrite the expected failure only to match the failure you saw. Apply each one in a scratch copy of the project or a separate git worktree, never in the user's working tree.";
@@ -136,6 +140,7 @@ describe("unshit agent skill", () => {
       ...(["rejectsMutants"] satisfies Array<keyof VerificationMethod>),
       ...(["observedFailure"] satisfies Array<keyof PlannedMutant>),
       ...(["testEvidence"] satisfies Array<keyof ReferenceComparison["adoptedPatterns"][number]>),
+      ...(["quote", "quoteInExcerpt"] satisfies Array<keyof QuotedEvidenceRef>),
     ];
     for (const field of fields) expect(UNSHIT_SKILL).toContain(`\`${field}`);
     for (const field of ["summary", "requirements", "outOfScope", "assumptions"] satisfies Array<keyof IntakeBrief>) {

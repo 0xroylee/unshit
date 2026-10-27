@@ -19,6 +19,9 @@ import type {
   SelectedFileRole,
   EvidenceExcerpt,
   EvidenceRequest,
+  EvidenceRef,
+  QuotedEvidenceRef,
+  QuoteProblem,
   ExistingCommand,
   VerificationKind,
 } from "./types.ts";
@@ -111,7 +114,12 @@ export const EVIDENCE_REQUEST_SCHEMA: JsonSchema = object({
   },
 });
 
-const evidenceRefSchema = object({ excerptId: string, claim: string });
+// A plan citation quotes the excerpt it cites. A review finding cites without a quote.
+const evidenceRefSchema = object({ excerptId: string, claim: string, quote: string });
+const findingEvidenceRefSchema = object({ excerptId: string, claim: string });
+// The longest quote of a plan citation, and the fewest code points of a quote that the host counts as found.
+export const QUOTE_MAX = 300;
+export const MIN_QUOTE_CODE_POINTS = 8;
 // The most acceptance criteria that one verification may cover. A verification names at least one wrong implementation
 // for each criterion it covers, so its rejectsMutants array has the same limit and a valid plan always fits.
 export const MAX_VERIFICATION_ACCEPTANCES = 24;
@@ -264,7 +272,7 @@ export const REVIEW_SCHEMA: JsonSchema = object({
       severity: { type: "string", enum: ["blocking", "material", "minor"] },
       description: string,
       requirementIds: stringArray,
-      evidence: { type: "array", items: evidenceRefSchema, maxItems: 6 },
+      evidence: { type: "array", items: findingEvidenceRefSchema, maxItems: 6 },
       suggestedCorrection: string,
     }),
   },
@@ -525,7 +533,7 @@ export function parseEvidenceRequests(value: unknown): EvidenceRequest[] {
   });
 }
 
-function parseEvidence(value: unknown, label: string, min = 0, max = 8): PlanTask["evidence"] {
+function parseEvidence(value: unknown, label: string, min = 0, max = 8): EvidenceRef[] {
   return asArray(value, label, min, max).map((value, index) => {
     const entry = asObject(value, `${label}[${index + 1}]`);
     return {
@@ -534,6 +542,33 @@ function parseEvidence(value: unknown, label: string, min = 0, max = 8): PlanTas
     };
   });
 }
+
+// A plan citation also needs a quote. Only a quote that is not text is an error, and the schema makes it text. The host
+// keeps the quote NFKC- and whitespace-normalized and counts it as found (quoteInExcerpt) only when it then has
+// MIN_QUOTE_CODE_POINTS to QUOTE_MAX code points and appears in the normalized text of the cited excerpt; it searches no
+// other excerpt and not the rest of the file. Any other quote is kept, cut to QUOTE_MAX code points, with the reason in
+// quoteProblem, so a quote never ends the run.
+function parseQuotedEvidence(value: unknown, label: string, excerptText: ReadonlyMap<string, string>, min = 0, max = 8): QuotedEvidenceRef[] {
+  return parseEvidence(value, label, min, max).map((ref, index) => {
+    const raw = ((value as unknown[])[index] as Obj).quote;
+    if (typeof raw !== "string") throw new ModelOutputError(`${label}[${index + 1}].quote must be text.`);
+    const quote = normalizedWords(raw);
+    const length = [...quote].length;
+    const problem: QuoteProblem | undefined = length === 0
+      ? "empty"
+      : length < MIN_QUOTE_CODE_POINTS
+        ? "too_short"
+        : length > QUOTE_MAX
+          ? "too_long"
+          : excerptText.get(ref.excerptId)?.includes(quote) ? undefined : "not_found";
+    if (!problem) return { ...ref, quote, quoteInExcerpt: true };
+    return { ...ref, quote: problem === "too_long" ? [...quote].slice(0, QUOTE_MAX).join("") : quote, quoteInExcerpt: false, quoteProblem: problem };
+  });
+}
+
+// Parses the plan citations of one list. path names the list in the model's output, such as
+// `referenceComparisons[1].adoptedPatterns[2].evidence`.
+type CitationParser = (value: unknown, label: string, min?: number, max?: number, path?: string) => QuotedEvidenceRef[];
 
 // The wrong implementations that one verification must reject. Each covered acceptance criterion needs at least one;
 // the host assigns the IDs and ignores any the model supplies.
@@ -558,6 +593,7 @@ function parsePlannedMutants(value: unknown, label: string, verificationId: stri
 function parseDesign(
   value: unknown,
   validateEvidence: (refs: PlanTask["evidence"], label: string) => void,
+  parseCitations: CitationParser,
 ): PlanDesign {
   const design = asObject(value, "design");
   const nullableText = (value: unknown, label: string): string | undefined => {
@@ -570,7 +606,7 @@ function parseDesign(
   };
   const modules = asArray(design.modules, "design.modules", 1, 12).map((value, index) => {
     const item = asObject(value, `design.modules[${index + 1}]`);
-    const evidence = parseEvidence(item.evidence, `design.modules[${index + 1}].evidence`, 0, 6);
+    const evidence = parseCitations(item.evidence, `design.modules[${index + 1}].evidence`, 0, 6);
     const newDesignReason = nullableText(item.newDesignReason, `design.modules[${index + 1}].newDesignReason`);
     requireGrounding(evidence, newDesignReason, `Module ${index + 1}`);
     return {
@@ -585,7 +621,7 @@ function parseDesign(
   const dataModelReason = nullableText(dataModelValue.notApplicableReason, "design.dataModel.notApplicableReason");
   const entities = asArray(dataModelValue.entities, "design.dataModel.entities", 0, 12).map((value, index) => {
     const item = asObject(value, `design.dataModel.entities[${index + 1}]`);
-    const evidence = parseEvidence(item.evidence, `design.dataModel.entities[${index + 1}].evidence`, 0, 6);
+    const evidence = parseCitations(item.evidence, `design.dataModel.entities[${index + 1}].evidence`, 0, 6);
     const newDesignReason = nullableText(item.newDesignReason, `design.dataModel.entities[${index + 1}].newDesignReason`);
     requireGrounding(evidence, newDesignReason, `Data entity ${index + 1}`);
     return {
@@ -603,7 +639,7 @@ function parseDesign(
   const invariantsReason = nullableText(invariantsValue.notApplicableReason, "design.invariants.notApplicableReason");
   const invariants = asArray(invariantsValue.items, "design.invariants.items", 0, 12).map((value, index) => {
     const item = asObject(value, `design.invariants.items[${index + 1}]`);
-    const evidence = parseEvidence(item.evidence, `design.invariants.items[${index + 1}].evidence`, 0, 6);
+    const evidence = parseCitations(item.evidence, `design.invariants.items[${index + 1}].evidence`, 0, 6);
     const newDesignReason = nullableText(item.newDesignReason, `design.invariants.items[${index + 1}].newDesignReason`);
     requireGrounding(evidence, newDesignReason, `Invariant ${index + 1}`);
     return {
@@ -620,7 +656,7 @@ function parseDesign(
   const accessReason = nullableText(accessValue.notApplicableReason, "design.accessControl.notApplicableReason");
   const boundaries = asArray(accessValue.boundaries, "design.accessControl.boundaries", 0, 8).map((value, index) => {
     const item = asObject(value, `design.accessControl.boundaries[${index + 1}]`);
-    const evidence = parseEvidence(item.evidence, `design.accessControl.boundaries[${index + 1}].evidence`, 0, 6);
+    const evidence = parseCitations(item.evidence, `design.accessControl.boundaries[${index + 1}].evidence`, 0, 6);
     const newDesignReason = nullableText(item.newDesignReason, `design.accessControl.boundaries[${index + 1}].newDesignReason`);
     requireGrounding(evidence, newDesignReason, `Access boundary ${index + 1}`);
     return {
@@ -653,6 +689,8 @@ export interface ParsedPlanPayload {
   decisions: DesignDecision[];
   referenceComparisons: Array<Pick<ReferenceComparison, "candidateId" | "adoptedPatterns" | "rejectedPatterns" | "localAdaptation">>;
   risks: PlanDocument["risks"];
+  // Each plan citation whose quote the host did not count as found, as `decisions[2].evidence[1] cites E4`.
+  unquotedCitations: string[];
 }
 
 export function parsePlan(
@@ -671,6 +709,17 @@ export function parsePlan(
   const acceptanceIds = new Set(brief.requirements.flatMap((requirement) => requirement.observableAcceptance.map((item) => item.id)));
   const sourceById = new Map(evidenceSources.map((source) => [source.id, source]));
   const excerptById = new Map(excerpts.map((excerpt) => [excerpt.id, excerpt]));
+  // The normalized lines that the model was sent for each excerpt.
+  const excerptText = new Map(excerpts.map((excerpt) => [excerpt.id, normalizedWords(excerpt.text)]));
+  // Each plan citation whose quote the host did not count as found, by its path in the output and its excerpt.
+  const unquotedCitations: string[] = [];
+  const parseCitations: CitationParser = (value, label, min = 0, max = 8, path = label) => {
+    const refs = parseQuotedEvidence(value, label, excerptText, min, max);
+    refs.forEach((ref, index) => {
+      if (!ref.quoteInExcerpt) unquotedCitations.push(`${path}[${index + 1}] cites ${ref.excerptId}`);
+    });
+    return refs;
+  };
   // With `role`, each cited excerpt must also come from a source that the host read in that role.
   const validateEvidence = (refs: PlanTask["evidence"], label: string, expectedRepository?: RepositorySnapshot, role?: SelectedFileRole): void => {
     for (const ref of refs) {
@@ -758,7 +807,7 @@ export function parsePlan(
         rejectsMutants,
       };
     });
-    const evidence = parseEvidence(item.evidence, `${id}.evidence`);
+    const evidence = parseCitations(item.evidence, `${id}.evidence`);
     validateEvidence(evidence, id);
     return {
       id,
@@ -797,7 +846,7 @@ export function parsePlan(
   const rawDecisions = asArray(result.decisions, "decisions", 0, 12);
   const decisions: DesignDecision[] = rawDecisions.map((value, index) => {
     const item = asObject(value, `decisions[${index + 1}]`);
-    const evidence = parseEvidence(item.evidence, `decisions[${index + 1}].evidence`);
+    const evidence = parseCitations(item.evidence, `decisions[${index + 1}].evidence`);
     validateEvidence(evidence, "Decision");
     const newDesignReason = item.newDesignReason === null ? undefined : asString(item.newDesignReason, `decisions[${index + 1}].newDesignReason`);
     if (evidence.length === 0 && !newDesignReason) throw new ModelOutputError(`Design decision ${index + 1} needs source evidence or a new-design reason.`);
@@ -811,7 +860,7 @@ export function parsePlan(
     };
   });
 
-  const design = parseDesign(result.design, validateEvidence);
+  const design = parseDesign(result.design, validateEvidence, parseCitations);
 
   const rawComparisons = asArray(result.referenceComparisons, "referenceComparisons", 0, 3);
   const selectedRepositoryIds = new Set(selectedRepositories.map((repository) => repository.candidate.id));
@@ -825,19 +874,24 @@ export function parsePlan(
     comparedIds.add(candidateId);
     const adoptedPatterns = asArray(item.adoptedPatterns, `referenceComparisons[${index + 1}].adoptedPatterns`, 1, 6).map((value, patternIndex) => {
       const pattern = asObject(value, `referenceComparisons[${index + 1}].adoptedPatterns[${patternIndex + 1}]`);
-      const evidence = parseEvidence(pattern.evidence, "adopted pattern evidence", 1, 6);
+      const evidence = parseCitations(pattern.evidence, "adopted pattern evidence", 1, 6, `referenceComparisons[${index + 1}].adoptedPatterns[${patternIndex + 1}].evidence`);
       validateEvidence(evidence, `Adopted pattern for ${candidateId}`, expectedRepository);
-      const testEvidence = parseEvidence(pattern.testEvidence, "adopted pattern test evidence", 0, 6);
+      const testEvidence = parseCitations(pattern.testEvidence, "adopted pattern test evidence", 0, 6, `referenceComparisons[${index + 1}].adoptedPatterns[${patternIndex + 1}].testEvidence`);
       validateEvidence(testEvidence, `Adopted pattern test for ${candidateId}`, expectedRepository, "test");
       const untestedReason = pattern.untestedReason === null ? undefined : asString(pattern.untestedReason, "adopted pattern untested reason", UNTESTED_REASON_MAX);
       if ((testEvidence.length > 0) === (untestedReason !== undefined)) {
         throw new ModelOutputError(`Adopted pattern ${patternIndex + 1} for ${candidateId} needs reference test evidence or an untestedReason, but not both.`);
       }
+      // A cited test pairs with the code it exercises only when the same pattern cites that code. The host checks the
+      // roles it gave the files when it read them, not that the test calls the cited code.
+      if (testEvidence.length > 0 && !evidence.some((ref) => sourceById.get(excerptById.get(ref.excerptId)!.sourceId)?.roles.includes("production"))) {
+        throw new ModelOutputError(`Adopted pattern ${patternIndex + 1} for ${candidateId} cites a reference test, but its evidence cites no excerpt of a file the host read as production; cite the production excerpt that the test exercises, or give an untestedReason.`);
+      }
       return { pattern: asString(pattern.pattern, "adopted pattern", 400), evidence, testEvidence, ...(untestedReason ? { untestedReason } : {}) };
     });
     const rejectedPatterns = asArray(item.rejectedPatterns, `referenceComparisons[${index + 1}].rejectedPatterns`, 1, 6).map((value, patternIndex) => {
       const pattern = asObject(value, `referenceComparisons[${index + 1}].rejectedPatterns[${patternIndex + 1}]`);
-      const evidence = parseEvidence(pattern.evidence, "rejected pattern evidence", 1, 6);
+      const evidence = parseCitations(pattern.evidence, "rejected pattern evidence", 1, 6, `referenceComparisons[${index + 1}].rejectedPatterns[${patternIndex + 1}].evidence`);
       validateEvidence(evidence, `Rejected pattern for ${candidateId}`, expectedRepository);
       return {
         pattern: asString(pattern.pattern, "rejected pattern", 400),
@@ -857,7 +911,7 @@ export function parsePlan(
   const rawRisks = asArray(result.risks, "risks", 0, 12);
   const risks = rawRisks.map((value, index) => {
     const item = asObject(value, `risks[${index + 1}]`);
-    const evidence = parseEvidence(item.evidence, `risks[${index + 1}].evidence`);
+    const evidence = parseCitations(item.evidence, `risks[${index + 1}].evidence`);
     validateEvidence(evidence, "Risk");
     return { description: asString(item.description, `risks[${index + 1}].description`), evidence };
   });
@@ -872,6 +926,7 @@ export function parsePlan(
     decisions,
     referenceComparisons,
     risks,
+    unquotedCitations,
   };
 }
 
@@ -896,8 +951,8 @@ export interface ParsedReview extends ReviewResult {
 }
 
 // Findings are strict: a malformed one fails the review. Surviving mutants are advisory, so a malformed one never does:
-// the host reads a blank decisionNeeded as null, drops an entry it cannot use and every entry past the cap, and
-// returns a note for each drop.
+// the host reads a blank decisionNeeded as null, drops an entry it cannot use and every entry past the cap, reads a
+// missing or non-list survivingMutants as none, and returns a note for each; each note keeps the plan Draft.
 export function parseReview(value: unknown, brief: IntakeBrief, excerpts: EvidenceExcerpt[]): ParsedReview {
   const result = asObject(value, "Review");
   const allowedRequirements = new Set(brief.requirements.map((requirement) => requirement.id));
@@ -921,7 +976,7 @@ export function parseReview(value: unknown, brief: IntakeBrief, excerpts: Eviden
   });
   const dropped: string[] = [];
   const entries = Array.isArray(result.survivingMutants) ? result.survivingMutants : [];
-  if (result.survivingMutants !== undefined && !Array.isArray(result.survivingMutants)) dropped.push("the host read survivingMutants as none because it is not a list.");
+  if (!Array.isArray(result.survivingMutants)) dropped.push(`the host read survivingMutants as none because ${result.survivingMutants === undefined ? "the review omitted it" : "it is not a list"}.`);
   if (entries.length > MAX_SURVIVING_MUTANTS) dropped.push(`the host dropped ${entries.length - MAX_SURVIVING_MUTANTS} surviving mutant(s) after the first ${MAX_SURVIVING_MUTANTS}.`);
   const survivingMutants = entries.slice(0, MAX_SURVIVING_MUTANTS).flatMap((value, index): SurvivingMutant[] => {
     try {

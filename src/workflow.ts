@@ -32,6 +32,8 @@ import {
   MAX_VERIFICATION_ACCEPTANCES,
   MUTANT_TEXT_MAX,
   UNTESTED_REASON_MAX,
+  MIN_QUOTE_CODE_POINTS,
+  QUOTE_MAX,
   type ParsedPlanPayload,
   type ParsedReview,
 } from "./model-schema.ts";
@@ -146,8 +148,8 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
   let checkpointPlan: PlanDocument | undefined;
   let checkpointRepositoryChoices: RepositoryChoice[] = [];
   let savedCheckpointPath: string | undefined;
-  // The reference-test gap of the current plan, which is in its readinessNotes but reaches `gaps` only at the final
-  // step; until then each checkpoint adds it, so its gaps match its plan notes.
+  // The gaps of the current plan (planGaps), which are in its readinessNotes but reach `gaps` only at the final step;
+  // until then each checkpoint adds them, so its gaps match its plan notes.
   let planTestGaps: ResearchGap[] = [];
   const progress = (event: ProgressEvent): void => options.onProgress?.(event);
   const now = options.now ?? (() => new Date());
@@ -509,7 +511,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         parsedPlan = parsePlan(repaired, brief, evidence.excerpts, commands, selectedSnapshots, evidence.sources);
         validationHistory.at(-1)!.resolved = true;
         validationIssues.splice(validationIssues.indexOf(issue), 1);
-        progress({ stage: "plan_repair", state: "completed", message: "The repaired plan passed host structure, coverage, dependency, command, and citation checks." });
+        progress({ stage: "plan_repair", state: "completed", message: "The repaired plan passed host structure, coverage, dependency, command, and citation ID checks; any quote the host did not count as found stays marked." });
       } catch (repairError) {
         if (options.signal?.aborted || repairError instanceof InterruptedWorkflowError) throw repairError;
         const repairIssue = safeValidationMessage(repairError);
@@ -524,7 +526,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       plan = placeholderPlan(brief, repositoryChoices, "validation", validationIssues);
       progress({ stage: "plan", state: "warning", message: "A usable task map could not pass host validation; the report will show the blocker as Draft." });
     } else {
-      planTestGaps = referenceTestGaps(parsedPlan);
+      planTestGaps = planGaps(parsedPlan);
       const draftReviewNotes = [...gaps, ...planTestGaps].filter((gap) => gap.material).map((gap) => gap.message);
       const initialReadiness = parsedPlan.shouldDraft || draftReviewNotes.length > 0 ? "draft" : "ready";
       plan = createPlanDocument(parsedPlan, brief, initialReadiness, draftReviewNotes, repositoryChoices, selectedSnapshots, selectedRationales);
@@ -541,11 +543,12 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       return { status: "error", message, ...(savedCheckpointPath ? { checkpointPath: savedCheckpointPath } : {}) };
     }
 
-    // Keeps a review and records each surviving mutant the host dropped from it as an informational gap.
+    // Keeps a review and records each surviving mutant the host dropped from it as a material gap: a dropped entry may be
+    // a surviving mutant of the latest review or an open decision of any review, so the review cannot support Ready.
     const recordReview = (parsed: ParsedReview): ReviewResult => {
       const { dropped, ...review } = parsed;
       reviews.push(review);
-      for (const note of dropped) gaps.push({ kind: "review", material: false, message: `In review ${reviews.length}, ${note}` });
+      for (const note of dropped) gaps.push({ kind: "review", material: true, message: `In review ${reviews.length}, ${note}` });
       return review;
     };
     // Set when a repair passed host validation but its follow-up review did not complete: then no review describes the
@@ -559,12 +562,14 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       // A surviving mutant that needs no business decision is repaired like a material finding; one that needs a
       // decision never reaches the planner.
       const repairableMutants = firstReview.survivingMutants.filter((mutant) => !mutant.decisionNeeded);
-      const importantFindings = [
+      const reviewFindings = [
         ...firstReview.findings.filter((finding) => finding.severity !== "minor"),
         ...survivingMutantFindings(repairableMutants, brief),
       ];
+      const hostFindings = unquotedCitationFindings(parsedPlan);
+      const importantFindings = [...reviewFindings, ...hostFindings];
       if (importantFindings.length > 0) {
-        progress({ stage: "plan_repair", state: "started", message: `Repairing ${importantFindings.length} independent review finding(s) once.` });
+        progress({ stage: "plan_repair", state: "started", message: `Repairing ${reviewFindings.length} independent review finding(s) and ${hostFindings.length} host finding(s) once.` });
         let repairedPlan = false;
         try {
           const repaired = await modelJson(
@@ -577,7 +582,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
           );
           const repairedPayload = parsePlan(repaired, brief, evidence.excerpts, commands, selectedSnapshots, evidence.sources);
           parsedPlan = repairedPayload;
-          planTestGaps = referenceTestGaps(repairedPayload);
+          planTestGaps = planGaps(repairedPayload);
           plan = createPlanDocument(repairedPayload, brief, "draft", planTestGaps.map((gap) => gap.message), repositoryChoices, selectedSnapshots, selectedRationales);
           checkpointPlan = plan;
           await saveCheckpoint("plan");
@@ -612,9 +617,9 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       progress({ stage: "review", state: "completed", message: `Independent review recorded ${reviews.reduce((count, review) => count + review.findings.length, 0)} finding(s) and ${reviews.reduce((count, review) => count + review.survivingMutants.length, 0)} surviving mutant(s).` });
     }
 
-    // Computed from the final plan, so a repair that cites a reference test clears it. From here on it is in gaps, and
-    // a checkpoint does not add it again.
-    gaps.push(...referenceTestGaps(parsedPlan));
+    // Computed from the final plan, so a repair that cites a reference test or fixes a quote clears its gap, and a repair
+    // that breaks a quote adds one. From here on they are in gaps, and a checkpoint does not add them again.
+    gaps.push(...planGaps(parsedPlan));
     planTestGaps = [];
     // The first review describes the plan before a repair; when the follow-up review did not complete, no review
     // describes the plan in the report, and the unreviewed-repair note keeps it Draft instead.
@@ -1007,10 +1012,11 @@ function planGenerationPrompt(
     "Map every host-assigned requirement R* and acceptance criterion A* to one or more topologically ordered tasks T*. Every task needs an observable acceptance condition and a verification method. Every task acceptance condition must cover its A* IDs, and every A* ID must be covered and verified.",
     "Include an architecture overview and at least one module with concrete interfaces. Describe data entities when the brief needs persisted or exchanged data; otherwise give a specific reason data modeling is not applicable. State applicable invariants and access boundaries; use a concrete notApplicableReason only when the clarified brief has none. Each module, entity, invariant, and access boundary needs source evidence or a concrete newDesignReason. Do not invent services, databases, roles, or permissions beyond the clarified brief.",
     "Use evidence excerpt IDs exactly as supplied. The host will replace each excerpt ID with its actual source path, commit, hash, permalink, and 1-based line range. Every consequential design decision needs evidence or a concrete newDesignReason. Compare every selected repository: include at least one adopted pattern with evidence, one rejected pattern with a reason, and a local adaptation; comparator evidence must come from that exact repository commit. Keep source findings distinct from proposed implementation and proposed checks.",
-    "For each adopted pattern, put in testEvidence the excerpts of that comparator's own tests (sources with role test) that exercise the code the pattern adopts, and set untestedReason to null. When no supplied test excerpt exercises it, give an empty testEvidence and a concrete untestedReason. A reference test was read, not run. A verification that ports a reference test case names that test's excerpt ID in its description.",
+    `In each evidence entry, set quote to the passage of that excerpt's untrustedSourceText that shows what the claim says: one contiguous passage, copied character for character, of ${MIN_QUOTE_CODE_POINTS} to ${QUOTE_MAX} characters after whitespace is collapsed. Do not shorten it with an ellipsis, join separate passages, or quote another excerpt, even one of the same file. The host looks for the quote only in the excerpt the entry cites; a shorter, longer or unfound quote counts as not found and keeps the plan Draft.`,
+    "For each adopted pattern, put in testEvidence the excerpts of that comparator's own tests (sources with role test) that exercise the code the pattern adopts, cite that code's production excerpts (sources with role production) in the pattern's evidence, and set untestedReason to null. When no supplied test excerpt exercises it, or no supplied production excerpt shows the code that the test exercises, give an empty testEvidence and a concrete untestedReason. A reference test was read, not run. A verification that ports a reference test case names that test's excerpt ID in its description.",
     "For existing verification commands, choose only a supplied commandId. For a new command, use kind to_create and put the command in plannedCommand. Use manual for checks that do not run a command. No target tests have been run. Do not assert that anything is implemented, executed, or passed.",
     "For every verification, fill rejectsMutants with at least one wrong implementation for each acceptance ID it covers. A wrong implementation is one specific mistake in the code this plan proposes, such as a reversed comparison, a skipped state or permission check, or a missing write. Give the failure its check reports on that mistake: the failing assertion or exact error message for a command, or what the person sees for a manual check. Pick mistakes that change the observable outcome, so the check fails on the mistake alone and passes on the correct code. Nobody has applied these mistakes or run these checks; describe the expected failure, not a result.",
-    `The host rejects a plan that breaks any of these limits: a verification names at most ${MAX_VERIFICATION_ACCEPTANCES} wrong implementations; the acceptanceId of each wrong implementation is an A* ID that the same verification lists in coversAcceptanceIds; wrongImplementation and observedFailure each have at most ${MUTANT_TEXT_MAX} characters; an untestedReason has at most ${UNTESTED_REASON_MAX} characters; testEvidence cites only excerpts of sources with role test from that comparison's repository at its pinned commit.`,
+    `The host rejects a plan that breaks any of these limits: a verification names at most ${MAX_VERIFICATION_ACCEPTANCES} wrong implementations; the acceptanceId of each wrong implementation is an A* ID that the same verification lists in coversAcceptanceIds; wrongImplementation and observedFailure each have at most ${MUTANT_TEXT_MAX} characters; an untestedReason has at most ${UNTESTED_REASON_MAX} characters; testEvidence cites only excerpts of sources with role test from that comparison's repository at its pinned commit; an adopted pattern with testEvidence also cites in its evidence an excerpt of a source with role production from that repository.`,
     "Set shouldDraft when important decisions or material source evidence remain unresolved, and explain it in draftReasons. Do not use general caveats as a reason to draft.",
     briefApprovalStatus(approval),
     "Return only the requested JSON.",
@@ -1034,9 +1040,10 @@ function reviewPrompt(originalRequirement: string, brief: IntakeBrief, answers: 
   return [
     "Independently review this plan against the clarified brief and host-recorded source evidence.",
     "Check requirement and acceptance coverage, dependency cycles/order, source path and commit grounding, cited excerpt relevance, architecture/modules/interfaces, data-model choices, invariants, access boundaries, command provenance, and any claim that checks were run. Check the clarified answers as binding constraints. Look for missing failure, permission, cancellation, persistence, and concurrency cases where they apply to the brief.",
-    "For each adopted pattern, check that every testEvidence excerpt is a test that exercises the code the pattern adopts; a cited test that does not is an unsupported citation. When the plan's readinessNotes say that no adopted pattern cites a reference test and a supplied test excerpt of that comparator exercises an adopted pattern, report a material finding that names the excerpt.",
+    "Each plan citation has a quote and a host flag quoteInExcerpt. The flag says only that the host found the quote in the cited excerpt, not that the quote supports the claim; a citation whose quote does not support its claim is an unsupported citation.",
+    "For each adopted pattern, check that every testEvidence excerpt is a test that exercises the production excerpts that the same pattern cites in evidence; a cited test that does not is an unsupported citation. When the plan's readinessNotes say that no adopted pattern pairs a reference test with the production code it exercises, and a supplied test excerpt of that comparator exercises an adopted pattern whose code a supplied production excerpt of the same comparator shows, report a material finding that names both excerpts.",
     "Then try to falsify each acceptance criterion A*: construct one plausible wrong implementation that every planned check covering it would still pass, including the rejected mutants that the checks name. Construct the counterexample first; do not argue that the checks are sufficient. Report each counterexample in survivingMutants with its A* ID, the wrong implementation, and why every planned check for that A* would still pass. Return an empty survivingMutants array when the planned checks reject every plausible wrong implementation you can construct.",
-    `Set acceptanceId to an acceptance criterion ID of the brief (A1, A2, ...), never to a task acceptance ID such as T1-A1. List at most ${MAX_SURVIVING_MUTANTS} surviving mutants, the most consequential first; the host drops every entry after the ${MAX_SURVIVING_MUTANTS}th and every entry whose acceptanceId is not an A* ID of the brief.`,
+    `Set acceptanceId to an acceptance criterion ID of the brief (A1, A2, ...), never to a task acceptance ID such as T1-A1. List at most ${MAX_SURVIVING_MUTANTS} surviving mutants, the most consequential first; the host drops every entry after the ${MAX_SURVIVING_MUTANTS}th and every entry whose acceptanceId is not an A* ID of the brief. Each dropped entry, and a review without a survivingMutants array, keeps the plan Draft.`,
     "A named rejected mutant whose check would still pass on it is a surviving mutant; begin its wrongImplementation with the mutant ID. A named mutant that behaves like a correct implementation, so that no check can fail on it, is a material finding that names the mutant ID.",
     "Set decisionNeeded only when a business choice that the brief and resolved answers leave open decides whether the implementation is wrong, such as who may act, which state is final, or what a limit is; state that choice as a question. Otherwise set decisionNeeded to null. Do not make the choice yourself.",
     briefApprovalStatus(approval),
@@ -1076,9 +1083,9 @@ function reviewRepairPrompt(
   commands: Array<{ commandId: string; command: string; sourceId: string; line: number }>,
 ): string {
   return [
-    "Repair the current plan for the independent review findings. Preserve complete requirement, acceptance, and verification coverage. Use only the current evidence IDs and supplied command IDs; never claim a check ran.",
+    `Repair the current plan for the findings below, from the independent review or the host's checks. Preserve complete requirement, acceptance, and verification coverage. Use only the current evidence IDs and supplied command IDs; never claim a check ran. Copy each evidence quote character for character from the excerpt that the entry cites: ${MIN_QUOTE_CODE_POINTS} to ${QUOTE_MAX} characters after whitespace is collapsed; a shorter, longer or unfound quote counts as not found and keeps the plan Draft.`,
     "When a repair changes a verification, update its rejectsMutants so each covered acceptance ID keeps at least one wrong implementation and the failure the changed check reports on it.",
-    "Each adopted pattern keeps either testEvidence that cites a test excerpt of its comparator exercising the pattern, or a concrete untestedReason. When the current plan's readinessNotes say that no adopted pattern cites a reference test, cite such a test excerpt where one is supplied; never cite a test that does not exercise the pattern to clear the note.",
+    "Each adopted pattern keeps either testEvidence that cites a test excerpt of its comparator exercising the pattern, with the production excerpt that the test exercises in its evidence, or a concrete untestedReason. When the current plan's readinessNotes say that no adopted pattern pairs a reference test with the production code it exercises, cite such a test excerpt, with the production excerpt of the code it exercises, where both are supplied; never cite a test that does not exercise the pattern, or a production excerpt that the test does not exercise, to clear the note.",
     briefApprovalStatus(approval),
     "FINDINGS:",
     JSON.stringify(findings),
@@ -1119,6 +1126,25 @@ function survivingMutantFindings(mutants: ReviewResult["survivingMutants"], brie
       suggestedCorrection: `Add or tighten a planned check for ${mutant.acceptanceId} that fails on this wrong implementation, and name the implementation as a rejected mutant of that check.`,
     };
   });
+}
+
+// The most citations that the host's quote finding lists by name; it counts the rest.
+const MAX_LISTED_CITATIONS = 20;
+
+// The bounded repair receives the plan citations whose quote the host did not count as found as one material finding.
+// It names at most MAX_LISTED_CITATIONS of them by their 1-based path and excerpt; their claims, and the rest, are in
+// the current plan with quoteInExcerpt false.
+function unquotedCitationFindings(payload: ParsedPlanPayload): ReviewResult["findings"] {
+  const citations = payload.unquotedCitations;
+  if (citations.length === 0) return [];
+  const more = citations.length > MAX_LISTED_CITATIONS ? `; and ${citations.length - MAX_LISTED_CITATIONS} more, each with quoteInExcerpt false in CURRENT PLAN` : "";
+  return [{
+    severity: "material",
+    description: `The host did not count the quote of these citations as found in the excerpt each cites (it counts a quote only when, after whitespace is collapsed, it has ${MIN_QUOTE_CODE_POINTS} to ${QUOTE_MAX} characters and appears in that excerpt). Each is named by its path in the plan output, with indices counted from 1: ${citations.slice(0, MAX_LISTED_CITATIONS).join("; ")}${more}.`,
+    requirementIds: [],
+    evidence: [],
+    suggestedCorrection: `Give each of these citations a quote of ${MIN_QUOTE_CODE_POINTS} to ${QUOTE_MAX} characters copied character for character from the excerpt it cites, or cite the excerpt that holds the quoted text.`,
+  }];
 }
 
 // The Draft reason of a repaired plan whose follow-up review did not complete.
@@ -1207,13 +1233,21 @@ function buildRepositoryChoices(
   });
 }
 
-// A plan whose adopted patterns cite no test of their comparator takes the reference code on trust. The gap belongs to
-// the plan, so the host computes it again for a repaired plan. Without a comparison there is no adopted pattern, and a
+// When no adopted pattern pairs a reference test with the production code it exercises, no read reference test stands
+// behind the adopted reference code. The gap belongs to the plan, so the host computes it again for a repaired plan. Without a comparison there is no adopted pattern, and a
 // search or selection gap already keeps the plan Draft.
 function referenceTestGaps(payload: ParsedPlanPayload): ResearchGap[] {
   const patterns = payload.referenceComparisons.flatMap((comparison) => comparison.adoptedPatterns);
   if (patterns.length === 0 || patterns.some((pattern) => pattern.testEvidence.length > 0)) return [];
-  return [{ kind: "repository", material: true, message: "No adopted pattern cites a reference test that exercises it; the reference comparison rests on production excerpts alone. The host recognises a test file by its path name only, so a comparator test whose path it does not recognise cannot be cited." }];
+  return [{ kind: "repository", material: true, message: "No adopted pattern pairs a reference test with the production code it exercises, so no read reference test stands behind the adopted reference code. The host recognises a test file by its path name only, so a comparator test whose path it does not recognise cannot be cited." }];
+}
+
+// The gaps of one plan, computed again for a repaired plan: the reference-test gap, and one for the plan citations whose
+// quote the host did not count as found in the excerpt each cites.
+function planGaps(payload: ParsedPlanPayload): ResearchGap[] {
+  const unquoted = payload.unquotedCitations.length;
+  const quoteGap: ResearchGap[] = unquoted > 0 ? [{ kind: "validation", material: true, message: `The host did not count the quote of ${unquoted} plan citation(s) as found in the excerpt each cites; plan.md marks each one, and the plan JSON gives each quoteInExcerpt false.` }] : [];
+  return [...referenceTestGaps(payload), ...quoteGap];
 }
 
 // A selected comparator counts only when the planner received an excerpt of its production or test source.

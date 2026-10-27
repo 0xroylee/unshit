@@ -49,6 +49,12 @@ const excerpts: EvidenceExcerpt[] = [
   { id: "E2", sourceId: "S2", startLine: 5, endLine: 9, text: "repository A source" },
   { id: "E3", sourceId: "S3", startLine: 2, endLine: 6, text: "repository B source" },
 ];
+// The text of each fixture excerpt, E4 and E5 being the reference test excerpts below and E6 and E7 a manifest and a
+// document of repository A. A plan citation quotes the excerpt it cites.
+const excerptQuotes: Record<string, string> = { E1: "local source", E2: "repository A source", E3: "repository B source", E4: "repository A test", E5: "repository B test", E6: "repository A manifest", E7: "repository A design notes" };
+function cite(excerptId: string, claim: string): { excerptId: string; claim: string; quote: string } {
+  return { excerptId, claim, quote: excerptQuotes[excerptId] ?? "text that no fixture excerpt holds" };
+}
 
 function plan(comparisonEvidence = "E2", snapshots: RepositorySnapshot[] = [snapshot("C1", "org/a", "a".repeat(40))]): Record<string, any> {
   return {
@@ -58,12 +64,12 @@ function plan(comparisonEvidence = "E2", snapshots: RepositorySnapshot[] = [snap
     draftReasons: [],
     design: {
       architecture: "A request handler validates the refund request and records it.",
-      modules: [{ name: "Refund handler", responsibility: "Validate and record refunds.", interfaces: ["POST /refunds"], evidence: [{ excerptId: "E1", claim: "The local project uses a request handler." }], newDesignReason: null }],
+      modules: [{ name: "Refund handler", responsibility: "Validate and record refunds.", interfaces: ["POST /refunds"], evidence: [cite("E1", "The local project uses a request handler.")], newDesignReason: null }],
       dataModel: {
-        entities: [{ name: "RefundRequest", fields: ["requestId", "amount", "status"], evidence: [{ excerptId: "E1", claim: "Existing project entities use explicit status." }], newDesignReason: null }],
+        entities: [{ name: "RefundRequest", fields: ["requestId", "amount", "status"], evidence: [cite("E1", "Existing project entities use explicit status.")], newDesignReason: null }],
         notApplicableReason: null,
       },
-      invariants: { items: [{ statement: "A refund cannot exceed the original charge.", evidence: [{ excerptId: "E1", claim: "The source validates monetary limits." }], newDesignReason: null }], notApplicableReason: null },
+      invariants: { items: [{ statement: "A refund cannot exceed the original charge.", evidence: [cite("E1", "The source validates monetary limits.")], newDesignReason: null }], notApplicableReason: null },
       accessControl: { boundaries: [], notApplicableReason: "The clarified brief does not specify authenticated actors or access restrictions." },
     },
     tasks: [{
@@ -81,13 +87,13 @@ function plan(comparisonEvidence = "E2", snapshots: RepositorySnapshot[] = [snap
         plannedCommand: null,
         rejectsMutants: [{ acceptanceId: "A1", wrongImplementation: "The handler returns success without saving the request.", observedFailure: "The inspected record list has no refund request." }],
       }],
-      evidence: [{ excerptId: "E1", claim: "The local application has a request-handling entry point." }],
+      evidence: [cite("E1", "The local application has a request-handling entry point.")],
     }],
     decisions: [],
     referenceComparisons: snapshots.map((repository) => ({
       candidateId: repository.candidate.id,
-      adoptedPatterns: [{ pattern: "Use a request status field.", evidence: [{ excerptId: repository.candidate.id === "C1" ? comparisonEvidence : "E3", claim: "The comparator records request state." }], testEvidence: [], untestedReason: "No test of the comparator was read for this fixture." }],
-      rejectedPatterns: [{ pattern: "Use a synchronous provider call.", reason: "It would keep a user request blocked on the external service.", evidence: [{ excerptId: repository.candidate.id === "C1" ? comparisonEvidence : "E3", claim: "The comparator performs synchronous provider work." }] }],
+      adoptedPatterns: [{ pattern: "Use a request status field.", evidence: [cite(repository.candidate.id === "C1" ? comparisonEvidence : "E3", "The comparator records request state.")], testEvidence: [], untestedReason: "No test of the comparator was read for this fixture." }],
+      rejectedPatterns: [{ pattern: "Use a synchronous provider call.", reason: "It would keep a user request blocked on the external service.", evidence: [cite(repository.candidate.id === "C1" ? comparisonEvidence : "E3", "The comparator performs synchronous provider work.")] }],
       localAdaptation: "Use the local persistence conventions.",
     })),
     risks: [],
@@ -467,42 +473,67 @@ describe("reference test evidence", () => {
   const repoB = snapshot("C2", "org/b", "b".repeat(40));
   const testSourceA = source("S4", "remote", { provider: "github", repository: "org/a", commitSha: "a".repeat(40), path: "tests/refund.test.ts", roles: ["test"] });
   const testSourceB = source("S5", "remote", { provider: "github", repository: "org/b", commitSha: "b".repeat(40), path: "tests/refund.test.ts", roles: ["test"] });
-  const sources = [localSource, sourceA, sourceB, testSourceA, testSourceB];
+  // The manifest that the host read for repository A, and a document that a request added, which the host reads as config.
+  const manifestSourceA = source("S6", "remote", { provider: "github", repository: "org/a", commitSha: "a".repeat(40), path: "package.json", roles: ["manifest"] });
+  const documentSourceA = source("S7", "remote", { provider: "github", repository: "org/a", commitSha: "a".repeat(40), path: "docs/design.md", roles: ["config"] });
+  const sources = [localSource, sourceA, sourceB, testSourceA, testSourceB, manifestSourceA, documentSourceA];
   const testExcerpts: EvidenceExcerpt[] = [
     ...excerpts,
     { id: "E4", sourceId: "S4", startLine: 1, endLine: 6, text: "repository A test" },
     { id: "E5", sourceId: "S5", startLine: 1, endLine: 6, text: "repository B test" },
+    { id: "E6", sourceId: "S6", startLine: 1, endLine: 6, text: "repository A manifest" },
+    { id: "E7", sourceId: "S7", startLine: 1, endLine: 6, text: "repository A design notes" },
   ];
   // Sets the reference test fields of the first adopted pattern of the first comparison.
   const withTest = (output: Record<string, any>, testEvidence: unknown, untestedReason: unknown): Record<string, any> => {
     Object.assign(output.referenceComparisons[0].adoptedPatterns[0], { testEvidence, untestedReason });
     return output;
   };
-  const testRef = { excerptId: "E4", claim: "The comparator test records a pending refund." };
+  const testRef = cite("E4", "The comparator test records a pending refund.");
 
   test("keeps the cited reference test or the untested reason on each adopted pattern", () => {
     const parsed = parsePlan(withTest(plan("E2", [repoA, repoB]), [testRef], null), brief, testExcerpts, [], [repoA, repoB], sources);
     expect(parsed.referenceComparisons[0]!.adoptedPatterns[0]).toEqual({
       pattern: "Use a request status field.",
-      evidence: [{ excerptId: "E2", claim: "The comparator records request state." }],
-      testEvidence: [testRef],
+      evidence: [{ ...cite("E2", "The comparator records request state."), quoteInExcerpt: true }],
+      testEvidence: [{ ...testRef, quoteInExcerpt: true }],
     });
     expect(parsed.referenceComparisons[1]!.adoptedPatterns[0]).toEqual({
       pattern: "Use a request status field.",
-      evidence: [{ excerptId: "E3", claim: "The comparator records request state." }],
+      evidence: [{ ...cite("E3", "The comparator records request state."), quoteInExcerpt: true }],
       testEvidence: [],
       untestedReason: "No test of the comparator was read for this fixture.",
     });
   });
 
   test("rejects a reference test citation from a file the host did not read as a test", () => {
-    const output = withTest(plan("E2", [repoA]), [{ excerptId: "E2", claim: "The handler is tested." }], null);
+    const output = withTest(plan("E2", [repoA]), [cite("E2", "The handler is tested.")], null);
     expect(() => parsePlan(output, brief, testExcerpts, [], [repoA], sources)).toThrow("Adopted pattern test for C1 cites E2 from S2.ts, which the host did not read as a test file.");
   });
 
   test("rejects a reference test citation from another comparator's tests", () => {
-    const output = withTest(plan("E2", [repoA, repoB]), [{ excerptId: "E5", claim: "The other comparator tests refunds." }], null);
+    const output = withTest(plan("E2", [repoA, repoB]), [cite("E5", "The other comparator tests refunds.")], null);
     expect(() => parsePlan(output, brief, testExcerpts, [], [repoA, repoB], sources)).toThrow(`Adopted pattern test for C1 must cite evidence from github:org/a@${"a".repeat(40)}.`);
+  });
+
+  test("rejects a reference test on an adopted pattern whose evidence holds no production excerpt", () => {
+    // Run 11: graphify's adopted pattern cited its test excerpt E16 as both evidence and testEvidence.
+    expect(() => parsePlan(withTest(plan("E4", [repoA]), [testRef], null), brief, testExcerpts, [], [repoA], sources)).toThrow("Adopted pattern 1 for C1 cites a reference test, but its evidence cites no excerpt of a file the host read as production; cite the production excerpt that the test exercises, or give an untestedReason.");
+  });
+
+  test("rejects a reference test on an adopted pattern whose evidence cites only a manifest or a document excerpt", () => {
+    const message = "Adopted pattern 1 for C1 cites a reference test, but its evidence cites no excerpt of a file the host read as production; cite the production excerpt that the test exercises, or give an untestedReason.";
+    // Only the production role pairs a test: a manifest (E6) or a requested document read as config (E7) does not.
+    for (const excerptId of ["E6", "E7"]) {
+      expect(() => parsePlan(withTest(plan(excerptId, [repoA]), [testRef], null), brief, testExcerpts, [], [repoA], sources)).toThrow(message);
+    }
+  });
+
+  test("accepts a tested pattern with one production excerpt among its evidence, and an untested pattern that rests on a test excerpt", () => {
+    const mixed = withTest(plan("E4", [repoA]), [testRef], null);
+    mixed.referenceComparisons[0].adoptedPatterns[0].evidence.push(cite("E2", "The handler records the status."));
+    expect(parsePlan(mixed, brief, testExcerpts, [], [repoA], sources).referenceComparisons[0]!.adoptedPatterns[0]!.testEvidence).toEqual([{ ...testRef, quoteInExcerpt: true }]);
+    expect(parsePlan(plan("E4", [repoA]), brief, testExcerpts, [], [repoA], sources).referenceComparisons[0]!.adoptedPatterns[0]!.untestedReason).toBe("No test of the comparator was read for this fixture.");
   });
 
   test("requires exactly one of reference test evidence and a non-blank untested reason", () => {
@@ -521,14 +552,187 @@ describe("reference test evidence", () => {
     const comparisons = (PLAN_SCHEMA.properties as Record<string, any>).referenceComparisons;
     const pattern = comparisons.items.properties.adoptedPatterns.items;
     expect(pattern.required).toEqual(["pattern", "evidence", "testEvidence", "untestedReason"]);
-    // Each test citation has the shape of a production citation, so parseEvidence accepts what a strict model returns.
+    // Each test citation has the shape of a production citation, so parseQuotedEvidence accepts what a strict model returns.
     expect(pattern.properties.testEvidence).toEqual({
       type: "array",
-      items: { type: "object", properties: { excerptId: { type: "string" }, claim: { type: "string" } }, required: ["excerptId", "claim"], additionalProperties: false },
+      items: { type: "object", properties: { excerptId: { type: "string" }, claim: { type: "string" }, quote: { type: "string" } }, required: ["excerptId", "claim", "quote"], additionalProperties: false },
       maxItems: 6,
     });
     expect(pattern.properties.testEvidence.items).toEqual(pattern.properties.evidence.items);
     expect(pattern.properties.untestedReason).toEqual({ type: ["string", "null"] });
+  });
+});
+
+describe("citation quotes", () => {
+  const repoA = snapshot("C1", "org/a", "a".repeat(40));
+  const testSourceA = source("S4", "remote", { provider: "github", repository: "org/a", commitSha: "a".repeat(40), path: "tests/refund.test.ts", roles: ["test"] });
+  const testSourceB = source("S5", "remote", { provider: "github", repository: "org/b", commitSha: "b".repeat(40), path: "tests/refund.test.ts", roles: ["test"] });
+  const sources = [localSource, sourceA, sourceB, testSourceA, testSourceB];
+  // E6 is a second excerpt of the local file S1, from lines that E1 does not hold. E11 to E15 are excerpts of other local
+  // files: ten indented lines, Chinese and full-width text, Go indented with tabs, 320 x's and 220 emoji.
+  const indentedLines = Array.from({ length: 10 }, (_, index) => `            total += item${index}.amount;`).join("\n");
+  const quoteExcerpts: EvidenceExcerpt[] = [
+    ...excerpts,
+    { id: "E4", sourceId: "S4", startLine: 1, endLine: 6, text: "repository A test" },
+    { id: "E6", sourceId: "S1", startLine: 9, endLine: 11, text: "export function approveRefund(refund) {\n  return { ...refund, status: 'approved', mood: '😀' };\n}" },
+    { id: "E11", sourceId: "S1", startLine: 20, endLine: 30, text: `function total(items) {\n${indentedLines}\n}\nconst spacing = 'a  b  c  d';` },
+    { id: "E12", sourceId: "S1", startLine: 40, endLine: 41, text: "// 计算退款金额（不含运费），单位：分\nexport const refundCents = (order) => order.total - order.shipping;" },
+    { id: "E13", sourceId: "S1", startLine: 50, endLine: 55, text: "func refundAmount(order Order) int {\n\tif order.Total <= 0 {\n\t\treturn 0\n\t}\n\treturn order.Total - order.Shipping\n}" },
+    { id: "E14", sourceId: "S1", startLine: 60, endLine: 60, text: `// ${"x".repeat(320)}` },
+    { id: "E5", sourceId: "S5", startLine: 1, endLine: 6, text: "repository B test" },
+    { id: "E15", sourceId: "S1", startLine: 70, endLine: 70, text: `// ${"😀".repeat(220)}` },
+  ];
+  // Parses plan() with one task citation and returns that citation.
+  const taskCitation = (excerptId: string, quote: unknown) => {
+    const output = plan();
+    output.tasks[0]!.evidence = [{ excerptId, claim: "The handler sets the refund status.", quote }];
+    return parsePlan(output, brief, quoteExcerpts, [], [repoA], sources).tasks[0]!.evidence[0]!;
+  };
+
+  test("keeps a plan citation's quote normalized and finds it only in the lines of the excerpt it cites", () => {
+    expect(taskCitation("E6", "approveRefund(refund)   {\n    return { ...refund")).toEqual({ excerptId: "E6", claim: "The handler sets the refund status.", quote: "approveRefund(refund) { return { ...refund", quoteInExcerpt: true });
+    expect(taskCitation("E1", "local source").quoteInExcerpt).toBe(true);
+    // E6, another excerpt of the same file S1, holds this text; E1, the cited excerpt, does not.
+    expect(taskCitation("E1", "status: 'approved'")).toMatchObject({ quote: "status: 'approved'", quoteInExcerpt: false });
+    expect(taskCitation("E6", "status: 'refunded'").quoteInExcerpt).toBe(false);
+    // Fewer than eight code points prove nothing, even when the excerpt holds them; the emoji is one code point.
+    expect(taskCitation("E6", "approveR").quoteInExcerpt).toBe(true);
+    expect(taskCitation("E6", "approve").quoteInExcerpt).toBe(false);
+    expect(taskCitation("E6", ": '😀' }").quoteInExcerpt).toBe(false);
+  });
+
+  test("rejects only a quote that is not text, and keeps an empty, too short, too long or unfound quote with its reason", () => {
+    expect(() => taskCitation("E1", undefined)).toThrow("T1.evidence[1].quote must be text.");
+    expect(() => taskCitation("E1", 3)).toThrow("T1.evidence[1].quote must be text.");
+    expect(taskCitation("E1", " \n ")).toEqual({ excerptId: "E1", claim: "The handler sets the refund status.", quote: "", quoteInExcerpt: false, quoteProblem: "empty" });
+    expect(taskCitation("E6", "approve")).toEqual({ excerptId: "E6", claim: "The handler sets the refund status.", quote: "approve", quoteInExcerpt: false, quoteProblem: "too_short" });
+    // E14 holds 320 x's: a quote of 300 counts as found; one of 301 is over the limit and is kept cut to 300.
+    expect(taskCitation("E14", "x".repeat(300))).toEqual({ excerptId: "E14", claim: "The handler sets the refund status.", quote: "x".repeat(300), quoteInExcerpt: true });
+    expect(taskCitation("E14", "x".repeat(301))).toEqual({ excerptId: "E14", claim: "The handler sets the refund status.", quote: "x".repeat(300), quoteInExcerpt: false, quoteProblem: "too_long" });
+    expect(taskCitation("E1", "status: 'approved'")).toEqual({ excerptId: "E1", claim: "The handler sets the refund status.", quote: "status: 'approved'", quoteInExcerpt: false, quoteProblem: "not_found" });
+    // A quote that is too long or too short and also not in its excerpt gets the length reason; a long one is cut.
+    expect(taskCitation("E14", "y".repeat(400))).toEqual({ excerptId: "E14", claim: "The handler sets the refund status.", quote: "y".repeat(300), quoteInExcerpt: false, quoteProblem: "too_long" });
+    expect(taskCitation("E1", "zzz")).toEqual({ excerptId: "E1", claim: "The handler sets the refund status.", quote: "zzz", quoteInExcerpt: false, quoteProblem: "too_short" });
+  });
+
+  test("counts the 300 limit in code points, so a quote of 200 emoji, 400 UTF-16 units, counts as found", () => {
+    const emoji = "😀".repeat(200);
+    expect(emoji).toHaveLength(400);
+    expect(taskCitation("E15", emoji)).toEqual({ excerptId: "E15", claim: "The handler sets the refund status.", quote: emoji, quoteInExcerpt: true });
+  });
+
+  test("names each citation by the 1-based indices of its comparison, pattern, decision, design item and risk", () => {
+    const repoB = snapshot("C2", "org/b", "b".repeat(40));
+    const output = plan("E2", [repoA, repoB]);
+    // A citation whose quote its excerpt does not hold. Each list below has a found citation first and this one after it.
+    const missing = (excerptId: string, claim: string) => ({ ...cite(excerptId, claim), quote: "a passage that no excerpt holds" });
+    output.decisions = [
+      { title: "Keep a status", decision: "Store a status.", rationale: "Requests change state.", evidence: [cite("E1", "The project has local source.")], newDesignReason: null },
+      { title: "Log refunds", decision: "Log each refund.", rationale: "Refunds need a trail.", evidence: [missing("E1", "The project logs refunds.")], newDesignReason: null },
+    ];
+    output.design.modules.push({ ...output.design.modules[0], name: "Refund log", evidence: [missing("E1", "The project has a log module.")] });
+    output.design.dataModel.entities.push({ ...output.design.dataModel.entities[0], name: "RefundLog", evidence: [missing("E1", "Logs are entities.")] });
+    output.design.invariants.items.push({ statement: "A log entry is never edited.", evidence: [missing("E1", "Logs are kept.")], newDesignReason: null });
+    output.design.accessControl = {
+      boundaries: [
+        { boundary: "Refund", behavior: "Only staff refund.", evidence: [cite("E1", "The project checks staff.")], newDesignReason: null },
+        { boundary: "Refund log", behavior: "Only staff read the log.", evidence: [missing("E1", "The project hides the log.")], newDesignReason: null },
+      ],
+      notApplicableReason: null,
+    };
+    output.risks = [
+      { description: "Amounts may drift.", evidence: [cite("E1", "The source rounds amounts.")] },
+      { description: "The log may grow.", evidence: [missing("E1", "The source keeps every entry.")] },
+    ];
+    // The second comparison has three adopted patterns and three rejected ones; the third of each misses its quotes, so
+    // its comparison and pattern indices differ.
+    const second = output.referenceComparisons[1];
+    const adopted = second.adoptedPatterns[0];
+    second.adoptedPatterns = [
+      adopted,
+      { ...adopted, pattern: "Record the amount." },
+      { pattern: "Test the status.", evidence: [missing("E3", "The comparator keeps a status.")], testEvidence: [missing("E5", "Its test checks the status.")], untestedReason: null },
+    ];
+    second.rejectedPatterns = [
+      second.rejectedPatterns[0],
+      { ...second.rejectedPatterns[0], pattern: "Retry the provider at once." },
+      { ...second.rejectedPatterns[0], pattern: "Approve inline.", evidence: [missing("E3", "The comparator approves inline.")] },
+    ];
+    expect(parsePlan(output, brief, quoteExcerpts, [], [repoA, repoB], sources).unquotedCitations).toEqual([
+      "decisions[2].evidence[1] cites E1",
+      "design.modules[2].evidence[1] cites E1",
+      "design.dataModel.entities[2].evidence[1] cites E1",
+      "design.invariants.items[2].evidence[1] cites E1",
+      "design.accessControl.boundaries[2].evidence[1] cites E1",
+      "referenceComparisons[2].adoptedPatterns[3].evidence[1] cites E3",
+      "referenceComparisons[2].adoptedPatterns[3].testEvidence[1] cites E5",
+      "referenceComparisons[2].rejectedPatterns[3].evidence[1] cites E3",
+      "risks[2].evidence[1] cites E1",
+    ]);
+  });
+
+  test("counts a quote's characters after whitespace is collapsed, so ten indented lines fit and 'a  b  c  d' is too short", () => {
+    // 349 characters as written, 229 once the indentation and line breaks are collapsed.
+    expect(indentedLines).toHaveLength(349);
+    expect(taskCitation("E11", indentedLines)).toMatchObject({ quoteInExcerpt: true });
+    expect(taskCitation("E11", indentedLines).quote).toHaveLength(229);
+    // Ten characters as written, seven once collapsed; E11 holds them.
+    expect(taskCitation("E11", "a  b  c  d")).toEqual({ excerptId: "E11", claim: "The handler sets the refund status.", quote: "a b c d", quoteInExcerpt: false, quoteProblem: "too_short" });
+  });
+
+  test("finds a verbatim Chinese and full-width quote, and quotes that only NFKC equates with the excerpt", () => {
+    expect(taskCitation("E12", "// 计算退款金额（不含运费），单位：分")).toMatchObject({ quote: "// 计算退款金额(不含运费),单位:分", quoteInExcerpt: true });
+    // ASCII punctuation in the quote, full-width in the excerpt, and full-width letters in the quote, ASCII in the excerpt.
+    expect(taskCitation("E12", "计算退款金额(不含运费),单位:分").quoteInExcerpt).toBe(true);
+    expect(taskCitation("E12", "ｒｅｆｕｎｄＣｅｎｔｓ = (order)")).toMatchObject({ quote: "refundCents = (order)", quoteInExcerpt: true });
+  });
+
+  test("finds a quote written with spaces in a Go excerpt indented with tabs", () => {
+    expect(taskCitation("E13", "if order.Total <= 0 {\n        return 0\n    }")).toMatchObject({ quote: "if order.Total <= 0 { return 0 }", quoteInExcerpt: true });
+  });
+
+  test("lists every plan citation whose quote the host did not count as found, by its output path, from tasks, decisions, design, comparisons and risks", () => {
+    const withEveryKind = (): Record<string, any> => {
+      const output = plan();
+      output.decisions = [{ title: "Keep a status", decision: "Store a request status.", rationale: "Requests change state.", evidence: [cite("E1", "The project has local source."), cite("E1", "The project keeps request state.")], newDesignReason: null }];
+      output.risks = [{ description: "Amounts may drift.", evidence: [cite("E1", "The source rounds refund amounts.")] }];
+      Object.assign(output.referenceComparisons[0].adoptedPatterns[0], { testEvidence: [cite("E4", "The comparator test records a pending refund.")], untestedReason: null });
+      return output;
+    };
+    expect(parsePlan(withEveryKind(), brief, quoteExcerpts, [], [repoA], sources).unquotedCitations).toEqual([]);
+    const output = withEveryKind();
+    const comparison = output.referenceComparisons[0];
+    for (const citation of [
+      output.tasks[0].evidence[0], output.decisions[0].evidence[1], output.design.modules[0].evidence[0], output.design.dataModel.entities[0].evidence[0],
+      output.design.invariants.items[0].evidence[0], comparison.adoptedPatterns[0].evidence[0], comparison.adoptedPatterns[0].testEvidence[0],
+      comparison.rejectedPatterns[0].evidence[0], output.risks[0].evidence[0],
+    ]) citation.quote = "a passage that no excerpt holds";
+    // The first citation of the decision keeps its quote, so only the second is listed.
+    expect(parsePlan(output, brief, quoteExcerpts, [], [repoA], sources).unquotedCitations).toEqual([
+      "T1.evidence[1] cites E1",
+      "decisions[1].evidence[2] cites E1",
+      "design.modules[1].evidence[1] cites E1",
+      "design.dataModel.entities[1].evidence[1] cites E1",
+      "design.invariants.items[1].evidence[1] cites E1",
+      "referenceComparisons[1].adoptedPatterns[1].evidence[1] cites E2",
+      "referenceComparisons[1].adoptedPatterns[1].testEvidence[1] cites E4",
+      "referenceComparisons[1].rejectedPatterns[1].evidence[1] cites E2",
+      "risks[1].evidence[1] cites E1",
+    ]);
+  });
+
+  test("asks for a quote on every plan citation and none on a review finding", () => {
+    const planProperties = PLAN_SCHEMA.properties as Record<string, any>;
+    const quoted = { type: "object", properties: { excerptId: { type: "string" }, claim: { type: "string" }, quote: { type: "string" } }, required: ["excerptId", "claim", "quote"], additionalProperties: false };
+    expect(planProperties.tasks.items.properties.evidence.items).toEqual(quoted);
+    expect(planProperties.decisions.items.properties.evidence.items).toEqual(quoted);
+    expect(planProperties.design.properties.modules.items.properties.evidence.items).toEqual(quoted);
+    expect(planProperties.referenceComparisons.items.properties.rejectedPatterns.items.properties.evidence.items).toEqual(quoted);
+    expect(planProperties.risks.items.properties.evidence.items).toEqual(quoted);
+    const findingEvidence = (REVIEW_SCHEMA.properties as Record<string, any>).findings.items.properties.evidence.items;
+    expect(findingEvidence).toEqual({ type: "object", properties: { excerptId: { type: "string" }, claim: { type: "string" } }, required: ["excerptId", "claim"], additionalProperties: false });
+    const finding = { severity: "minor", description: "The handler is named twice.", requirementIds: [], evidence: [{ excerptId: "E1", claim: "The project names its handler." }], suggestedCorrection: "Name it once." };
+    expect(parseReview({ findings: [finding], survivingMutants: [] }, brief, excerpts).findings[0]!.evidence).toStrictEqual([{ excerptId: "E1", claim: "The project names its handler." }]);
   });
 });
 
@@ -630,13 +834,14 @@ describe("surviving mutants in review", () => {
     expect(() => parseReview({ findings: [finding], survivingMutants: [] }, reviewBrief, [])).toThrow("Review refers to unknown requirement R9.");
   });
 
-  test("requires survivingMutants in the review schema and reads a review without the key as none", () => {
+  test("requires survivingMutants in the review schema and notes a review without the key", () => {
     const schema = REVIEW_SCHEMA as { required: string[]; properties: { survivingMutants: { maxItems: number; items: { required: string[]; properties: { decisionNeeded: { type: unknown } } } } } };
     expect(schema.required).toEqual(["findings", "survivingMutants"]);
     expect(schema.properties.survivingMutants.maxItems).toBe(12);
     expect(schema.properties.survivingMutants.items.required).toEqual(["acceptanceId", "wrongImplementation", "whyPlannedChecksPass", "decisionNeeded"]);
     expect(schema.properties.survivingMutants.items.properties.decisionNeeded.type).toEqual(["string", "null"]);
-    expect(parseReview({ findings: [] }, reviewBrief, [])).toStrictEqual({ findings: [], survivingMutants: [], dropped: [] });
+    expect(parseReview({ findings: [] }, reviewBrief, [])).toStrictEqual({ findings: [], survivingMutants: [], dropped: ["the host read survivingMutants as none because the review omitted it."] });
+    expect(parseReview({ findings: [], survivingMutants: [] }, reviewBrief, []).dropped).toEqual([]);
   });
 });
 

@@ -1,7 +1,9 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import { renderReport } from "../src/report.ts";
 import { parseIntake } from "../src/model-schema.ts";
-import type { BriefApproval, EvidenceSource, FinalSource, PlanDocument, PlanTask, RepositoryChoice, ResearchSummary } from "../src/types.ts";
+import type { BriefApproval, EvidenceSource, FinalSource, PlanDocument, PlanTask, QuotedEvidenceRef, RepositoryChoice, ResearchSummary } from "../src/types.ts";
 
 test("renders failed queries with host failure descriptions and GitLab report citations", () => {
   const brief = parseIntake({
@@ -44,7 +46,7 @@ test("renders failed queries with host failure descriptions and GitLab report ci
         description: "Submit a request and inspect the record.",
         rejectsMutants: [{ id: "T1-V1-M1", acceptanceId: "A1", wrongImplementation: "The endpoint returns success without saving the request.", observedFailure: "The inspected record list has no refund request." }],
       }],
-      evidence: [{ excerptId: "E1", claim: "The reference validates refund inputs." }],
+      evidence: [{ excerptId: "E1", claim: "The reference validates refund inputs.", quote: "source text", quoteInExcerpt: true }],
     }],
     decisions: [],
     design: {
@@ -329,7 +331,7 @@ describe("trusted, not checked", () => {
   test("states what citations, local sources and the review are trusted for, with or without a comparator", () => {
     for (const report of [render([]), render([github])]) {
       const section = trustedSection(report);
-      expect(section).toContain("- The claim next to each citation is written by the model. The host checks only that the excerpt ID exists, and for a reference comparison that the excerpt comes from that repository at the pinned commit and, for a cited reference test, from a file it read as a test; it then shows the line range it recorded when it read the file.\n");
+      expect(section).toContain("- The claim next to each citation is written by the model. The host checks only that the excerpt ID exists, that the quote of a plan citation appears in that excerpt, and for a reference comparison that the excerpt comes from that repository at the pinned commit and, for a cited reference test, from a file it read as a test, with an excerpt of a file it read as production cited by the same pattern; it then shows the line range it recorded when it read the file. That the quoted text supports the claim rests on the planner and the independent review.\n");
       expect(section).toContain("- Local sources are identified by the SHA-256 of the content this run read, taken after any redaction, not by a commit.\n");
       expect(section).toContain("- The independent review is the same model in a fresh session.\n");
       expect(section).toContain("- Surviving mutants, and the lack of them, are the reviewer model's reasoning: unshit applied and ran none of them, and a review that reports none does not show that the planned checks reject every wrong implementation.\n");
@@ -380,17 +382,17 @@ describe("trusted, not checked", () => {
       selectionRationale: "Implements refunds.",
       adoptedPatterns: patterns.map((tests) => ({
         pattern: "Keep a refund status.",
-        evidence: [{ excerptId: "E1", claim: "The model has a status." }],
-        testEvidence: tests.map((excerptId) => ({ excerptId, claim: "The test moves a refund to approved." })),
+        evidence: [{ excerptId: "E1", claim: "The model has a status.", quote: "status: 'pending'", quoteInExcerpt: true }],
+        testEvidence: tests.map((excerptId) => ({ excerptId, claim: "The test moves a refund to approved.", quote: "moves a refund to approved", quoteInExcerpt: true })),
       })),
-      rejectedPatterns: [{ pattern: "Approve inline.", reason: "It blocks the request.", evidence: [{ excerptId: "E1", claim: "Approval is inline." }] }],
+      rejectedPatterns: [{ pattern: "Approve inline.", reason: "It blocks the request.", evidence: [{ excerptId: "E1", claim: "Approval is inline.", quote: "approve(refund)", quoteInExcerpt: true }] }],
       localAdaptation: "Use the local store.",
     });
 
     // Six citations of four test excerpts: E2 twice under one pattern and again under a second pattern, which also
     // cites E5.
     const report = render([], [], { referenceComparisons: [comparison("C1", "org/refunds", [["E2", "E3", "E2"], ["E2", "E5"]]), comparison("C2", "org/refund-desk", [["E4"]])] });
-    expect(trustedSection(report)).toContain("- The plan cites 4 distinct reference test excerpt(s) under adopted patterns. The host recognises a test file by its path name only; it read these at the pinned commit and ran none of them, and that each one exercises its pattern rests on the planner and the independent review.\n");
+    expect(trustedSection(report)).toContain("- The plan cites 4 distinct reference test excerpt(s) under adopted patterns. The host recognises a test file by its path name only; it read these at the pinned commit and ran none of them, and that each one exercises the production excerpts cited with it rests on the planner and the independent review.\n");
     expect(trustedSection(render([]))).not.toContain("reference test excerpt(s)");
   });
 
@@ -409,11 +411,21 @@ describe("trusted, not checked", () => {
     expect(trustedSection(render([]))).not.toContain("brief approval");
   });
 
-  test("describes the checks performed as excerpt ID, comparator commit, coverage, command and dependency checks", () => {
+  test("describes the checks performed as excerpt ID, quote, comparator commit, coverage, command and dependency checks", () => {
     const report = render([]);
 
-    expect(report).toContain("## Checks performed\n\nThe host read and hashed the listed source files and recorded the line range of every excerpt it cut. It checked that each cited excerpt ID is one it created and that each reference comparison cites only its own repository at the pinned commit, checked requirement and acceptance coverage, checked that existing verification commands come from local files it read, and checked that task dependencies exist and form no cycle. It checked that each verification names at least one wrong implementation for every acceptance criterion it covers, and that each reference test cited under an adopted pattern comes from a file it read as a test from that repository at the pinned commit. It did not check that an excerpt supports the claim next to it, and it did not run target project commands or tests.\n");
+    expect(report).toContain("## Checks performed\n\nThe host read and hashed the listed source files and recorded the line range of every excerpt it cut. It checked that each cited excerpt ID is one it created and that each reference comparison cites only its own repository at the pinned commit, checked requirement and acceptance coverage, checked that existing verification commands come from local files it read, and checked that task dependencies exist and form no cycle. It checked that each verification names at least one wrong implementation for every acceptance criterion it covers, that each reference test cited under an adopted pattern comes from a file it read as a test from that repository at the pinned commit, and that a pattern citing a reference test also cites an excerpt of a file it read as production from that repository. It checked that the quote of each plan citation, after NFKC and whitespace normalization, has 8 to 300 characters (counted as Unicode code points) and appears in the lines of the excerpt it cites, and it marks each citation whose quote it did not count as found. It did not check that a quote or its excerpt supports the claim next to it, or that a cited test exercises the production code cited with it, and it did not run target project commands or tests.\n");
     expect(report).not.toContain("validated citations against source line ranges");
+  });
+
+  test("documents in the README that the host checks only the role of the production excerpt next to a cited reference test", async () => {
+    const readme = await readFile(path.resolve(import.meta.dir, "..", "README.md"), "utf8");
+
+    // Run 11 read graphify/extract.py as production but not the graphify.llm code that the cited test calls, so a
+    // pattern citing that test and an extract.py excerpt passes the host.
+    expect(readme).toContain("引用了参考测试的模式还要至少引用一段 host 读作实现文件的摘录（同一仓库、同一提交），不符合时走一次计划修正；host 只核对这段摘录来自它读作实现文件的源文件，不核对它是不是测试用到的代码；同一仓库没有读作实现文件的摘录时，这个模式只能写明原因。");
+    expect(readme).toContain("（引用的参考测试还要来自 host 读作测试的文件，同一模式还要引用一段 host 读作实现文件的摘录）");
+    expect(readme).not.toContain("只读到测试、没有读到它测的实现时");
   });
 });
 
@@ -549,8 +561,8 @@ test("renders under each adopted pattern its reference test as read, not run, or
   });
   const sources = [remote("S1", "src/refund.ts", ["production"]), remote("S2", "tests/refund.test.ts", ["test"])];
   const excerpts = [
-    { id: "E1", sourceId: "S1", startLine: 1, endLine: 8, text: "production" },
-    { id: "E2", sourceId: "S2", startLine: 2, endLine: 9, text: "test" },
+    { id: "E1", sourceId: "S1", startLine: 1, endLine: 8, text: "export const refund = { status: 'pending', cap: 100 };" },
+    { id: "E2", sourceId: "S2", startLine: 2, endLine: 9, text: "test('moves a refund to approved', () => {});" },
   ];
   const plan: PlanDocument = {
     title: "Refund plan",
@@ -573,10 +585,10 @@ test("renders under each adopted pattern its reference test as read, not run, or
       commitSha: sha,
       selectionRationale: "Implements the refund lifecycle.",
       adoptedPatterns: [
-        { pattern: "Keep a refund status.", evidence: [{ excerptId: "E1", claim: "The model has a status." }], testEvidence: [{ excerptId: "E2", claim: "The test moves a refund to approved." }] },
-        { pattern: "Cap partial refunds.", evidence: [{ excerptId: "E1", claim: "The model caps the amount." }], testEvidence: [], untestedReason: "No read test covers partial refunds." },
+        { pattern: "Keep a refund status.", evidence: [{ excerptId: "E1", claim: "The model has a status.", quote: "status: 'pending'", quoteInExcerpt: true }], testEvidence: [{ excerptId: "E2", claim: "The test moves a refund to approved.", quote: "moves a refund to approved", quoteInExcerpt: true }] },
+        { pattern: "Cap partial refunds.", evidence: [{ excerptId: "E1", claim: "The model caps the amount.", quote: "cap: 100", quoteInExcerpt: true }], testEvidence: [], untestedReason: "No read test covers partial refunds." },
       ],
-      rejectedPatterns: [{ pattern: "Approve inline.", reason: "It blocks the request.", evidence: [{ excerptId: "E1", claim: "Approval is inline." }] }],
+      rejectedPatterns: [{ pattern: "Approve inline.", reason: "It blocks the request.", evidence: [{ excerptId: "E1", claim: "Approval is inline.", quote: "export const refund", quoteInExcerpt: true }] }],
       localAdaptation: "Use the local store.",
     }],
     risks: [],
@@ -611,9 +623,178 @@ test("renders under each adopted pattern its reference test as read, not run, or
     commands: [],
   });
   // The line after the reference test is the next pattern, so a tested pattern shows no "No reference test" line.
-  expect(report).toContain(`- Keep a refund status. ([src/refund.ts L1-L8](https://github.com/org/refunds/blob/${sha}/src/refund.ts#L1-L8))\n  - Reference test (read, not run): The test moves a refund to approved. ([tests/refund.test.ts L2-L9](https://github.com/org/refunds/blob/${sha}/tests/refund.test.ts#L2-L9))\n- Cap partial refunds. (`);
+  expect(report).toContain(`- Keep a refund status. ([src/refund.ts L1-L8](https://github.com/org/refunds/blob/${sha}/src/refund.ts#L1-L8): \` status: 'pending' \`)\n  - Reference test (read, not run): The test moves a refund to approved. ([tests/refund.test.ts L2-L9](https://github.com/org/refunds/blob/${sha}/tests/refund.test.ts#L2-L9): \` moves a refund to approved \`)\n- Cap partial refunds. (`);
   expect(report.match(/No reference test/g)).toHaveLength(1);
-  expect(report).toContain(`- Cap partial refunds. ([src/refund.ts L1-L8](https://github.com/org/refunds/blob/${sha}/src/refund.ts#L1-L8))\n  - No reference test: No read test covers partial refunds.\n`);
+  expect(report).toContain(`- Cap partial refunds. ([src/refund.ts L1-L8](https://github.com/org/refunds/blob/${sha}/src/refund.ts#L1-L8): \` cap: 100 \`)\n  - No reference test: No read test covers partial refunds.\n`);
+});
+
+test("shows each plan citation's quote and says when the host did not find it in the cited excerpt", () => {
+  const brief = parseIntake({
+    summary: "Record refunds.",
+    requirements: [{ description: "Record refunds.", observableAcceptance: ["A refund is recorded."] }],
+    materialQuestions: [],
+    researchQueries: ["refund endpoint"],
+  });
+  const sha = "c".repeat(40);
+  const remote = (id: string, filePath: string, roles: EvidenceSource["roles"]): EvidenceSource => ({
+    id,
+    kind: "remote",
+    path: filePath,
+    sha256: "a".repeat(64),
+    lineCount: 12,
+    byteCount: 200,
+    provider: "github",
+    repository: "org/refunds",
+    commitSha: sha,
+    permalink: `https://github.com/org/refunds/blob/${sha}/${filePath}`,
+    snapshotPath: `sources/${id}.txt`,
+    roles,
+  });
+  const sources = [remote("S1", "src/refund.ts", ["production"]), remote("S2", "tests/refund.test.ts", ["test"])];
+  const excerpts = [
+    { id: "E1", sourceId: "S1", startLine: 3, endLine: 10, text: "export function refund(amount, actor) {\n  if (amount <= 0) throw new Error(`bad amount ${amount}`);\n  if (!actor.canRefund) throw new Error('forbidden');\n  return { amount, status: 'pending' };\n}" },
+    { id: "E2", sourceId: "S2", startLine: 2, endLine: 9, text: "test('moves a refund to approved', () => {});" },
+  ];
+  // A citation of E1 whose quote the host found there, or, with found false, did not.
+  const cited = (claim: string, quote: string, found = true): QuotedEvidenceRef => ({ excerptId: "E1", claim, quote, quoteInExcerpt: found });
+  const plan: PlanDocument = {
+    title: "Refund plan",
+    summary: "Record a refund request.",
+    requirements: brief.requirements,
+    tasks: [{
+      id: "T1",
+      title: "Record refunds",
+      description: "Validate and save the refund.",
+      requirementIds: ["R1"],
+      dependencies: [],
+      acceptance: [{ id: "T1-A1", requirementId: "R1", coversAcceptanceIds: ["A1"], condition: "A valid refund is saved." }],
+      verification: [{ id: "T1-V1", kind: "manual", acceptanceIds: ["A1"], description: "Save a refund and inspect it.", rejectsMutants: [{ id: "T1-V1-M1", acceptanceId: "A1", wrongImplementation: "The refund is not saved.", observedFailure: "The refund list stays empty." }] }],
+      evidence: [cited("The reference rejects a non-positive amount.", "throw new Error(`bad amount ${amount}`)")],
+    }],
+    decisions: [{ id: "D1", title: "Start pending", decision: "A refund starts pending.", rationale: "Approval comes later.", evidence: [cited("Refunds start approved.", "status: 'approved'", false)] }],
+    design: {
+      architecture: "A request endpoint records refunds.",
+      modules: [{ name: "Refund handler", responsibility: "Record refunds.", interfaces: ["refund(amount, actor)"], evidence: [cited("The handler returns the refund.", "return { amount, status: 'pending' }")] }],
+      dataModel: { entities: [{ name: "Refund", fields: ["amount", "status"], evidence: [cited("A refund has an amount and a status.", "{ amount, status")] }] },
+      invariants: { items: [{ statement: "An amount is positive.", evidence: [cited("Non-positive amounts are refused.", "if (amount <= 0)")] }] },
+      accessControl: { boundaries: [{ boundary: "Refund", behavior: "Only an actor who may refund can refund.", evidence: [cited("The handler checks the actor.", "if (!actor.canRefund)")] }] },
+    },
+    repositoryChoices: [],
+    referenceComparisons: [{
+      candidateId: "C1",
+      provider: "github",
+      repository: "org/refunds",
+      commitSha: sha,
+      selectionRationale: "Implements the refund lifecycle.",
+      adoptedPatterns: [{ pattern: "Keep a pending status.", evidence: [cited("The reference saves a pending refund.", "status: 'pending'")], testEvidence: [{ excerptId: "E2", claim: "The test approves a refund.", quote: "moves a refund to approved", quoteInExcerpt: true }] }],
+      rejectedPatterns: [{ pattern: "Throw plain errors", reason: "Callers cannot tell the errors apart.", evidence: [cited("The reference throws plain errors.", "throw new Error('forbidden')")] }],
+      localAdaptation: "Use the local store.",
+    }],
+    risks: [{ description: "A zero amount is refused.", evidence: [cited("The reference refuses zero.", "amount <= 0")] }],
+    readiness: "draft",
+    readinessNotes: [],
+  };
+  const report = renderReport({
+    brief,
+    resolvedAnswers: [],
+    plan,
+    sources: sources.map((source) => ({
+      id: source.id,
+      kind: source.kind,
+      path: source.path,
+      location: source.permalink!,
+      snapshotPath: source.snapshotPath,
+      sha256: source.sha256,
+      lineCount: source.lineCount,
+      byteCount: source.byteCount,
+      provider: "github",
+      repository: source.repository,
+      commitSha: source.commitSha,
+      permalink: source.permalink,
+      roles: source.roles,
+      excerpts: excerpts.filter((excerpt) => excerpt.sourceId === source.id).map(({ id, startLine, endLine }) => ({ id, startLine, endLine })),
+    })),
+    evidence: { sources, excerpts, bytesBySourceId: new Map(), textBySourceId: new Map(), gaps: [] },
+    gaps: [],
+    reviews: [],
+    validationIssues: [],
+    validationHistory: [],
+    commands: [],
+  });
+  const e1 = `[src/refund.ts L3-L10](https://github.com/org/refunds/blob/${sha}/src/refund.ts#L3-L10)`;
+  const e2 = `[tests/refund.test.ts L2-L9](https://github.com/org/refunds/blob/${sha}/tests/refund.test.ts#L2-L9)`;
+  const lines = report.split("\n");
+  // A quote that holds backticks gets a longer fence.
+  expect(lines).toContain(`- The reference rejects a non-positive amount. (${e1}: \`\` throw new Error(\`bad amount \${amount}\`) \`\`)`);
+  expect(lines).toContain(`- Refunds start approved. (${e1}; the host did not find the quoted \` status: 'approved' \` in E1)`);
+  expect(lines).toContain(`  - Evidence: The handler returns the refund. (${e1}: \` return { amount, status: 'pending' } \`)`);
+  expect(lines).toContain(`  - Evidence: A refund has an amount and a status. (${e1}: \` { amount, status \`)`);
+  expect(lines).toContain(`  - Evidence: Non-positive amounts are refused. (${e1}: \` if (amount <= 0) \`)`);
+  expect(lines).toContain(`  - Evidence: The handler checks the actor. (${e1}: \` if (!actor.canRefund) \`)`);
+  expect(lines).toContain(`- Keep a pending status. (${e1}: \` status: 'pending' \`)`);
+  expect(lines).toContain(`  - Reference test (read, not run): The test approves a refund. (${e2}: \` moves a refund to approved \`)`);
+  expect(lines).toContain(`- Throw plain errors: Callers cannot tell the errors apart. (${e1}: \` throw new Error('forbidden') \`)`);
+  expect(lines).toContain(`- A zero amount is refused. (${e1}: \` amount <= 0 \`)`);
+});
+
+test("says after each citation why the host did not count its quote as found", () => {
+  const brief = parseIntake({
+    summary: "Record refunds.",
+    requirements: [{ description: "Record refunds.", observableAcceptance: ["A refund is recorded."] }],
+    materialQuestions: [],
+    researchQueries: ["refund endpoint"],
+  });
+  const source: EvidenceSource = { id: "S1", kind: "local", path: "src/refund.ts", sha256: "a".repeat(64), lineCount: 12, byteCount: 200, snapshotPath: "sources/S1.txt", roles: ["production"] };
+  // A citation of E1 that the host did not count as found, for one reason.
+  const missed = (claim: string, quote: string, quoteProblem: QuotedEvidenceRef["quoteProblem"]): QuotedEvidenceRef => ({ excerptId: "E1", claim, quote, quoteInExcerpt: false, quoteProblem });
+  const plan: PlanDocument = {
+    title: "Refund plan",
+    summary: "Record a refund request.",
+    requirements: brief.requirements,
+    tasks: [],
+    decisions: [{
+      id: "D1",
+      title: "Start pending",
+      decision: "A refund starts pending.",
+      rationale: "Approval comes later.",
+      evidence: [
+        missed("The quote is blank.", "", "empty"),
+        missed("The quote is short.", "pend", "too_short"),
+        missed("The quote is long.", "x".repeat(300), "too_long"),
+        missed("The quote is elsewhere.", "status: 'approved'", "not_found"),
+      ],
+    }],
+    design: {
+      architecture: "A request endpoint records refunds.",
+      modules: [],
+      dataModel: { entities: [], notApplicableReason: "Not included in this rendering fixture." },
+      invariants: { items: [], notApplicableReason: "Not included in this rendering fixture." },
+      accessControl: { boundaries: [], notApplicableReason: "Not included in this rendering fixture." },
+    },
+    repositoryChoices: [],
+    referenceComparisons: [],
+    risks: [],
+    readiness: "draft",
+    readinessNotes: [],
+  };
+  const report = renderReport({
+    brief,
+    resolvedAnswers: [],
+    plan,
+    sources: [{ id: "S1", kind: "local", path: source.path, location: source.path, snapshotPath: source.snapshotPath, sha256: source.sha256, lineCount: source.lineCount, byteCount: source.byteCount, roles: source.roles, excerpts: [{ id: "E1", startLine: 3, endLine: 10 }] }],
+    evidence: { sources: [source], excerpts: [{ id: "E1", sourceId: "S1", startLine: 3, endLine: 10, text: "export const status = 'pending';" }], bytesBySourceId: new Map(), textBySourceId: new Map(), gaps: [] },
+    gaps: [],
+    reviews: [],
+    validationIssues: [],
+    validationHistory: [],
+    commands: [],
+  });
+  const lines = report.split("\n");
+  const e1 = "`src/refund.ts#L3-L10`";
+  expect(lines).toContain(`- The quote is blank. (${e1}; the quote is empty, so the host did not count it as found in E1)`);
+  expect(lines).toContain(`- The quote is short. (${e1}; the quote \` pend \` is shorter than 8 characters, so the host did not count it as found in E1)`);
+  expect(lines).toContain(`- The quote is long. (${e1}; the quote \` ${"x".repeat(300)}… \` is longer than 300 characters, so the host did not count it as found in E1)`);
+  expect(lines).toContain(`- The quote is elsewhere. (${e1}; the host did not find the quoted \` status: 'approved' \` in E1)`);
 });
 
 test("shows the brief approval and labels every requirement with the user's words or inferred", () => {

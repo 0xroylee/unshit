@@ -242,6 +242,7 @@ export class GitHubResearcher {
     }
 
     for (const gap of gaps) gap.material = candidates.length === 0;
+    if (material.omitted?.length) gaps.push({ kind: "search", message: `Brief material not searched on GitHub: ${material.omitted.join("; ")}.`, material: false });
 
     const ordered = orderCandidates(candidates, material);
     const result = ordered;

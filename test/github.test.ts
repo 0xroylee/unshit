@@ -1904,3 +1904,69 @@ describe("Grep code search", () => {
     expect(requests.find((entry) => entry.url.origin === "https://mcp.grep.app")?.init?.method).toBe("POST");
   });
 });
+
+describe("discovery material allocation", () => {
+  const twoTopics = { phrases: ["refund workflow", "refund request"], topics: ["refunds", "payments"], omitted: ['topic "billing" (over the two-topic limit)'] };
+
+  test("keeps nine GitHub search requests with a second topic and records the query past the budget as skipped", async () => {
+    const calls: URL[] = [];
+    const researcher = new GitHubResearcher({
+      now: () => NOW,
+      minimumPassing: 20,
+      fetch: async (input) => {
+        const url = requestUrl(input);
+        calls.push(url);
+        return json({ items: [] });
+      },
+    });
+    const result = await researcher.discover(twoTopics);
+    expect(calls.filter((url) => url.origin === "https://api.github.com")).toHaveLength(9);
+    expect(result.research.searchRequests.github).toBe(9);
+    const github = result.research.queries.filter((query) => query.provider === "github");
+    expect(github.map((query) => `${query.tier} ${query.status} ${query.query.split(" ")[0]}`)).toEqual([
+      "0 ok refund", "0 ok refund", "0 ok topic:refunds", "0 ok topic:payments",
+      "1 ok refund", "1 ok refund", "1 ok topic:refunds",
+      "2 ok refund", "2 ok refund", "2 skipped topic:refunds",
+    ]);
+  });
+
+  test("records brief material that no query searched as one informational search gap", async () => {
+    const items = [1, 2, 3, 4].map((index) => searchItem(`org/refund-${index}`, 300));
+    const researcher = new GitHubResearcher({ now: () => NOW, fetch: async () => json({ items }) });
+    const result = await researcher.discover(twoTopics);
+    expect(result.research.searchRequests.github).toBe(4);
+    const note = { kind: "search" as const, material: false, message: 'Brief material not searched on GitHub: topic "billing" (over the two-topic limit).' };
+    expect(result.gaps).toEqual([note]);
+
+    // With no candidate at all, the note stays informational and the material no-match gap is still added.
+    const empty = await new GitHubResearcher({ now: () => NOW, fetch: async () => json({ items: [] }) }).discover(twoTopics);
+    expect(empty.gaps).toEqual([note, { kind: "search", material: true, message: "No public repository matched the host-built queries." }]);
+  });
+});
+
+describe("commit-pinned reads", () => {
+  test("reads trees and sources at the resolved SHA after the default branch moves", async () => {
+    const pinnedFiles = ["src/handler.ts", "tests/handler.test.ts", "LICENSE"];
+    const researcher = new GitHubResearcher({
+      now: () => NOW,
+      fetch: async (input) => {
+        const url = requestUrl(input);
+        // After the commit read, the branch names a commit with no tests and different source.
+        const pinned = url.pathname.includes(COMMIT) || url.searchParams.get("ref") === COMMIT;
+        if (url.pathname.endsWith("/commits/main")) return json({ sha: COMMIT, id: COMMIT });
+        if (url.pathname.includes("/git/trees/")) return json({ truncated: false, tree: (pinned ? pinnedFiles : ["src/handler.ts"]).map((path) => ({ path, type: "blob", size: 7 })) });
+        if (url.pathname.endsWith("/repository/tree")) return json((pinned ? pinnedFiles : ["src/handler.ts"]).map((path) => ({ path, type: "blob" })));
+        if (url.origin === "https://raw.githubusercontent.com" || url.pathname.endsWith("/raw")) return new Response(pinned ? "pinned\n" : "moved\n");
+        return new Response("unexpected request", { status: 404 });
+      },
+    });
+    const resolution = await researcher.resolveShortlist([
+      candidate("x"),
+      candidate("g", { provider: "gitlab", fullName: "org/repo-g", webUrl: "https://gitlab.com/org/repo-g", providerProjectId: "42" }),
+    ]);
+    expect(resolution.snapshots.map((snapshot) => `${snapshot.candidate.provider}@${snapshot.commitSha}`)).toEqual([`github@${COMMIT}`, `gitlab@${COMMIT}`]);
+    for (const snapshot of resolution.snapshots) {
+      expect(new TextDecoder().decode(await researcher.fetchSource(snapshot, "src/handler.ts"))).toBe("pinned\n");
+    }
+  });
+});

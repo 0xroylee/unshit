@@ -323,3 +323,105 @@ describe("host-built repository screening", () => {
     expect(tied.map((entry) => entry.id)).toEqual(["C3", "C4"]);
   });
 });
+
+describe("discovery material allocation", () => {
+  const run11 = {
+    domainTerms: ["implementation plan", "reference code", "repository search", "code search", "pinned commit", "source evidence"],
+    topicSlugs: ["code-search", "code-analysis", "software-engineering"],
+  };
+
+  test("gives a later specific domain term the slot of a generic-only one and names what it leaves out", () => {
+    const material = domainMaterialFromBrief(brief(run11));
+    expect(material.phrases).toEqual(["implementation plan", "repository search"]);
+    expect(material.topics).toEqual(["code-search", "code-analysis"]);
+    expect(material.omitted).toEqual([
+      'domain term "reference code" (generic words only; specific terms took the two phrase slots)',
+      'domain term "code search" (over the two-phrase limit)',
+      'domain term "pinned commit" (over the two-phrase limit)',
+      'domain term "source evidence" (over the two-phrase limit)',
+      'topic "software-engineering" (over the two-topic limit)',
+    ]);
+  });
+
+  test("keeps generic-only terms when no specific term remains and omits nothing from a two-term brief", () => {
+    expect(domainMaterialFromBrief(brief({ domainTerms: ["web app", "data platform", "api service"] })).phrases).toEqual(["web app", "data platform"]);
+    expect("omitted" in domainMaterialFromBrief(brief())).toBe(false);
+  });
+
+  test("searches a domain term that the brief repeats once and gives the second slot to the next term", () => {
+    const material = domainMaterialFromBrief(brief({ domainTerms: ["Event Ticketing", "event ticketing", "ticket sales"] }));
+    expect(material.phrases).toEqual(["event ticketing", "ticket sales"]);
+    expect("omitted" in material).toBe(false);
+  });
+
+  test("counts short words such as QR and CI when it decides whether a domain term is generic", () => {
+    // "qr code" and "ci cd" keep a specific word under three letters, so neither is generic-only.
+    const qr = domainMaterialFromBrief(brief({ domainTerms: ["QR code", "ticket checkin", "event platform"] }));
+    expect(qr.phrases).toEqual(["qr code", "ticket checkin"]);
+    expect(qr.omitted).toEqual(['domain term "event platform" (over the two-phrase limit)']);
+    expect(domainMaterialFromBrief(brief({ domainTerms: ["web app", "ci cd"] })).phrases).toEqual(["ci cd", "web app"]);
+  });
+
+  test("ignores stop words such as an and a when it decides whether a domain term is generic", () => {
+    // "an api" and "a tool" are generic-only once the stop word is set aside, so both specific terms are searched.
+    const material = domainMaterialFromBrief(brief({ domainTerms: ["an api", "a tool", "event ticketing", "ticket sales"] }));
+    expect(material.phrases).toEqual(["event ticketing", "ticket sales"]);
+    expect(material.omitted).toEqual([
+      'domain term "an api" (generic words only; specific terms took the two phrase slots)',
+      'domain term "a tool" (generic words only; specific terms took the two phrase slots)',
+    ]);
+    // A term of stop words only counts as generic, so the specific term goes first.
+    expect(domainMaterialFromBrief(brief({ domainTerms: ["of the", "event ticketing"] })).phrases).toEqual(["event ticketing", "of the"]);
+  });
+
+  test("does not let an invalid topic slug take one of the two topic slots", () => {
+    const material = domainMaterialFromBrief(brief({ topicSlugs: ["Code Search", "refunds", "payments"] }));
+    expect(material.topics).toEqual(["refunds", "payments"]);
+    expect(material.omitted).toEqual(['topic "Code Search" (not a GitHub topic slug)']);
+  });
+
+  test("says a generic-only term was displaced only when specific terms hold both phrase slots", () => {
+    // Every term is generic-only: the third loses to the first two in brief order.
+    const generic = domainMaterialFromBrief(brief({ domainTerms: ["source code", "reference code", "code tool"] }));
+    expect(generic.phrases).toEqual(["source code", "reference code"]);
+    expect(generic.omitted).toEqual(['domain term "code tool" (over the two-phrase limit)']);
+    // One specific term and two generic-only terms: a generic-only term still holds the second slot.
+    const mixed = domainMaterialFromBrief(brief({ domainTerms: ["management system", "web app", "event ticketing"] }));
+    expect(mixed.phrases).toEqual(["event ticketing", "management system"]);
+    expect(mixed.omitted).toEqual(['domain term "web app" (over the two-phrase limit)']);
+  });
+
+  test("lists topic slugs that are not GitHub topic slugs and domain terms with no searchable words, each once", () => {
+    const material = domainMaterialFromBrief(brief({
+      domainTerms: ["event ticketing", "!!!", "ticket sales", "!!!"],
+      topicSlugs: ["Code Search", "event-ticketing", "code_search", "CODE SEARCH"],
+    }));
+    expect(material.phrases).toEqual(["event ticketing", "ticket sales"]);
+    expect(material.topics).toEqual(["event-ticketing"]);
+    expect(material.omitted).toEqual([
+      'domain term "!!!" (no searchable words)',
+      'topic "Code Search" (not a GitHub topic slug)',
+      'topic "code_search" (not a GitHub topic slug)',
+    ]);
+    // Brief text is quoted as JSON, so a line break in it cannot split the report's gap line. Blank values hold no
+    // brief material and are not listed.
+    const broken = domainMaterialFromBrief(brief({ domainTerms: ["event ticketing", "**\n**", "   "], topicSlugs: ["code\nsearch", "  "] }));
+    expect(broken.omitted).toEqual(['domain term "**\\n**" (no searchable words)', 'topic "code\\nsearch" (not a GitHub topic slug)']);
+  });
+
+  test("searches the second topic only at the strictest tier", () => {
+    const plan = planSearches(domainMaterialFromBrief(brief(run11)), NOW).github;
+    expect(plan.map((entry) => `${entry.tier} ${entry.query.split(" archived:")[0]}`)).toEqual([
+      "0 implementation plan in:name,description,topics",
+      "0 repository search in:name,description,topics",
+      "0 topic:code-search",
+      "0 topic:code-analysis",
+      "1 implementation plan in:name,description,topics",
+      "1 repository search in:name,description,topics",
+      "1 topic:code-search",
+      "2 implementation plan in:name,description,topics",
+      "2 repository search in:name,description,topics",
+      "2 topic:code-search",
+    ]);
+  });
+});

@@ -9,7 +9,7 @@ import { ProviderRequestError } from "../src/request-failure.ts";
 import { parseApprovedBrief, parseIntake } from "../src/model-schema.ts";
 import { UNAPPROVED_BRIEF_NOTE, briefSha256, editableBrief } from "../src/brief-approval.ts";
 import { DEFAULT_QUALITY_BAR } from "../src/repository-screening.ts";
-import type { BriefApproval, CodeSearchSummary, IntakeBrief, ProgressEvent, RepositoryCandidate, RepositorySnapshot, ResearchGap, TreeFile } from "../src/types.ts";
+import type { BriefApproval, CodeSearchSummary, IntakeBrief, PlanDocument, ProgressEvent, RepositoryCandidate, RepositorySnapshot, ResearchGap, TreeFile } from "../src/types.ts";
 import type { DomainMaterial } from "../src/repository-screening.ts";
 import { REFERENCE_PLAN_MODULES, REFERENCE_POLICY_INPUTS } from "../src/instructions.ts";
 import { renderReport } from "../src/report.ts";
@@ -59,9 +59,16 @@ function snapshotFor(candidate: RepositoryCandidate, treeTruncated = false): Rep
   };
 }
 
+// Text that the default researcher's src/index.ts, tests/index.test.ts and package.json hold, for citation quotes.
+const DEFAULT_SOURCE_QUOTE = "status: 'pending'";
+const DEFAULT_TEST_QUOTE = "test('creates refund'";
+const PACKAGE_JSON_QUOTE = '"test": "bun test"';
+
 // testExcerptId is the comparator test excerpt that the adopted pattern cites; with the default researcher it is the
-// excerpt of tests/index.test.ts. With null the pattern gives an untested reason instead.
-function validPlan(excerptId = "E1", testExcerptId: string | null = "E2"): Record<string, any> {
+// excerpt of tests/index.test.ts. With null the pattern gives an untested reason instead. Every other citation cites
+// excerptId and quotes `quote` from it, and the test citation quotes `testQuote`; the defaults are in the default
+// researcher's src/index.ts and tests/index.test.ts.
+function validPlan(excerptId = "E1", testExcerptId: string | null = "E2", quote = DEFAULT_SOURCE_QUOTE, testQuote = DEFAULT_TEST_QUOTE): Record<string, any> {
   return {
     title: "Refund request plan",
     summary: "Validate and record a refund request.",
@@ -69,9 +76,9 @@ function validPlan(excerptId = "E1", testExcerptId: string | null = "E2"): Recor
     draftReasons: [],
     design: {
       architecture: "A request module validates inputs and persists the request.",
-      modules: [{ name: "Refund requests", responsibility: "Validate and record requests.", interfaces: ["POST /refund-requests"], evidence: [{ excerptId, claim: "The comparator uses an HTTP request handler." }], newDesignReason: null }],
-      dataModel: { entities: [{ name: "RefundRequest", fields: ["amount", "status"], evidence: [{ excerptId, claim: "The comparator stores request state." }], newDesignReason: null }], notApplicableReason: null },
-      invariants: { items: [{ statement: "Amounts must be positive.", evidence: [{ excerptId, claim: "The source validates the amount." }], newDesignReason: null }], notApplicableReason: null },
+      modules: [{ name: "Refund requests", responsibility: "Validate and record requests.", interfaces: ["POST /refund-requests"], evidence: [{ excerptId, claim: "The comparator uses an HTTP request handler.", quote }], newDesignReason: null }],
+      dataModel: { entities: [{ name: "RefundRequest", fields: ["amount", "status"], evidence: [{ excerptId, claim: "The comparator stores request state.", quote }], newDesignReason: null }], notApplicableReason: null },
+      invariants: { items: [{ statement: "Amounts must be positive.", evidence: [{ excerptId, claim: "The source validates the amount.", quote }], newDesignReason: null }], notApplicableReason: null },
       accessControl: { boundaries: [{ boundary: "Refund approval", behavior: "Only an authorized actor can approve a refund.", evidence: [], newDesignReason: "Approval permissions are required by the brief and the target access policy must be designed." }], notApplicableReason: null },
     },
     tasks: [{
@@ -89,13 +96,13 @@ function validPlan(excerptId = "E1", testExcerptId: string | null = "E2"): Recor
         plannedCommand: null,
         rejectsMutants: [{ acceptanceId: "A1", wrongImplementation: "The handler stores the request without a status.", observedFailure: "The stored request shows no pending status." }],
       }],
-      evidence: [{ excerptId, claim: "The reference validates and stores refund requests." }],
+      evidence: [{ excerptId, claim: "The reference validates and stores refund requests.", quote }],
     }],
     decisions: [],
     referenceComparisons: [{
       candidateId: "C1",
-      adoptedPatterns: [{ pattern: "Represent requests with a state.", evidence: [{ excerptId, claim: "The reference has a request state." }], testEvidence: testExcerptId ? [{ excerptId: testExcerptId, claim: "The reference test creates a pending refund." }] : [], untestedReason: testExcerptId ? null : "No test of the comparator was read." }],
-      rejectedPatterns: [{ pattern: "Process approval inline.", reason: "It couples request intake to approval handling.", evidence: [{ excerptId, claim: "The reference combines request and approval." }] }],
+      adoptedPatterns: [{ pattern: "Represent requests with a state.", evidence: [{ excerptId, claim: "The reference has a request state.", quote }], testEvidence: testExcerptId ? [{ excerptId: testExcerptId, claim: "The reference test creates a pending refund.", quote: testQuote }] : [], untestedReason: testExcerptId ? null : "No test of the comparator was read." }],
+      rejectedPatterns: [{ pattern: "Process approval inline.", reason: "It couples request intake to approval handling.", evidence: [{ excerptId, claim: "The reference combines request and approval.", quote }] }],
       localAdaptation: "Apply the target authorization and persistence rules.",
     }],
     risks: [],
@@ -181,8 +188,8 @@ function gateway(options: {
           else if (kind === "files") result = options.fileSelection ?? { files: [{ fileId: "C1F1", role: "production", rationale: "Main request handler." }] };
           else if (kind === "requests") result = typeof options.evidenceRequests === "function" ? options.evidenceRequests(prompt) : options.evidenceRequests ?? { requests: [] };
           else if (kind === "plan") result = options.plans?.[planIndex++] ?? validPlan();
-          else result = options.reviews?.[reviewIndex++] ?? { findings: [] };
-          if (sessionIndex > 0 && kind === "review" && result === undefined) result = { findings: [] };
+          else result = options.reviews?.[reviewIndex++] ?? { findings: [], survivingMutants: [] };
+          if (sessionIndex > 0 && kind === "review" && result === undefined) result = { findings: [], survivingMutants: [] };
           return { status: "completed", text: JSON.stringify(result), threadId: `thread-${sessionIndex + 1}`, turnId: `turn-${planIndex + reviewIndex + 1}` };
         },
         async close(): Promise<void> {},
@@ -506,7 +513,8 @@ describe("trustworthy reference flag", () => {
       const outcome = await runWorkflow({
         cwd,
         requirement: "Build a refund request service.",
-        modelGateway: gateway({ intake: baseIntake(), plans: [validPlan("E1", null)] }),
+        // The production and test reads fail, so E1 is the comparator's package.json.
+        modelGateway: gateway({ intake: baseIntake(), plans: [validPlan("E1", null, PACKAGE_JSON_QUOTE)] }),
         researcher: researcher({ failPaths: ["src/index.ts", "tests/index.test.ts"] }).value,
       });
 
@@ -539,7 +547,19 @@ describe("trustworthy reference flag", () => {
 });
 
 // The material gap the host records when no adopted pattern cites a reference test.
-const noReferenceTest = "No adopted pattern cites a reference test that exercises it; the reference comparison rests on production excerpts alone. The host recognises a test file by its path name only, so a comparator test whose path it does not recognise cannot be cited.";
+const noReferenceTest = "No adopted pattern pairs a reference test with the production code it exercises, so no read reference test stands behind the adopted reference code. The host recognises a test file by its path name only, so a comparator test whose path it does not recognise cannot be cited.";
+
+// The gap of a plan with `count` citations whose quote the host did not count as found.
+function quoteGap(count: number): string {
+  return `The host did not count the quote of ${count} plan citation(s) as found in the excerpt each cites; plan.md marks each one, and the plan JSON gives each quoteInExcerpt false.`;
+}
+
+// A valid plan whose task cites E1, the comparator's src/index.ts, with a quote that E1 does not hold.
+function unquotedPlan(): Record<string, any> {
+  const output = validPlan();
+  output.tasks[0]!.evidence[0]!.quote = "status: 'approved'";
+  return output;
+}
 
 describe("reference test citations", () => {
   const testFinding = { severity: "material", description: "No adopted pattern cites the comparator test E2, which exercises request creation.", requirementIds: ["R1"], evidence: [{ excerptId: "E2", claim: "The comparator test creates a refund." }], suggestedCorrection: "Cite E2 as testEvidence of the request state pattern." };
@@ -585,7 +605,7 @@ describe("reference test citations", () => {
         modelGateway: gateway({
           intake: baseIntake(),
           plans: [validPlan("E1", null), validPlan()],
-          reviews: [{ findings: [testFinding] }, { findings: [] }],
+          reviews: [{ findings: [testFinding], survivingMutants: [] }, { findings: [], survivingMutants: [] }],
           onPrompt: (prompt) => {
             if (prompt.startsWith("Independently review this plan")) reviewPrompts.push(prompt);
             if (prompt.startsWith("Repair the current plan")) repairPrompt = prompt;
@@ -619,7 +639,7 @@ describe("reference test citations", () => {
         modelGateway: gateway({
           intake: baseIntake(),
           plans: [validPlan("E1", null), validPlan("E1", null)],
-          reviews: [{ findings: [testFinding] }, { findings: [] }],
+          reviews: [{ findings: [testFinding], survivingMutants: [] }, { findings: [], survivingMutants: [] }],
           onPrompt: (prompt) => { if (prompt.startsWith("Independently review this plan")) reviewPrompts.push(prompt); },
         }),
         researcher: researcher().value,
@@ -644,8 +664,8 @@ describe("reference test citations", () => {
     // E7 and E8 are the production and test excerpts of the second comparator, read after the six files of the first.
     plan.referenceComparisons.push({
       candidateId: "C2",
-      adoptedPatterns: [{ pattern: "Record the refund amount.", evidence: [{ excerptId: "E7", claim: "The second comparator records the amount." }], testEvidence: [{ excerptId: "E8", claim: "Its test creates a refund." }], untestedReason: null }],
-      rejectedPatterns: [{ pattern: "Process approval inline.", reason: "It couples request intake to approval handling.", evidence: [{ excerptId: "E7", claim: "The second comparator approves inline." }] }],
+      adoptedPatterns: [{ pattern: "Record the refund amount.", evidence: [{ excerptId: "E7", claim: "The second comparator records the amount.", quote: DEFAULT_SOURCE_QUOTE }], testEvidence: [{ excerptId: "E8", claim: "Its test creates a refund.", quote: DEFAULT_TEST_QUOTE }], untestedReason: null }],
+      rejectedPatterns: [{ pattern: "Process approval inline.", reason: "It couples request intake to approval handling.", evidence: [{ excerptId: "E7", claim: "The second comparator approves inline.", quote: DEFAULT_SOURCE_QUOTE }] }],
       localAdaptation: "Apply the target persistence rules.",
     });
     try {
@@ -680,16 +700,16 @@ describe("reference test citations", () => {
         modelGateway: gateway({
           intake: baseIntake(),
           plans: [validPlan(), validPlan()],
-          reviews: [{ findings: [testFinding] }, { findings: [] }],
+          reviews: [{ findings: [testFinding], survivingMutants: [] }, { findings: [], survivingMutants: [] }],
           onPrompt: (prompt) => prompts.push(prompt),
         }),
         researcher: researcher().value,
       });
       const prompt = (start: string): string => prompts.find((entry) => entry.startsWith(start)) ?? "";
       expect(prompt("Choose up to 20")).toContain("For a selected repository, choose with its production files the tests that exercise them; the plan cites those tests for the patterns it adopts.");
-      expect(prompt("Produce a detailed implementation plan")).toContain("For each adopted pattern, put in testEvidence the excerpts of that comparator's own tests (sources with role test) that exercise the code the pattern adopts, and set untestedReason to null. When no supplied test excerpt exercises it, give an empty testEvidence and a concrete untestedReason. A reference test was read, not run. A verification that ports a reference test case names that test's excerpt ID in its description.");
-      expect(prompt("Independently review this plan")).toContain("For each adopted pattern, check that every testEvidence excerpt is a test that exercises the code the pattern adopts; a cited test that does not is an unsupported citation. When the plan's readinessNotes say that no adopted pattern cites a reference test and a supplied test excerpt of that comparator exercises an adopted pattern, report a material finding that names the excerpt.");
-      expect(prompt("Repair the current plan")).toContain("Each adopted pattern keeps either testEvidence that cites a test excerpt of its comparator exercising the pattern, or a concrete untestedReason. When the current plan's readinessNotes say that no adopted pattern cites a reference test, cite such a test excerpt where one is supplied; never cite a test that does not exercise the pattern to clear the note.");
+      expect(prompt("Produce a detailed implementation plan")).toContain("For each adopted pattern, put in testEvidence the excerpts of that comparator's own tests (sources with role test) that exercise the code the pattern adopts, cite that code's production excerpts (sources with role production) in the pattern's evidence, and set untestedReason to null. When no supplied test excerpt exercises it, or no supplied production excerpt shows the code that the test exercises, give an empty testEvidence and a concrete untestedReason. A reference test was read, not run. A verification that ports a reference test case names that test's excerpt ID in its description.");
+      expect(prompt("Independently review this plan")).toContain("For each adopted pattern, check that every testEvidence excerpt is a test that exercises the production excerpts that the same pattern cites in evidence; a cited test that does not is an unsupported citation. When the plan's readinessNotes say that no adopted pattern pairs a reference test with the production code it exercises, and a supplied test excerpt of that comparator exercises an adopted pattern whose code a supplied production excerpt of the same comparator shows, report a material finding that names both excerpts.");
+      expect(prompt("Repair the current plan")).toContain("Each adopted pattern keeps either testEvidence that cites a test excerpt of its comparator exercising the pattern, with the production excerpt that the test exercises in its evidence, or a concrete untestedReason. When the current plan's readinessNotes say that no adopted pattern pairs a reference test with the production code it exercises, cite such a test excerpt, with the production excerpt of the code it exercises, where both are supplied; never cite a test that does not exercise the pattern, or a production excerpt that the test does not exercise, to clear the note.");
       // The roles of each source in the registry of a prompt; the registry is one JSON line after its heading.
       const registryRoles = (text: string, heading: string): Record<string, unknown> => {
         const registry = JSON.parse(text.split(`${heading}\n\n`)[1]!.split("\n\n")[0]!) as { sources: Array<{ path: string; roles: unknown }> };
@@ -718,7 +738,7 @@ describe("reference test roles and checkpoints", () => {
         modelGateway: gateway({
           intake: baseIntake(),
           fileSelection: { files: [{ fileId: "C1F1", role: "test", rationale: "The model calls the handler a test." }] },
-          plans: [validPlan("E1", "E1"), validPlan()],
+          plans: [validPlan("E1", "E1", DEFAULT_SOURCE_QUOTE, DEFAULT_SOURCE_QUOTE), validPlan()],
         }),
         researcher: researcher().value,
       });
@@ -732,8 +752,33 @@ describe("reference test roles and checkpoints", () => {
     }
   });
 
-  test("saves the reference-test gap with every checkpoint whose plan notes hold it, also when review is interrupted or times out", async () => {
-    const scenarios: Array<{ name: string; plans: unknown[]; reviews?: unknown[]; turnResult?: (kind: TurnKind, occurrence: number) => ModelTurnResult | undefined; expected: Array<[string, boolean, number]> }> = [
+  test("repairs a pattern that cites the comparator test as its own production evidence when the production source was not read", async () => {
+    const cwd = await tempDirectory();
+    try {
+      // The read of src/index.ts fails, so E1 is the excerpt of tests/index.test.ts. The plan cites E1 as the pattern's
+      // evidence and as its reference test; the repair gives an untested reason instead. Every citation quotes E1.
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), plans: [validPlan("E1", "E1", DEFAULT_TEST_QUOTE), validPlan("E1", null, DEFAULT_TEST_QUOTE)] }),
+        researcher: researcher({ failPaths: ["src/index.ts"] }).value,
+      });
+      expect(outcome.status).toBe("completed");
+      if (outcome.status === "completed") {
+        expect(outcome.sources.find((source) => source.excerpts.some((excerpt) => excerpt.id === "E1"))?.roles).toEqual(["test"]);
+        expect(outcome.validationHistory).toEqual([{ issue: "Adopted pattern 1 for C1 cites a reference test, but its evidence cites no excerpt of a file the host read as production; cite the production excerpt that the test exercises, or give an untestedReason.", resolved: true }]);
+        expect(outcome.plan.referenceComparisons[0]!.adoptedPatterns[0]).toMatchObject({ testEvidence: [], untestedReason: "No test of the comparator was read." });
+        expect(outcome.gaps).toContainEqual({ kind: "repository", material: true, message: noReferenceTest });
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("saves each plan gap with every checkpoint whose plan notes hold it, also when review is interrupted or times out", async () => {
+    // Each scenario follows one gap, the reference-test gap unless it names another.
+    const scenarios: Array<{ name: string; gap?: string; plans: unknown[]; reviews?: unknown[]; turnResult?: (kind: TurnKind, occurrence: number) => ModelTurnResult | undefined; expected: Array<[string, boolean, number]> }> = [
       {
         name: "interrupted in the first review",
         plans: [validPlan("E1", null)],
@@ -750,7 +795,7 @@ describe("reference test roles and checkpoints", () => {
         // The repair cites the test excerpt E2, so the checkpoint after it has neither the note nor the gap.
         name: "interrupted in the review after a repair that cites a reference test",
         plans: [validPlan("E1", null), validPlan()],
-        reviews: [{ findings: [{ severity: "material", description: "No adopted pattern cites the comparator test E2.", requirementIds: ["R1"], evidence: [{ excerptId: "E2", claim: "The comparator test creates a refund." }], suggestedCorrection: "Cite E2 as testEvidence." }] }],
+        reviews: [{ findings: [{ severity: "material", description: "No adopted pattern cites the comparator test E2.", requirementIds: ["R1"], evidence: [{ excerptId: "E2", claim: "The comparator test creates a refund." }], suggestedCorrection: "Cite E2 as testEvidence." }], survivingMutants: [] }],
         turnResult: (kind, occurrence) => (kind === "review" && occurrence === 2 ? { status: "interrupted", message: "The run was interrupted." } : undefined),
         expected: [["evidence", false, 0], ["plan", true, 1], ["plan", false, 0], ["interrupted", false, 0]],
       },
@@ -759,6 +804,26 @@ describe("reference test roles and checkpoints", () => {
         name: "completed",
         plans: [validPlan("E1", null)],
         expected: [["evidence", false, 0], ["plan", true, 1], ["plan", true, 1]],
+      },
+      {
+        name: "interrupted in the first review, with a quote the host did not count as found",
+        gap: quoteGap(1),
+        plans: [unquotedPlan()],
+        turnResult: (kind) => (kind === "review" ? { status: "interrupted", message: "The run was interrupted." } : undefined),
+        expected: [["evidence", false, 0], ["plan", true, 1], ["interrupted", true, 1]],
+      },
+      {
+        // The host's finding starts the repair, which copies the quote, so the checkpoints after it have neither.
+        name: "completed after a repair that copies the quote",
+        gap: quoteGap(1),
+        plans: [unquotedPlan(), validPlan()],
+        expected: [["evidence", false, 0], ["plan", true, 1], ["plan", false, 0], ["plan", false, 0]],
+      },
+      {
+        name: "completed after a repair that keeps the quote",
+        gap: quoteGap(1),
+        plans: [unquotedPlan(), unquotedPlan()],
+        expected: [["evidence", false, 0], ["plan", true, 1], ["plan", true, 1], ["plan", true, 1]],
       },
     ];
     for (const scenario of scenarios) {
@@ -772,7 +837,8 @@ describe("reference test roles and checkpoints", () => {
           modelGateway: gateway({ intake: baseIntake(), plans: scenario.plans, ...(scenario.reviews ? { reviews: scenario.reviews } : {}), ...(scenario.turnResult ? { turnResult: scenario.turnResult } : {}) }),
           researcher: researcher().value,
           onCheckpoint: async (input, stage) => {
-            checkpoints.push([stage, input.plan.readinessNotes.includes(noReferenceTest), input.gaps.filter((gap) => gap.message === noReferenceTest && gap.material).length]);
+            const gap = scenario.gap ?? noReferenceTest;
+            checkpoints.push([stage, input.plan.readinessNotes.includes(gap), input.gaps.filter((entry) => entry.message === gap && entry.material).length]);
             return undefined;
           },
         });
@@ -780,6 +846,205 @@ describe("reference test roles and checkpoints", () => {
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
+    }
+  });
+});
+
+describe("citation quotes", () => {
+  const materialFinding = { severity: "material", description: "T1 does not say where the request is stored.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Name the store." };
+  // The findings that the review repair prompt lists.
+  const findingsOf = (prompt: string): unknown => JSON.parse(prompt.split("FINDINGS:\n\n")[1]!.split("\n\nORIGINAL USER REQUIREMENT:")[0]!);
+  // The host's finding that lists these citations.
+  const quoteFinding = (listed: string): unknown => ({
+    severity: "material",
+    description: `The host did not count the quote of these citations as found in the excerpt each cites (it counts a quote only when, after whitespace is collapsed, it has 8 to 300 characters and appears in that excerpt). Each is named by its path in the plan output, with indices counted from 1: ${listed}.`,
+    requirementIds: [],
+    evidence: [],
+    suggestedCorrection: "Give each of these citations a quote of 8 to 300 characters copied character for character from the excerpt it cites, or cite the excerpt that holds the quoted text.",
+  });
+  // Runs the workflow on these plans with an approved brief and clean reviews, and keeps the prompts and progress.
+  const run = async (plans: unknown[], cwd: string, extra: Partial<Parameters<typeof runWorkflow>[0]> = {}) => {
+    const prompts: string[] = [];
+    const progressMessages: string[] = [];
+    const outcome = await runWorkflow({
+      cwd,
+      requirement: "Build a refund request service.",
+      approveBrief: async () => true,
+      modelGateway: gateway({ intake: baseIntake(), plans, onPrompt: (prompt) => prompts.push(prompt) }),
+      researcher: researcher().value,
+      onProgress: (event) => progressMessages.push(event.message),
+      ...extra,
+    });
+    if (outcome.status !== "completed") throw new Error(`Workflow returned ${outcome.status}`);
+    return { outcome, prompts, progressMessages, repairPrompt: prompts.find((prompt) => prompt.startsWith("Repair the current plan")) ?? "" };
+  };
+
+  test("keeps a plan Draft with a material gap and asks the review repair to fix a citation whose quote is not in its excerpt", async () => {
+    const cwd = await tempDirectory();
+    let manifest: { plan: PlanDocument } | undefined;
+    let report = "";
+    try {
+      // The review finds nothing, and the repaired plan still quotes text that E1 does not hold.
+      const { outcome, prompts, progressMessages, repairPrompt } = await run([unquotedPlan(), unquotedPlan()], cwd, {
+        onArtifacts: async (input) => {
+          const artifacts = await writePlanArtifacts({ cwd, runId: "unquoted-citation", input });
+          manifest = JSON.parse(await readFile(artifacts.manifestPath, "utf8"));
+          report = await readFile(artifacts.reportPath, "utf8");
+          return artifacts;
+        },
+      });
+      expect(outcome.validationHistory).toEqual([]);
+      expect(outcome.readiness).toBe("draft");
+      expect(outcome.gaps).toContainEqual({ kind: "validation", material: true, message: quoteGap(1) });
+      expect(outcome.plan.readinessNotes).toEqual([quoteGap(1)]);
+      // Both reviewers see the gap in the plan's readinessNotes.
+      const reviewPrompts = prompts.filter((prompt) => prompt.startsWith("Independently review this plan"));
+      expect(reviewPrompts).toHaveLength(2);
+      for (const prompt of reviewPrompts) expect(prompt).toContain(quoteGap(1));
+      // The review found nothing, so the one finding of the repair is the host's, and the repair says so.
+      expect(findingsOf(repairPrompt)).toEqual([quoteFinding("T1.evidence[1] cites E1")]);
+      expect(repairPrompt.startsWith("Repair the current plan for the findings below, from the independent review or the host's checks.")).toBe(true);
+      expect(progressMessages).toContain("Repairing 0 independent review finding(s) and 1 host finding(s) once.");
+      expect(manifest?.plan.tasks[0]).toMatchObject({ requirementIds: ["R1"], evidence: [{ excerptId: "E1", claim: "The reference validates and stores refund requests.", quote: "status: 'approved'", quoteInExcerpt: false, quoteProblem: "not_found" }] });
+      const line = report.split("\n").find((entry) => entry.startsWith("- The reference validates and stores refund requests. ("));
+      expect(line?.endsWith("; the host did not find the quoted ` status: 'approved' ` in E1)")).toBe(true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("counts and names every citation whose quote the host did not count as found, with the reason for each in plan.md", async () => {
+    const cwd = await tempDirectory();
+    let report = "";
+    // The task quote is not in E1, and the module quote is too short to count.
+    const twoPlan = (): Record<string, any> => {
+      const output = unquotedPlan();
+      output.design.modules[0]!.evidence[0]!.quote = "pend";
+      return output;
+    };
+    try {
+      const { outcome, repairPrompt } = await run([twoPlan(), twoPlan()], cwd, {
+        onArtifacts: async (input) => {
+          report = renderReport(input);
+          return undefined;
+        },
+      });
+      expect(outcome.gaps).toContainEqual({ kind: "validation", material: true, message: quoteGap(2) });
+      expect(outcome.plan.readinessNotes).toEqual([quoteGap(2)]);
+      expect(findingsOf(repairPrompt)).toEqual([quoteFinding("T1.evidence[1] cites E1; design.modules[1].evidence[1] cites E1")]);
+      expect(outcome.plan.design.modules[0]!.evidence[0]).toMatchObject({ quote: "pend", quoteInExcerpt: false, quoteProblem: "too_short" });
+      const line = report.split("\n").find((entry) => entry.startsWith("  - Evidence: The comparator uses an HTTP request handler. ("));
+      expect(line?.endsWith("; the quote ` pend ` is shorter than 8 characters, so the host did not count it as found in E1)")).toBe(true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("names at most 20 citations in the host's finding and counts the rest", async () => {
+    const cwd = await tempDirectory();
+    // 26 citations of E1 whose quote E1 does not hold: 8 on the task, then 6 on each of the module, entity and invariant.
+    const manyPlan = (): Record<string, any> => {
+      const output = validPlan();
+      const citations = (count: number) => Array.from({ length: count }, (_, index) => ({ excerptId: "E1", claim: `Claim ${index + 1}.`, quote: "status: 'approved'" }));
+      output.tasks[0]!.evidence = citations(8);
+      output.design.modules[0]!.evidence = citations(6);
+      output.design.dataModel.entities[0]!.evidence = citations(6);
+      output.design.invariants.items[0]!.evidence = citations(6);
+      return output;
+    };
+    try {
+      const { outcome, repairPrompt } = await run([manyPlan(), manyPlan()], cwd);
+      const paths = (path: string, count: number) => Array.from({ length: count }, (_, index) => `${path}[${index + 1}] cites E1`);
+      const listed = [...paths("T1.evidence", 8), ...paths("design.modules[1].evidence", 6), ...paths("design.dataModel.entities[1].evidence", 6)];
+      expect(findingsOf(repairPrompt)).toEqual([quoteFinding(`${listed.join("; ")}; and 6 more, each with quoteInExcerpt false in CURRENT PLAN`)]);
+      expect(outcome.gaps).toContainEqual({ kind: "validation", material: true, message: quoteGap(26) });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("says that a passed validation repair checked citation IDs and keeps the marks of the quotes it did not count as found", async () => {
+    const cwd = await tempDirectory();
+    const missingMutants = unquotedPlan();
+    missingMutants.tasks[0]!.verification[0]!.rejectsMutants = [];
+    try {
+      const { outcome, progressMessages } = await run([missingMutants, unquotedPlan(), unquotedPlan()], cwd);
+      expect(outcome.validationHistory).toEqual([{ issue: "T1.verification[1].rejectsMutants must contain 1 to 24 items.", resolved: true }]);
+      expect(progressMessages).toContain("The repaired plan passed host structure, coverage, dependency, command, and citation ID checks; any quote the host did not count as found stays marked.");
+      expect(outcome.plan.tasks[0]!.evidence[0]).toMatchObject({ quoteInExcerpt: false, quoteProblem: "not_found" });
+      expect(outcome.plan.readinessNotes).toEqual([quoteGap(1)]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("clears the quote gap when the review repair copies the quote from the cited excerpt", async () => {
+    const cwd = await tempDirectory();
+    try {
+      const { outcome, prompts } = await run([unquotedPlan(), validPlan()], cwd);
+      const reviewPrompts = prompts.filter((prompt) => prompt.startsWith("Independently review this plan"));
+      expect(outcome.reviews).toHaveLength(2);
+      expect(reviewPrompts[0]).toContain(quoteGap(1));
+      expect(reviewPrompts[1]).not.toContain(quoteGap(1));
+      expect(outcome.plan.tasks[0]!.evidence[0]).toEqual({ excerptId: "E1", claim: "The reference validates and stores refund requests.", quote: "status: 'pending'", quoteInExcerpt: true });
+      expect(outcome.gaps.some((gap) => gap.message === quoteGap(1))).toBe(false);
+      expect(outcome.plan.readinessNotes).toEqual([]);
+      expect(outcome.readiness).toBe("ready");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a plan Draft when the review repair changes a citation to a quote that is not in its excerpt", async () => {
+    const cwd = await tempDirectory();
+    const changed = validPlan();
+    changed.tasks[0]!.evidence = [{ excerptId: "E1", claim: "The reference stores an approved refund.", quote: "status: 'approved'" }];
+    try {
+      // The first plan quotes E1 correctly; the repair for the review's finding changes the claim and its quote.
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        approveBrief: async () => true,
+        modelGateway: gateway({
+          intake: baseIntake(),
+          plans: [validPlan(), changed],
+          reviews: [{ findings: [materialFinding], survivingMutants: [] }, { findings: [], survivingMutants: [] }],
+        }),
+        researcher: researcher().value,
+      });
+      if (outcome.status !== "completed") throw new Error(`Workflow returned ${outcome.status}`);
+      expect(outcome.plan.tasks[0]!.evidence).toEqual([{ excerptId: "E1", claim: "The reference stores an approved refund.", quote: "status: 'approved'", quoteInExcerpt: false, quoteProblem: "not_found" }]);
+      expect(outcome.gaps).toContainEqual({ kind: "validation", material: true, message: quoteGap(1) });
+      expect(outcome.plan.readinessNotes).toEqual([quoteGap(1)]);
+      expect(outcome.readiness).toBe("draft");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("tells the planner, the reviewer and the review repair how the host counts a quote, and leaves quotes out of the host's rejection limits", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    try {
+      await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({
+          intake: baseIntake(),
+          plans: [validPlan(), validPlan()],
+          reviews: [{ findings: [materialFinding], survivingMutants: [] }, { findings: [], survivingMutants: [] }],
+          onPrompt: (prompt) => prompts.push(prompt),
+        }),
+        researcher: researcher().value,
+      });
+      const prompt = (start: string): string => prompts.find((entry) => entry.startsWith(start)) ?? "";
+      const planner = prompt("Produce a detailed implementation plan");
+      expect(planner).toContain("In each evidence entry, set quote to the passage of that excerpt's untrustedSourceText that shows what the claim says: one contiguous passage, copied character for character, of 8 to 300 characters after whitespace is collapsed. Do not shorten it with an ellipsis, join separate passages, or quote another excerpt, even one of the same file. The host looks for the quote only in the excerpt the entry cites; a shorter, longer or unfound quote counts as not found and keeps the plan Draft.");
+      expect(planner.split("\n\n").find((part) => part.startsWith("The host rejects a plan that breaks any of these limits"))).not.toContain("quote");
+      expect(prompt("Independently review this plan")).toContain("Each plan citation has a quote and a host flag quoteInExcerpt. The flag says only that the host found the quote in the cited excerpt, not that the quote supports the claim; a citation whose quote does not support its claim is an unsupported citation.");
+      expect(prompt("Repair the current plan")).toContain("Repair the current plan for the findings below, from the independent review or the host's checks. Preserve complete requirement, acceptance, and verification coverage. Use only the current evidence IDs and supplied command IDs; never claim a check ran. Copy each evidence quote character for character from the excerpt that the entry cites: 8 to 300 characters after whitespace is collapsed; a shorter, longer or unfound quote counts as not found and keeps the plan Draft.");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 });
@@ -825,7 +1090,7 @@ describe("model turn timeouts", () => {
         requirement: "Build a refund request service.",
         modelGateway: gateway({
           intake: baseIntake(),
-          reviews: [{ findings: [{ severity: "material", description: "The approval rule is missing.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Add the approval rule." }] }],
+          reviews: [{ findings: [{ severity: "material", description: "The approval rule is missing.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Add the approval rule." }], survivingMutants: [] }],
           turnResult: (kind, occurrence) => (kind === "plan" && occurrence === 2 ? timedOutTurn() : undefined),
         }),
         researcher: researcher().value,
@@ -1046,7 +1311,8 @@ describe("workflow gates and readiness", () => {
         const outcome = await runWorkflow({
           cwd,
           requirement: "Build a refund request service.",
-          modelGateway: gateway({ intake: baseIntake(), plans: [validPlan("E1", null)] }),
+          // The read of src/index.ts fails, so E1 is the excerpt of tests/index.test.ts.
+          modelGateway: gateway({ intake: baseIntake(), plans: [validPlan("E1", null, DEFAULT_TEST_QUOTE)] }),
           researcher: refs.value,
           onArtifacts: async (input) => {
             report = renderReport(input);
@@ -1133,7 +1399,8 @@ describe("workflow gates and readiness", () => {
         requirement: "Build a refund request service.",
         modelGateway: gateway({
           intake: baseIntake(),
-          plans: [noReferencesPlan()],
+          // The validation repair cites the comparator, every file of which reads "export const value = true;".
+          plans: [noReferencesPlan(), validPlan("E1", "E2", "export const value = true", "export const value = true")],
           selection: {
             selected: [{ candidateId: "C1", rationale: "Use the first verified refund service." }],
             rejected: [{ candidateId: "C2", rationale: "The first repository is the comparator for this run." }],
@@ -1350,7 +1617,7 @@ describe("workflow gates and readiness", () => {
       const outcome = await runWorkflow({
         cwd,
         requirement: "Build a refund request service.",
-        modelGateway: gateway({ intake: baseIntake(), plans: [noReferencesPlan(), validPlan("E1", null)], fileSelection: { files: [] } }),
+        modelGateway: gateway({ intake: baseIntake(), plans: [noReferencesPlan(), validPlan("E1", null, "export const value = true")], fileSelection: { files: [] } }),
         researcher: realResearcher,
         onArtifacts: async (input) => {
           artifactOutputs.push(JSON.stringify(input));
@@ -1428,7 +1695,7 @@ describe("workflow gates and readiness", () => {
         expect(outcome.plan.tasks).toHaveLength(1);
         expect(outcome.research?.trustworthyReferenceFound).toBe(false);
         expect(outcome.gaps.find((gap) => gap.message.startsWith("No trustworthy public reference repository was found"))?.message).toContain("a license");
-        expect(outcome.gaps.some((gap) => gap.message.startsWith("No adopted pattern cites a reference test"))).toBe(false);
+        expect(outcome.gaps.some((gap) => gap.message.startsWith("No adopted pattern pairs a reference test"))).toBe(false);
       }
       expect(prompts.some((prompt) => prompt.startsWith("Select zero to three public repository"))).toBe(false);
       expect(finalReport).toContain("No trustworthy public reference repository was found");
@@ -1727,7 +1994,7 @@ describe("workflow gates and readiness", () => {
         cwd,
         requirement: "Build a refund request service.",
         approveBrief: async () => true,
-        modelGateway: gateway({ intake: baseIntake(), plans: [invalid, validPlan()], reviews: [{ findings: [] }] }),
+        modelGateway: gateway({ intake: baseIntake(), plans: [invalid, validPlan()], reviews: [{ findings: [], survivingMutants: [] }] }),
         researcher: researcher().value,
       });
       expect(outcome.status).toBe("completed");
@@ -1746,7 +2013,7 @@ describe("workflow gates and readiness", () => {
     const question = { question: "Who may approve a refund?", whyMaterial: "This defines the refund authorization boundary." };
     const questionId = parseIntake(baseIntake([question])).materialQuestions[0]!.id;
     const observedPrompts: string[] = [];
-    const reviewFinding = { findings: [{ severity: "material", description: "The authorization choice needs a direct statement.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Carry the decision into the access boundary." }] };
+    const reviewFinding = { findings: [{ severity: "material", description: "The authorization choice needs a direct statement.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Carry the decision into the access boundary." }], survivingMutants: [] };
     const invalidInitialPlan = validPlan();
     invalidInitialPlan.tasks[0]!.requirementIds = ["R99"];
     let finalReport = "";
@@ -1758,7 +2025,7 @@ describe("workflow gates and readiness", () => {
         modelGateway: gateway({
           intake: baseIntake([question]),
           plans: [invalidInitialPlan, validPlan(), validPlan()],
-          reviews: [reviewFinding, { findings: [] }],
+          reviews: [reviewFinding, { findings: [], survivingMutants: [] }],
           onPrompt: (prompt) => observedPrompts.push(prompt),
         }),
         researcher: researcher().value,
@@ -1820,7 +2087,7 @@ describe("workflow gates and readiness", () => {
         modelGateway: gateway({
           intake: baseIntake(),
           plans: [missing, validPlan(), validPlan()],
-          reviews: [{ findings: [{ severity: "material", description: "The status check is vague.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Name the stored status." }] }, { findings: [] }],
+          reviews: [{ findings: [{ severity: "material", description: "The status check is vague.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Name the stored status." }], survivingMutants: [] }, { findings: [], survivingMutants: [] }],
           onPrompt: (prompt) => prompts.push(prompt),
         }),
         researcher: researcher().value,
@@ -1837,7 +2104,7 @@ describe("workflow gates and readiness", () => {
       // The review repair keeps or adjusts the named wrong implementations, so its current plan carries them.
       const repairPrompt = prompts.find((prompt) => prompt.startsWith("Repair the current plan"))!;
       expect(repairPrompt.slice(repairPrompt.indexOf("\n\nCURRENT PLAN:\n\n"), repairPrompt.indexOf("\n\nBRIEF:\n\n"))).toContain('"rejectsMutants":[{"id":"T1-V1-M1","acceptanceId":"A1","wrongImplementation":"The handler stores the request without a status.","observedFailure":"The stored request shows no pending status."}]');
-      expect(prompts.find((prompt) => prompt.startsWith("Produce a detailed implementation plan"))).toContain("The host rejects a plan that breaks any of these limits: a verification names at most 24 wrong implementations; the acceptanceId of each wrong implementation is an A* ID that the same verification lists in coversAcceptanceIds; wrongImplementation and observedFailure each have at most 500 characters; an untestedReason has at most 700 characters; testEvidence cites only excerpts of sources with role test from that comparison's repository at its pinned commit.");
+      expect(prompts.find((prompt) => prompt.startsWith("Produce a detailed implementation plan"))).toContain("The host rejects a plan that breaks any of these limits: a verification names at most 24 wrong implementations; the acceptanceId of each wrong implementation is an A* ID that the same verification lists in coversAcceptanceIds; wrongImplementation and observedFailure each have at most 500 characters; an untestedReason has at most 700 characters; testEvidence cites only excerpts of sources with role test from that comparison's repository at its pinned commit; an adopted pattern with testEvidence also cites in its evidence an excerpt of a source with role production from that repository.");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1872,7 +2139,7 @@ describe("workflow gates and readiness", () => {
         modelGateway: gateway({
           intake: baseIntake(),
           plans: [validPlan(), invalidRepair],
-          reviews: [{ findings: [{ severity: "material", description: "A material answer is not reflected.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Honor the clarified constraint." }] }],
+          reviews: [{ findings: [{ severity: "material", description: "A material answer is not reflected.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Honor the clarified constraint." }], survivingMutants: [] }],
         }),
         researcher: researcher().value,
       });
@@ -2176,6 +2443,8 @@ describe("workflow gates and readiness", () => {
         modelGateway: gateway({
           intake: { ...baseIntake(), codePatterns: ["refund_hook"] },
           fileSelection: { files: [{ fileId: "C1Z1", role: "production", rationale: "Code match." }] },
+          // E1 is a file with the default contents "export const path = '<path>';".
+          plans: [validPlan("E1", "E2", "export const path = '")],
           onPrompt: (prompt) => prompts.push(prompt),
         }),
         researcher: researcher({ snapshots: [snapshot] }).value,
@@ -2486,6 +2755,7 @@ describe("evidence requests", () => {
         modelGateway: gateway({
           intake: baseIntake(),
           fileSelection: { files: [{ fileId: ledger.id, role: "production", rationale: "Local ledger code." }] },
+          plans: [noReferencesPlan()],
           onPrompt: (prompt) => prompts.push(prompt),
         }),
         researcher: researcher({ snapshots: [], candidates: [] }).value,
@@ -2507,7 +2777,8 @@ describe("evidence requests", () => {
       await runWorkflow({
         cwd,
         requirement: "Build a refund request service.",
-        modelGateway: gateway({ intake: baseIntake(), onPrompt: (prompt) => prompts.push(prompt) }),
+        // E1 is a filler file with the default contents "export const path = '<path>';".
+        modelGateway: gateway({ intake: baseIntake(), plans: [validPlan("E1", "E2", "export const path = '")], onPrompt: (prompt) => prompts.push(prompt) }),
         researcher: researcher({ snapshots: [{ ...base, files: [...base.files, ...filler] }] }).value,
       });
 
@@ -2536,7 +2807,8 @@ describe("evidence requests", () => {
         modelGateway: gateway({
           intake: baseIntake(),
           evidenceRequests: { requests: [{ kind: "file", id: "C1F7", name: "", startLine: 0, endLine: 0, reason: "The comparator's production code." }] },
-          plans: [validPlan("E1", null)],
+          // E1 is the comparator's package.json.
+          plans: [validPlan("E1", null, PACKAGE_JSON_QUOTE)],
         }),
         // The first reads of the comparator's production and test files fail, so only the requested file is its code.
         researcher: researcher({ snapshots: [{ ...base, files: [...base.files, extra] }], failPaths: ["src/index.ts", "tests/index.test.ts"] }).value,
@@ -2936,7 +3208,7 @@ describe("surviving mutants from independent review", () => {
       expect(findings[0]).toMatchObject({ severity: "material", requirementIds: ["R1"], evidence: [] });
       expect(findings[0]!.description).toContain(unchecked.wrongImplementation);
       expect(findings[0]!.description).toContain(unchecked.whyPlannedChecksPass);
-      expect(events.map((event) => event.message)).toContain("Repairing 1 independent review finding(s) once.");
+      expect(events.map((event) => event.message)).toContain("Repairing 1 independent review finding(s) and 0 host finding(s) once.");
       expect(events.map((event) => event.message)).toContain("Independent review recorded 0 finding(s) and 1 surviving mutant(s).");
       expect(outcome.status).toBe("completed");
       if (outcome.status === "completed") {
@@ -3060,7 +3332,7 @@ describe("surviving mutants from independent review", () => {
       expect(reviewPrompt).toContain("Otherwise set decisionNeeded to null. Do not make the choice yourself.");
       expect(reviewPrompt).toContain("\n\nSet decisionNeeded only when a business choice that the brief and resolved answers leave open decides whether the implementation is wrong, such as who may act, which state is final, or what a limit is; state that choice as a question. Otherwise set decisionNeeded to null. Do not make the choice yourself.\n\n");
       expect(reviewPrompt).toContain(" Report each counterexample in survivingMutants with its A* ID, the wrong implementation, and why every planned check for that A* would still pass. Return an empty survivingMutants array when the planned checks reject every plausible wrong implementation you can construct.\n\n");
-      expect(reviewPrompt).toContain("\n\nSet acceptanceId to an acceptance criterion ID of the brief (A1, A2, ...), never to a task acceptance ID such as T1-A1. List at most 12 surviving mutants, the most consequential first; the host drops every entry after the 12th and every entry whose acceptanceId is not an A* ID of the brief.\n\n");
+      expect(reviewPrompt).toContain("\n\nSet acceptanceId to an acceptance criterion ID of the brief (A1, A2, ...), never to a task acceptance ID such as T1-A1. List at most 12 surviving mutants, the most consequential first; the host drops every entry after the 12th and every entry whose acceptanceId is not an A* ID of the brief. Each dropped entry, and a review without a survivingMutants array, keeps the plan Draft.\n\n");
       expect(reviewPrompt).toContain("Use only the requirement IDs, acceptance criterion IDs and excerpt IDs supplied. Findings should name the concrete gap and one correction. Report a business choice that the brief and resolved answers leave open only as a surviving mutant with decisionNeeded, never as a finding or in a suggestedCorrection.");
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -3171,7 +3443,7 @@ describe("surviving mutants from independent review", () => {
     }
   });
 
-  test("drops surviving mutants it cannot use from either review, records each drop in plan.md and the manifest and still completes", async () => {
+  test("drops surviving mutants it cannot use from either review, records each drop as a material gap in plan.md and the manifest and completes as Draft", async () => {
     const cwd = await tempDirectory();
     const prompts: string[] = [];
     let manifest: { gaps: unknown[]; reviews: Array<{ survivingMutants: unknown[] }> } | undefined;
@@ -3210,13 +3482,35 @@ describe("surviving mutants from independent review", () => {
         { findings: [], survivingMutants: [{ acceptanceId: "A1", wrongImplementation: unchecked.wrongImplementation, whyPlannedChecksPass: unchecked.whyPlannedChecksPass }] },
         { findings: [], survivingMutants: [] },
       ]);
-      const drops: ResearchGap[] = [{ kind: "review", material: false, message: firstDrop }, { kind: "review", material: false, message: secondDrop }];
+      const drops: ResearchGap[] = [{ kind: "review", material: true, message: firstDrop }, { kind: "review", material: true, message: secondDrop }];
       expect(outcome.gaps.filter((gap) => gap.kind === "review")).toEqual(drops);
-      expect(outcome.readiness).toBe("ready");
+      expect(outcome.readiness).toBe("draft");
+      expect(outcome.plan.readinessNotes).toEqual([firstDrop, secondDrop]);
       expect(manifest?.gaps).toEqual(expect.arrayContaining(drops));
       expect(manifest?.reviews.map((review) => review.survivingMutants.length)).toEqual([1, 0]);
-      expect(report).toContain(`- Informational (review): ${firstDrop}\n`);
-      expect(report).toContain(`- Informational (review): ${secondDrop}\n`);
+      expect(report).toContain(`- Material (review): ${firstDrop}\n`);
+      expect(report).toContain(`- Material (review): ${secondDrop}\n`);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the plan Draft when the follow-up review omits survivingMutants", async () => {
+    const cwd = await tempDirectory();
+    const omitted = "In review 2, the host read survivingMutants as none because the review omitted it.";
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), reviews: [{ findings: [], survivingMutants: [unchecked] }, { findings: [] }] }),
+        researcher: researcher().value,
+      });
+      if (outcome.status !== "completed") throw new Error(`Workflow returned ${outcome.status}`);
+      expect(outcome.reviews.map((review) => review.survivingMutants.length)).toEqual([1, 0]);
+      expect(outcome.gaps.filter((gap) => gap.kind === "review")).toEqual([{ kind: "review", material: true, message: omitted }]);
+      expect(outcome.readiness).toBe("draft");
+      expect(outcome.plan.readinessNotes).toEqual([omitted]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -3250,6 +3544,43 @@ describe("surviving mutants from independent review", () => {
       expect(outcome.plan.readinessNotes).toEqual([unreviewedRepairNote, unknownRequirement, openDecisionNote]);
       expect(outcome.validationHistory).toContainEqual({ issue: unknownRequirement, resolved: false });
       expect(events.map((event) => event.message)).toContain("The repaired plan passed host validation, but its follow-up review did not complete; the report remains Draft.");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a repaired plan Draft when only the host's quote finding started the repair, the first review was clean and the follow-up review failed", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const unknownRequirement = "Review refers to unknown requirement R9.";
+    const invalid = { severity: "material", description: "The pending status rule is missing.", requirementIds: ["R9"], evidence: [], suggestedCorrection: "State the pending status rule." };
+    try {
+      // The first plan has one quote that E1 does not hold and the first review finds nothing, so the host's quote
+      // finding alone starts the repair. The repair copies the quote; the follow-up review fails. The clean first review
+      // describes the plan before the repair, so only the unreviewed repair's validation issue keeps this plan Draft.
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        approveBrief: async () => true,
+        modelGateway: gateway({
+          intake: baseIntake(),
+          plans: [unquotedPlan(), validPlan()],
+          reviews: [{ findings: [], survivingMutants: [] }, { findings: [invalid], survivingMutants: [] }],
+          onPrompt: (prompt) => prompts.push(prompt),
+        }),
+        researcher: researcher().value,
+      });
+
+      if (outcome.status !== "completed") throw new Error(`Workflow returned ${outcome.status}`);
+      const repaired = repairFindings(prompts.find((prompt) => prompt.startsWith("Repair the current plan"))!);
+      expect(repaired).toHaveLength(1);
+      expect(repaired[0]!.description.startsWith("The host did not count the quote of these citations as found in the excerpt each cites")).toBe(true);
+      expect(outcome.reviews).toEqual([{ findings: [], survivingMutants: [] }]);
+      expect(outcome.plan.tasks[0]!.evidence[0]).toMatchObject({ quote: "status: 'pending'", quoteInExcerpt: true });
+      expect(outcome.gaps.filter((gap) => gap.material)).toEqual([]);
+      expect(outcome.readiness).toBe("draft");
+      expect(outcome.plan.readinessNotes).toEqual([unreviewedRepairNote, unknownRequirement]);
+      expect(outcome.validationIssues).toEqual([unknownRequirement]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

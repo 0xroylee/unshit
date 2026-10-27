@@ -331,7 +331,7 @@ export async function addRequestedEvidence(
       }
       requestedFileIds.add(request.id);
       filesRead += 1;
-      const role: SelectedFileRole = isTestPath(file.path) ? "test" : "production";
+      const role: SelectedFileRole = isTestPath(file.path) ? "test" : isImplementationSourceFile(file.path) ? "production" : "config";
       const item: FileToRead = local ? { file, roles: [role], kind: "local" } : { file, roles: [role], kind: "remote", repository: remote!.repository };
       try {
         const { source, bytes, text, lines, redactionGap } = await readSource(item, `S${sources.length + 1}`, options);

@@ -253,6 +253,21 @@ export interface EvidenceRef {
   claim: string;
 }
 
+// Why the host did not count a plan citation's quote as found: after normalization the quote is empty, has fewer than
+// MIN_QUOTE_CODE_POINTS or more than QUOTE_MAX code points, or is not in the cited excerpt.
+export type QuoteProblem = "empty" | "too_short" | "too_long" | "not_found";
+
+// A plan citation. quote is the model's copy of the excerpt text that the claim rests on, NFKC- and
+// whitespace-normalized, and cut to QUOTE_MAX code points when longer. quoteInExcerpt is host decided: the quote has
+// MIN_QUOTE_CODE_POINTS to QUOTE_MAX code points and appears in the normalized text of excerpt excerptId, the lines the
+// model was sent, not elsewhere in its file. When it is false, quoteProblem says why. Neither shows that the quote
+// supports the claim.
+export interface QuotedEvidenceRef extends EvidenceRef {
+  quote: string;
+  quoteInExcerpt: boolean;
+  quoteProblem?: QuoteProblem;
+}
+
 export interface TaskAcceptance {
   id: string;
   requirementId: string;
@@ -291,7 +306,7 @@ export interface PlanTask {
   dependencies: string[];
   acceptance: TaskAcceptance[];
   verification: VerificationMethod[];
-  evidence: EvidenceRef[];
+  evidence: QuotedEvidenceRef[];
 }
 
 export interface DesignDecision {
@@ -299,7 +314,7 @@ export interface DesignDecision {
   title: string;
   decision: string;
   rationale: string;
-  evidence: EvidenceRef[];
+  evidence: QuotedEvidenceRef[];
   newDesignReason?: string;
 }
 
@@ -307,7 +322,7 @@ export interface PlanModule {
   name: string;
   responsibility: string;
   interfaces: string[];
-  evidence: EvidenceRef[];
+  evidence: QuotedEvidenceRef[];
   newDesignReason?: string;
 }
 
@@ -315,15 +330,15 @@ export interface PlanDesign {
   architecture: string;
   modules: PlanModule[];
   dataModel: {
-    entities: Array<{ name: string; fields: string[]; evidence: EvidenceRef[]; newDesignReason?: string }>;
+    entities: Array<{ name: string; fields: string[]; evidence: QuotedEvidenceRef[]; newDesignReason?: string }>;
     notApplicableReason?: string;
   };
   invariants: {
-    items: Array<{ statement: string; evidence: EvidenceRef[]; newDesignReason?: string }>;
+    items: Array<{ statement: string; evidence: QuotedEvidenceRef[]; newDesignReason?: string }>;
     notApplicableReason?: string;
   };
   accessControl: {
-    boundaries: Array<{ boundary: string; behavior: string; evidence: EvidenceRef[]; newDesignReason?: string }>;
+    boundaries: Array<{ boundary: string; behavior: string; evidence: QuotedEvidenceRef[]; newDesignReason?: string }>;
     notApplicableReason?: string;
   };
 }
@@ -358,8 +373,8 @@ export interface ReferenceComparison {
   selectionRationale: string;
   // testEvidence cites the comparator's own tests that exercise the pattern (read, not run); untestedReason says why
   // no read test does. Exactly one of the two is present.
-  adoptedPatterns: Array<{ pattern: string; evidence: EvidenceRef[]; testEvidence: EvidenceRef[]; untestedReason?: string }>;
-  rejectedPatterns: Array<{ pattern: string; reason: string; evidence: EvidenceRef[] }>;
+  adoptedPatterns: Array<{ pattern: string; evidence: QuotedEvidenceRef[]; testEvidence: QuotedEvidenceRef[]; untestedReason?: string }>;
+  rejectedPatterns: Array<{ pattern: string; reason: string; evidence: QuotedEvidenceRef[] }>;
   localAdaptation: string;
 }
 
@@ -372,7 +387,7 @@ export interface PlanDocument {
   design: PlanDesign;
   repositoryChoices: RepositoryChoice[];
   referenceComparisons: ReferenceComparison[];
-  risks: Array<{ description: string; evidence: EvidenceRef[] }>;
+  risks: Array<{ description: string; evidence: QuotedEvidenceRef[] }>;
   readiness: Readiness;
   readinessNotes: string[];
 }

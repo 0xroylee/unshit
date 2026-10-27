@@ -12,6 +12,8 @@ export interface DomainMaterial {
   phrases: string[];
   topics: string[];
   codePatterns?: string[];
+  // Sanitized brief material that no host-built GitHub query uses; discover() reports it as an informational gap.
+  omitted?: string[];
 }
 
 export interface SearchTier {
@@ -54,6 +56,9 @@ const GENERIC_WORDS = new Set([
   "system", "tool", "tools", "web",
 ]);
 
+// Function words carry no domain meaning, so they never make a domain term specific.
+const SHORT_STOP_WORDS = new Set(["a", "an", "the", "of", "to", "in", "on", "for", "and", "or", "with"]);
+
 const DEFAULT_SEARCH_TIERS: SearchTier[] = [
   { tier: 0, minStars: 200, maxMonthsSincePush: 12 },
   { tier: 1, minStars: 50, maxMonthsSincePush: 24 },
@@ -61,15 +66,18 @@ const DEFAULT_SEARCH_TIERS: SearchTier[] = [
 ];
 
 export function domainMaterialFromBrief(brief: IntakeBrief): DomainMaterial {
-  const phrases: string[] = [];
-  const seenPhrases = new Set<string>();
-  for (const raw of brief.domainTerms) {
-    const phrase = sanitizePhrase(raw);
-    if (!phrase || seenPhrases.has(phrase)) continue;
-    seenPhrases.add(phrase);
-    phrases.push(phrase);
-    if (phrases.length === 2) break;
-  }
+  // A term says little about fit when every word that is not a SHORT_STOP_WORDS entry, short ones such as "qr"
+  // included, is in GENERIC_WORDS; a term of stop words only counts as generic too. Specific terms take the two phrase
+  // slots first. omitted names every term and topic that no query uses; brief text is quoted as JSON.
+  const terms = [...new Set(brief.domainTerms.map((raw) => sanitizePhrase(raw)).filter(Boolean))];
+  const generic = (term: string): boolean => term.split(/[^\p{L}\p{N}]+/u).filter((word) => word && !SHORT_STOP_WORDS.has(word)).every((word) => GENERIC_WORDS.has(word));
+  const phrases = [...terms.filter((term) => !generic(term)), ...terms.filter(generic)].slice(0, 2);
+  const specificSlots = phrases.every((phrase) => !generic(phrase));
+  const omitted = [
+    ...new Set(brief.domainTerms.filter((raw) => raw.trim() && !sanitizePhrase(raw)).map((raw) => `domain term ${JSON.stringify(raw.trim())} (no searchable words)`)),
+    ...terms.filter((term) => !phrases.includes(term))
+      .map((term) => `domain term "${term}" (${generic(term) && specificSlots ? "generic words only; specific terms took the two phrase slots" : "over the two-phrase limit"})`),
+  ];
   if (phrases.length === 0) {
     const fallback = sanitizePhrase(brief.researchQueries[0] ?? "") || sanitizePhrase(brief.summary);
     if (fallback) phrases.push(fallback.split(" ").slice(0, 3).join(" ").slice(0, 40));
@@ -79,10 +87,11 @@ export function domainMaterialFromBrief(brief: IntakeBrief): DomainMaterial {
   const seenTopics = new Set<string>();
   for (const raw of brief.topicSlugs) {
     const topic = raw.normalize("NFKC").trim().toLowerCase();
-    if (!/^[a-z0-9-]{1,50}$/.test(topic) || seenTopics.has(topic)) continue;
+    if (!topic || seenTopics.has(topic)) continue;
     seenTopics.add(topic);
-    topics.push(topic);
-    if (topics.length === 1) break;
+    if (!/^[a-z0-9-]{1,50}$/.test(topic)) omitted.push(`topic ${JSON.stringify(raw.trim())} (not a GitHub topic slug)`);
+    else if (topics.length < 2) topics.push(topic);
+    else omitted.push(`topic "${topic}" (over the two-topic limit)`);
   }
   const codePatterns: string[] = [];
   const seenPatterns = new Set<string>();
@@ -94,20 +103,21 @@ export function domainMaterialFromBrief(brief: IntakeBrief): DomainMaterial {
     codePatterns.push(pattern);
     if (codePatterns.length === 4) break;
   }
-  return { phrases, topics, ...(codePatterns.length > 0 ? { codePatterns } : {}) };
+  return { phrases, topics, ...(codePatterns.length > 0 ? { codePatterns } : {}), ...(omitted.length > 0 ? { omitted } : {}) };
 }
 
 export function planSearches(material: DomainMaterial, now: Date, tiers: SearchTier[] = DEFAULT_SEARCH_TIERS): SearchPlan {
   const phrases = material.phrases.slice(0, 2);
-  const topics = material.topics.slice(0, 1);
+  const topics = material.topics.slice(0, 2);
   const github: SearchPlan["github"] = [];
   for (const tier of tiers.slice(0, 3)) {
     const pushedDate = dateMonthsBefore(now, tier.maxMonthsSincePush);
     const qualifiers = `archived:false fork:false stars:>=${tier.minStars} pushed:>=${pushedDate}`;
     for (const phrase of phrases) github.push({ tier: tier.tier, query: `${phrase} in:name,description,topics ${qualifiers}` });
-    for (const topic of topics) github.push({ tier: tier.tier, query: `topic:${topic} ${qualifiers}` });
+    // Only the strictest tier spends a request on the second topic; GitHubResearcher's budget of 9 records any excess as skipped.
+    for (const topic of tier.tier === 0 ? topics : topics.slice(0, 1)) github.push({ tier: tier.tier, query: `topic:${topic} ${qualifiers}` });
   }
-  return { github: github.slice(0, 9), gitlab: phrases.slice(0, 2) };
+  return { github, gitlab: phrases.slice(0, 2) };
 }
 
 export function candidateFromSearchItem(provider: "github" | "gitlab", item: unknown): Omit<RepositoryCandidate, "id"> | undefined {
