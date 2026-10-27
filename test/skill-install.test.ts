@@ -4,6 +4,10 @@ import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import { parseCliArguments } from "../src/cli.ts";
 import { SKILL_MARKER, UNSHIT_SKILL, defaultSkillTargets, installSkill } from "../src/skill-install.ts";
+import { TRUSTED_SECTION_HEADING } from "../src/report.ts";
+import type { AnswerRequestDocument } from "../src/storage.ts";
+import { OPEN_DECISION_PREFIX } from "../src/workflow.ts";
+import type { IntakeBrief, PlannedMutant, ReferenceComparison, Requirement, RequirementOrigin, RunOutcome, VerificationMethod } from "../src/types.ts";
 
 const repositoryRoot = path.resolve(import.meta.dir, "..");
 
@@ -43,11 +47,101 @@ describe("unshit agent skill", () => {
       "- The JSON result has `stage`, `limit` (`idle` or `total`) and `limitSeconds`.",
       "- Tell the user which stage timed out. To retry, run the same command again with a larger `--turn-timeout <seconds>` (30 to 3600; the default is 600, and a turn may run three times as long in total).",
       "- The JSON result has `readiness`, `plan`, `research`, `gaps`, `sources` and `artifacts.reportPath` (the Markdown plan). The evidence is under `<project>/.unshit/<run-id>/`: `plan.md`, `manifest.json` and `sources/`.",
+      "- A run in a terminal prints no JSON result: its plan is `plan.md` in the newest `<project>/.unshit/<run-id>/` folder that has one.",
       "- `research.selected` is the number of reference repositories selected for the plan. If `research.trustworthyReferenceFound` is false, no selected repository supplied production or test excerpts: say so plainly, the plan has no reference repository behind it.",
     ]) {
       expect(UNSHIT_SKILL.split("\n")).toContain(line);
     }
     expect(UNSHIT_SKILL.trimEnd().endsWith(SKILL_MARKER)).toBe(true);
+  });
+
+  const onlyTheUserApproves = "- Only the user approves the brief. Never write `approveBrief: true` into `answersFile` yourself. Give the user the file path and let them set `approveBrief` to `true`, or let them run the same command without `--json` in a terminal and approve it when unshit asks.";
+  const settledDecisionsPlanAgain = "- When the user settles an open decision, unshit must plan again with it, as the note says: the decision goes into the brief of the answers file and the user sets `approveBrief` to `true`, or you add it to the requirement text in their words and the user runs that command in a terminal without `--json` and approves the brief when unshit asks. You may write the decision into the brief for the user; never set `approveBrief` yourself. Implement from the new plan.";
+  const approvedFileStaysApproved = "- If the plan came from an approved answers file, `approveBrief` there is already `true`, so the user approves a change by rereading the edited brief and saving it. If you wrote the decision into that brief, show the user the change and rerun only after they have read and accepted it.";
+  const readyOnlyAfterApproval = "- A plan can be Ready only after the user approves its brief. With `--json` unshit cannot ask, so it finishes the plan as Draft, and the JSON result has `answersFile` and no `briefApproval`. When unshit cannot write the answers file, the result has no `answersFile`: tell the user, and run the same command again to get one.";
+
+  test("leaves approval of the brief to the user and labels what the user said apart from what unshit inferred", () => {
+    const lines = UNSHIT_SKILL.split("\n");
+    for (const line of [
+      "## When the user has not approved the brief yet",
+      readyOnlyAfterApproval,
+      "- Show the user the whole brief: `brief.summary`, each requirement in `brief.requirements` with its `observableAcceptance`, and the lists `brief.outOfScope` and `brief.assumptions`. Label a requirement whose `origin` is `stated` \"you said\" and quote its `userWords`; label one whose `origin` is `inferred` \"inferred\": unshit found no verbatim quote of the user's words for it. Ask the user whether this is what they want.",
+      onlyTheUserApproves,
+      "- After the user has set it, run the same command again with `--answers <answersFile>`. The user may edit the brief in `answersFile` before setting it. If the user does not approve, ask what should change, add it to the requirement text in their words, and start a new run without `--answers`.",
+    ]) {
+      expect(lines).toContain(line);
+    }
+    // No other line may tell an agent when or how to set approveBrief.
+    expect(lines.filter((line) => line.includes("approveBrief"))).toEqual([onlyTheUserApproves, settledDecisionsPlanAgain, approvedFileStaysApproved]);
+    // Nor approve the brief, or type yes at unshit's prompt, in the user's place without naming approveBrief.
+    expect(lines.filter((line) => /approv|type yes|yourself/i.test(line))).toEqual([
+      "- Ask the user these questions. They are business decisions: do not answer them yourself and do not invent policies or roles.",
+      "## When the user has not approved the brief yet",
+      readyOnlyAfterApproval,
+      onlyTheUserApproves,
+      "- After the user has set it, run the same command again with `--answers <answersFile>`. The user may edit the brief in `answersFile` before setting it. If the user does not approve, ask what should change, add it to the requirement text in their words, and start a new run without `--answers`.",
+      "  - Each note in the plan that starts with \"Open decision for\". These are the user's to settle: ask them, and do not settle them yourself.",
+      settledDecisionsPlanAgain,
+      approvedFileStaysApproved,
+    ]);
+  });
+
+  test("has the user see what the plan trusts and settle its open decisions before implementing", () => {
+    for (const line of [
+      "  - The plan's \"Trusted, not checked\" section: what the plan relies on that unshit did not check.",
+      "  - Each note in the plan that starts with \"Open decision for\". These are the user's to settle: ask them, and do not settle them yourself.",
+      settledDecisionsPlanAgain,
+      approvedFileStaysApproved,
+      "- Before you start, make sure the user has seen the \"Trusted, not checked\" section and has settled each open decision. Do not implement an acceptance condition whose decision is still open.",
+    ]) {
+      expect(UNSHIT_SKILL.split("\n")).toContain(line);
+    }
+    // The code renders the heading and the note prefix from these constants, so a rename that leaves the skill behind fails here.
+    expect(UNSHIT_SKILL).toContain(`The plan's "${TRUSTED_SECTION_HEADING}" section`);
+    expect(UNSHIT_SKILL).toContain(`Each note in the plan that starts with "${OPEN_DECISION_PREFIX}".`);
+  });
+
+  test("writes tests against the plan's named wrong implementations and the reference tests", () => {
+    for (const line of [
+      "- When an adopted pattern cites a reference test (`testEvidence`), read that test too and check the same behavior in your test.",
+      "- Each planned verification names the wrong implementations it rejects (`rejectsMutants`, with ids such as `T1-V1-M1`). Write each test so that it fails on them.",
+    ]) {
+      expect(UNSHIT_SKILL.split("\n")).toContain(line);
+    }
+  });
+
+  test("ends an implementation with a conformance report of the checks that actually ran", () => {
+    const lines = UNSHIT_SKILL.split("\n");
+    const eachWrongImplementation = "  - Each named wrong implementation (`T1-V1-M1` and so on): killed, survived or failed differently, each with the command you ran, or not run. It is killed only when the named test passed on your code and failed as its `observedFailure` describes with the wrong implementation applied. It survived when the named test still passed with it applied. It failed differently when the named test failed, but not as `observedFailure` describes: say how. That does not count as killed until you fix the test or correct the expected failure; report either change and why, and never rewrite the expected failure only to match the failure you saw. Apply each one in a scratch copy of the project or a separate git worktree, never in the user's working tree.";
+    const survivors = "- A survivor means the test does not catch that bug. Before you call the task done, fix the test until it kills the wrong implementation, or report the survivor plainly.";
+    for (const line of [
+      "- When you finish, give the user a conformance report for each task:",
+      eachWrongImplementation,
+      "  - The verification commands you actually ran, each with its result. List the planned verifications you did not run separately, as not run. A manual check counts as run only when you or the user did it.",
+      "  - Each adopted pattern and its reference test: followed, or why you deviated. If the plan gives a reason that the pattern has no reference test, repeat it.",
+      survivors,
+      "- Never call the implementation verified because the plan was Ready. Ready describes the plan before any code existed; only the checks you ran describe the code.",
+    ]) {
+      expect(lines).toContain(line);
+    }
+    // No other line may say when a wrong implementation counts as killed or what to do with a survivor.
+    expect(lines.filter((line) => /killed|surviv/.test(line))).toEqual([eachWrongImplementation, survivors]);
+  });
+
+  test("names only fields that the run result and the plan carry", () => {
+    const fields: string[] = [
+      ...(["answersFile", "briefApproval", "brief"] satisfies Array<keyof Extract<RunOutcome, { status: "completed" }>>),
+      ...(["approveBrief"] satisfies Array<keyof AnswerRequestDocument>),
+      ...(["origin", "userWords", "observableAcceptance"] satisfies Array<keyof Requirement>),
+      ...(["rejectsMutants"] satisfies Array<keyof VerificationMethod>),
+      ...(["observedFailure"] satisfies Array<keyof PlannedMutant>),
+      ...(["testEvidence"] satisfies Array<keyof ReferenceComparison["adoptedPatterns"][number]>),
+    ];
+    for (const field of fields) expect(UNSHIT_SKILL).toContain(`\`${field}`);
+    for (const field of ["summary", "requirements", "outOfScope", "assumptions"] satisfies Array<keyof IntakeBrief>) {
+      expect(UNSHIT_SKILL).toContain(`\`brief.${field}\``);
+    }
+    for (const origin of ["stated", "inferred"] satisfies RequirementOrigin[]) expect(UNSHIT_SKILL).toContain(`\`${origin}\``);
   });
 
   test("installs into each target, then reports unchanged, and updates its own older copy", async () => {
