@@ -1,5 +1,5 @@
 import { isDemoPath } from "./file-ranking.ts";
-import type { CodePatternMatch, CodeSearchSummary } from "./types.ts";
+import type { CodePatternMatch, CodeSearchSummary, GrepResponseProblem } from "./types.ts";
 
 export const GREP_ENDPOINT = "https://mcp.grep.app";
 
@@ -39,14 +39,21 @@ export function grepRequestBody(id: number, query: CodeSearchQuery): string {
   });
 }
 
-// Returns undefined when the body is not a successful searchGitHub result.
-export function parseGrepResponse(text: string, contentType: string | null): CodeSearchHit[] | undefined {
+export type GrepResponse = { hits: CodeSearchHit[] } | { problem: GrepResponseProblem; rpcErrorCode?: number };
+
+// Returns the hits of a successful searchGitHub result, or the first check that the body failed.
+export function parseGrepResponse(text: string, contentType: string | null): GrepResponse {
   try {
-    if (typeof text !== "string") return undefined;
+    if (typeof text !== "string") return { problem: "not_json_rpc" };
     const payload = (typeof contentType === "string" && contentType.toLowerCase().includes("text/event-stream")) ? eventPayload(text) : jsonValue(text);
-    if (!isRecord(payload) || "error" in payload) return undefined;
+    if (!isRecord(payload) || !("result" in payload || "error" in payload)) return { problem: "not_json_rpc" };
+    if ("error" in payload) {
+      const code = isRecord(payload.error) ? payload.error.code : undefined;
+      return Number.isSafeInteger(code) ? { problem: "rpc_error", rpcErrorCode: code as number } : { problem: "rpc_error" };
+    }
     const result = payload.result;
-    if (!isRecord(result) || result.isError === true || !Array.isArray(result.content)) return undefined;
+    if (isRecord(result) && result.isError === true) return { problem: "tool_error" };
+    if (!isRecord(result) || !Array.isArray(result.content)) return { problem: "no_hits" };
     const hits: CodeSearchHit[] = [];
     let noResults = false;
     for (const item of result.content) {
@@ -63,9 +70,9 @@ export function parseGrepResponse(text: string, contentType: string | null): Cod
       hits.push({ repository, path });
       if (hits.length === 20) break;
     }
-    return hits.length > 0 || noResults ? hits : undefined;
+    return hits.length > 0 || noResults ? { hits } : { problem: "no_hits" };
   } catch {
-    return undefined;
+    return { problem: "not_json_rpc" };
   }
 }
 

@@ -31,6 +31,10 @@ export type RequestFailureCategory =
   | "invalid_request"
   | "internal";
 
+// The first check that a Grep search body failed: no readable JSON-RPC response, a JSON-RPC error, a tool error, or
+// a result with neither a hit nor the no-results message.
+export type GrepResponseProblem = "not_json_rpc" | "rpc_error" | "tool_error" | "no_hits";
+
 export interface RequestFailure {
   provider: "github" | "gitlab" | "grep";
   endpoint: RequestEndpoint;
@@ -38,6 +42,10 @@ export interface RequestFailure {
   status?: number;
   limitBytes?: number;
   page?: number;
+  // Only on a Grep invalid_response: the failed check, the media type (not_json_rpc) and the error code (rpc_error).
+  responseProblem?: GrepResponseProblem;
+  contentType?: string;
+  rpcErrorCode?: number;
   attempts: number;
   retryRefused: boolean;
 }
