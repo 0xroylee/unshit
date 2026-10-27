@@ -1121,6 +1121,20 @@ describe("completions that arrive before the connection ends", () => {
   });
 });
 
+describe("process exit after a turn", () => {
+  test("lets the process exit within two seconds of a turn that ended without a completion, with a 4-second idle limit", async () => {
+    for (const scenario of ["disconnect", "unanswered-cancel"] as const) {
+      const started = Date.now();
+      const child = Bun.spawn([process.execPath, `${import.meta.dir}/fixtures/turn-then-exit.ts`, scenario], { stdout: "pipe", stderr: "pipe" });
+      const code = await child.exited;
+      const output = (await new Response(child.stdout).text()).trim();
+
+      expect({ scenario, code, output }).toEqual({ scenario, code: 0, output: scenario === "disconnect" ? "failed" : "interrupted" });
+      expect(Date.now() - started).toBeLessThan(2_000);
+    }
+  }, 15_000);
+});
+
 async function waitForProcess(fixture: ReturnType<typeof createMockSpawner>): Promise<MockAppServerProcess> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (fixture.processes[0]) return fixture.processes[0];
