@@ -3610,7 +3610,9 @@ describe("reference preview gate", () => {
       const page = path.join(cwd, ".unshit", "run-1", "preview.html");
       expect(before).toContain(`Reference preview page: ${page}\n`);
       expect(before).toContain("[ok] repository_search: completed; found 2\n    found C1 github:org/refunds [discovery]\n    found C2 github:org/young [discovery]\n");
-      expect(before).toContain("    excluded C2 github:org/young [discovery] (created 2026-09-16, younger than 180 days)\n");
+      expect(before).toContain("[ok] metadata_screening: completed; passed 1, excluded 1\n    excluded C2 github:org/young [discovery] (created 2026-09-16, younger than 180 days)\n");
+      // The terminal gives repositories that passed the metadata bar only as a count; the page lists them.
+      expect(before).not.toContain("    passed ");
       expect(before).toContain("[..] preview_confirmation: waiting\n");
       expect(before).toContain("[  ] source_reads: pending\n");
       expect(await readFile(page, "utf8")).toContain("github:org/young");
@@ -3674,7 +3676,7 @@ describe("reference preview publication", () => {
 
       await review.reached.promise;
       text = output.join("");
-      expect(text).toMatch(/\[ok\] evidence_requests: completed; added \d+\n {4}added excerpts: E\d+/);
+      expect(text).toMatch(/\[ok\] evidence_requests: completed; supplied_to_model \d+, added \d+\n {4}added excerpts: E\d+/);
       expect(text).toContain("[ok] plan: completed; supplied_to_model ");
       snapshots = await linkedSnapshots(page);
       expect(snapshots).toContain("export const path = 'src/extra.ts';\n");
@@ -3844,9 +3846,9 @@ describe("reference preview publication", () => {
       expect(outcome.status).toBe("completed");
       const blocks = output.join("").split("Reference preview, revision ");
       const planBlock = blocks.find((block) => block.includes("[ok] plan: completed") && !block.includes("[ok] review:"))!;
-      expect(planBlock).toContain("[ok] plan: completed; supplied_to_model 6, cited 3\n    supplied_to_model excerpts: E1, E2, E3, E4, E5, E6\n    cited excerpts: E4, E1, E2\n");
+      expect(planBlock).toContain("[ok] plan: completed; supplied_to_model 6, cited 3\n    cited excerpts: E4, E1, E2\n");
       const reviewBlock = blocks.find((block) => block.includes("[ok] review: completed"))!;
-      expect(reviewBlock).toContain("[ok] plan: completed; supplied_to_model 6, cited 3\n    supplied_to_model excerpts: E1, E2, E3, E4, E5, E6\n    cited excerpts: E3, E1, E2\n");
+      expect(reviewBlock).toContain("[ok] plan: completed; supplied_to_model 6, cited 3\n    cited excerpts: E3, E1, E2\n");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -3905,6 +3907,121 @@ describe("reference preview publication", () => {
         researcher: researcher().value,
         ...writers,
       });
+      expect(outcome).toMatchObject({ status: "error", message: "Could not finalize workflow preview artifacts." });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("reference preview inputs", () => {
+  const requirement = "Build a refund request service.";
+  const bothFiles = { files: [{ fileId: "C1F1", role: "production", rationale: "Handler." }, { fileId: "C1F2", role: "test", rationale: "Tests." }] };
+
+  test("records every candidate the ranking turn received as supplied to the model, apart from the ones it ranked", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const published: WorkflowPreview[] = [];
+    const second = { ...repositorySnapshot().candidate, id: "C2", fullName: "org/other", webUrl: "https://github.com/org/other" };
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), ranking: { ranked: ["C2"] }, fileSelection: bothFiles, onPrompt: (prompt, schema) => { if (turnKind(schema) === "ranking") prompts.push(prompt); } }),
+        researcher: researcher({ candidates: [repositorySnapshot().candidate, second], treeResolutionLimit: 1 }).value,
+        onPreview: async (preview) => {
+          published.push(preview);
+        },
+      });
+      expect(outcome.status).toBe("completed");
+      const offered = [...prompts[0]!.matchAll(/"id":"(C\d+)"/g)].map((match) => match[1]!);
+      expect(offered).toEqual(["C1", "C2"]);
+      const ranking = stageOf(published.at(-1), "candidate_ranking")!;
+      expect(ranking.uses.filter((use) => use.relation === "supplied_to_model").map((use) => use.key)).toEqual(offered);
+      expect(ranking.uses.filter((use) => use.relation === "ranked").map((use) => use.key)).toEqual(["C2"]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("records the excerpts the evidence-request turn received, also when it adds nothing", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const published: WorkflowPreview[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles, evidenceRequests: { requests: [] }, onPrompt: (prompt, schema) => { if (turnKind(schema) === "requests") prompts.push(prompt); } }),
+        researcher: researcher().value,
+        onPreview: async (preview) => {
+          published.push(preview);
+        },
+      });
+      expect(outcome.status).toBe("completed");
+      const received = [...new Set([...prompts[0]!.matchAll(/"excerptId":"(E\d+)"/g)].map((match) => match[1]!))];
+      expect(received.length).toBeGreaterThan(0);
+      const requests = stageOf(published.at(-1), "evidence_requests")!;
+      expect(requests.status).toBe("completed");
+      expect(requests.uses).toEqual(received.map((key) => ({ relation: "supplied_to_model", key })));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("gives the number of files offered to file selection in the terminal, the page and the plan", async () => {
+    const cwd = await tempDirectory();
+    const output: string[] = [];
+    const prompts: string[] = [];
+    try {
+      const writers = createRunWriters({ cwd, runId: "run-1", jsonl: false, write: (text) => output.push(text) });
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles, onPrompt: (prompt, schema) => { if (turnKind(schema) === "files") prompts.push(prompt); } }),
+        researcher: researcher().value,
+        ...writers,
+      });
+      expect(outcome.status).toBe("completed");
+      const offered = new Set([...prompts[0]!.matchAll(/"fileId":"([^"]+)"/g)].map((match) => match[1]!)).size;
+      expect(offered).toBeGreaterThan(2);
+      expect(output.join("")).toContain(`[ok] file_selection: completed; selected 2; ${offered} files offered to the model\n`);
+      const page = await readFile(path.join(cwd, ".unshit", "run-1", "preview.html"), "utf8");
+      expect(page).toContain(`<p class="muted"><span lang="en">${offered} files offered to the model, not listed</span> · <span lang="zh-CN">提供给模型的文件 ${offered} 个，未逐一列出</span></p>`);
+      const plan = await readFile(path.join(cwd, ".unshit", "run-1", "plan.md"), "utf8");
+      expect(plan).toContain(`- **File selection** (\`file_selection\`): completed; ${offered} files offered to the model, not listed.\n`);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("ends as an error with a fixed message, and no completed result, when the final page cannot be written", async () => {
+    const cwd = await tempDirectory();
+    let planWritten = false;
+    try {
+      const writers = createRunWriters({
+        cwd,
+        runId: "run-1",
+        jsonl: false,
+        write: () => undefined,
+        writer: async (target, data) => {
+          if (target.endsWith("preview.html") && planWritten) throw new Error("ENOSPC: no space left on device, write '/private/run/preview.html'");
+          await plainWrite(target, data);
+          if (target.endsWith("plan.md")) planWritten = true;
+        },
+      });
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles }),
+        researcher: researcher().value,
+        ...writers,
+      });
+      expect(planWritten).toBe(true);
       expect(outcome).toMatchObject({ status: "error", message: "Could not finalize workflow preview artifacts." });
     } finally {
       await rm(cwd, { recursive: true, force: true });

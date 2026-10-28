@@ -510,6 +510,8 @@ export interface PreviewStage {
   id: PreviewStageId;
   status: PreviewStageStatus;
   uses: PreviewUse[];
+  // How many files the stage's model turn could choose from; the files themselves are not listed.
+  offeredFiles?: number;
 }
 
 // One revision of the stage-and-reference preview. `references` holds every reference that a stage uses, and the

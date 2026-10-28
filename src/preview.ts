@@ -51,6 +51,7 @@ export interface PreviewRecorder {
   register(references: PreviewReference[]): void;
   has(key: string): boolean;
   setStatus(stage: PreviewStageId, status: PreviewStageStatus): void;
+  setOfferedFiles(stage: PreviewStageId, count: number): void;
   record(stage: PreviewStageId, relation: PreviewRelation, keys: string[], notes?: ReadonlyMap<string, string>): void;
   snapshot(): WorkflowPreview;
 }
@@ -61,6 +62,7 @@ export interface PreviewRecorder {
 export function createPreviewRecorder(): PreviewRecorder {
   const registry = new Map<string, PreviewReference>();
   const statuses = new Map<PreviewStageId, PreviewStageStatus>();
+  const offeredFiles = new Map<PreviewStageId, number>();
   const uses = new Map<PreviewStageId, Map<PreviewRelation, PreviewUse[]>>();
   let revision = 0;
   let changed = true;
@@ -72,6 +74,10 @@ export function createPreviewRecorder(): PreviewRecorder {
     setStatus(stage, status) {
       if ((statuses.get(stage) ?? "pending") === status) return;
       statuses.set(stage, status);
+      changed = true;
+    },
+    setOfferedFiles(stage, count) {
+      offeredFiles.set(stage, count);
       changed = true;
     },
     record(stage, relation, keys, notes = new Map()) {
@@ -89,11 +95,15 @@ export function createPreviewRecorder(): PreviewRecorder {
         revision += 1;
         changed = false;
       }
-      const stages: PreviewStage[] = PREVIEW_STAGES.map(({ id }) => ({
-        id,
-        status: statuses.get(id) ?? "pending",
-        uses: [...(uses.get(id)?.values() ?? [])].flat().map((use) => ({ ...use })),
-      }));
+      const stages: PreviewStage[] = PREVIEW_STAGES.map(({ id }) => {
+        const offered = offeredFiles.get(id);
+        return {
+          id,
+          status: statuses.get(id) ?? "pending",
+          uses: [...(uses.get(id)?.values() ?? [])].flat().map((use) => ({ ...use })),
+          ...(offered === undefined ? {} : { offeredFiles: offered }),
+        };
+      });
       const shown = new Set(stages.flatMap((stage) => stage.uses.map((use) => use.key)));
       for (const key of [...shown]) {
         const sourceKey = registry.get(key)?.sourceKey;
@@ -117,7 +127,7 @@ export function changedStages(preview: WorkflowPreview, previous?: WorkflowPrevi
 }
 
 function stageSignature(stage: PreviewStage): string {
-  return JSON.stringify([stage.status, stage.uses.map((use) => [use.relation, use.key, use.note ?? ""])]);
+  return JSON.stringify([stage.status, stage.offeredFiles ?? null, stage.uses.map((use) => [use.relation, use.key, use.note ?? ""])]);
 }
 
 export function candidateReference(candidate: RepositoryCandidate): PreviewReference {

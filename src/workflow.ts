@@ -369,6 +369,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     const treeChecks = options.researcher.treeResolutionLimit;
     if (discovery.candidates.length > treeChecks) {
       progress({ stage: "candidate_ranking", state: "started", message: `Ranking ${discovery.candidates.length} metadata-passing repositories for ${treeChecks} commit-pinned tree checks.` });
+      preview.record("candidate_ranking", "supplied_to_model", discovery.candidates.map((candidate) => candidate.id));
       try {
         const rankingValue = await modelJson(
           planningSession,
@@ -506,6 +507,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         return entry ? [fileReference(entry.file, entry.snapshot)] : [];
       }));
       preview.record("file_selection", "selected", fileSelection.map((selected) => selected.fileId).filter((id) => preview.has(id)));
+      preview.setOfferedFiles("file_selection", choices.offered.length);
       preview.setStatus("file_selection", "completed");
       progress({ stage: "file_selection", state: "completed", message: `Selected ${fileSelection.length} source files for bounded reads.` });
     } else {
@@ -541,6 +543,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
 
     if (evidence.excerpts.length > 0) {
       progress({ stage: "evidence_requests", state: "started", message: "Asking the model which source the plan needs beyond the excerpts." });
+      preview.record("evidence_requests", "supplied_to_model", evidence.excerpts.map((excerpt) => excerpt.id));
       try {
         const unread = unreadFileChoices(choices, evidence, local.files, selectedSnapshots);
         const left = EXCERPT_BUDGET - evidence.excerpts.reduce((sum, excerpt) => sum + excerpt.text.length, 0);

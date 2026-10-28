@@ -853,6 +853,15 @@ describe("stage and reference preview rendering", () => {
 
   // Ported from the comparator's preview tests (langgenius/dify, E84): a paused run and missing data read differently
   // from a finished run whose traces can be opened.
+  test("escapes a hostile note on a stage use", () => {
+    const preview = previewWith();
+    preview.stages.find((stage) => stage.id === "repository_search")!.uses[0]!.note = "archived</span><script>alert(1)</script><img src=x onerror=alert(1)>";
+    const html = renderPreviewHtml(preview, new Set());
+    expect(html).toContain("archived&lt;/span&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;img src=x onerror=alert(1)&gt;");
+    expect(html.match(/<script/g) ?? []).toEqual([]);
+    expect(html.match(/<img/g) ?? []).toEqual([]);
+  });
+
   test("tells a waiting preview from a finished one", () => {
     const waiting = renderPreviewHtml(previewWith({ waiting: true }), new Set());
     expect(waiting).toContain("The run is waiting at this preview. Type yes in the terminal to continue");

@@ -466,6 +466,9 @@ function relationGroups(uses: PreviewUse[], references: Map<string, PreviewRefer
   return [...groups].map(([relation, rows]) => ({ relation, rows }));
 }
 
+// Relations that the terminal gives only as a count on the stage line; the page and the plan list each reference.
+const COUNTED_IN_TERMINAL = new Set<PreviewRelation>(["passed", "supplied_to_model"]);
+
 // The terminal lines for the stages that changed since `previous`, or for every stage without it. Labels and notes
 // lose control and bidirectional characters, so a file name cannot move the cursor or start a forged line.
 export function renderPreviewText(preview: WorkflowPreview, previous?: WorkflowPreview): string {
@@ -475,8 +478,10 @@ export function renderPreviewText(preview: WorkflowPreview, previous?: WorkflowP
     const groups = relationGroups(stage.uses, references);
     const counts = groups.map(({ relation, rows }) => `${relation} ${rows.length}`).join(", ");
     const empty = stage.status === "completed" || stage.status === "skipped" || stage.status === "failed" ? "; no references" : "";
-    lines.push(`${STATUS_MARKERS[stage.status]} ${stage.id}: ${stage.status}${counts ? `; ${counts}` : empty}`);
+    const offered = stage.offeredFiles === undefined ? "" : `; ${stage.offeredFiles} files offered to the model`;
+    lines.push(`${STATUS_MARKERS[stage.status]} ${stage.id}: ${stage.status}${counts ? `; ${counts}` : empty}${offered}`);
     for (const { relation, rows } of groups) {
+      if (COUNTED_IN_TERMINAL.has(relation)) continue;
       const excerpts = rows.filter(({ reference }) => reference.kind === "excerpt");
       if (excerpts.length > 0) lines.push(`    ${relation} excerpts: ${excerpts.map(({ reference }) => reference.key).join(", ")}`);
       for (const { use, reference } of rows) {
@@ -499,7 +504,8 @@ function previewMarkdown(preview: WorkflowPreview): string[] {
   const lines = ["## Stages and references", "", `Revision ${preview.revision} of the stage-and-reference preview; \`preview.html\` in the run folder shows the same revision. ${PREVIEW_INTRO}`, ""];
   for (const stage of preview.stages) {
     const groups = relationGroups(stage.uses, references);
-    lines.push(`- **${previewStageTitle(stage.id).title}** (\`${stage.id}\`): ${STATUS_TEXT[stage.status][0].toLowerCase()}${groups.length === 0 ? "; no references" : ""}.`);
+    const offered = stage.offeredFiles === undefined ? "" : `; ${stage.offeredFiles} files offered to the model, not listed`;
+    lines.push(`- **${previewStageTitle(stage.id).title}** (\`${stage.id}\`): ${STATUS_TEXT[stage.status][0].toLowerCase()}${groups.length === 0 ? "; no references" : ""}${offered}.`);
     for (const { relation, rows } of groups) {
       const label = RELATION_TEXT[relation][0];
       const excerpts = rows.filter(({ reference }) => reference.kind === "excerpt");
@@ -555,7 +561,8 @@ export function renderPreviewHtml(preview: WorkflowPreview, publishedSnapshots: 
       return `<details${rows.length <= 12 ? " open" : ""}><summary>${bilingual(label, labelZh)} (${rows.length})</summary><ul>${items}</ul></details>`;
     }).join("");
     const empty = groups ? "" : `<p class="muted">${stage.status === "pending" || stage.status === "waiting" ? bilingual("No references yet", "暂无参考") : bilingual("No references", "无参考")}</p>`;
-    return `<li class="stage" data-status="${stage.status}"><h2><span class="num">${String(index + 1).padStart(2, "0")}</span> ${bilingual(title, titleZh)} <code>${stage.id}</code></h2><p class="status">${bilingual(status, statusZh)}</p>${groups}${empty}</li>`;
+    const offered = stage.offeredFiles === undefined ? "" : `<p class="muted">${bilingual(`${stage.offeredFiles} files offered to the model, not listed`, `提供给模型的文件 ${stage.offeredFiles} 个，未逐一列出`)}</p>`;
+    return `<li class="stage" data-status="${stage.status}"><h2><span class="num">${String(index + 1).padStart(2, "0")}</span> ${bilingual(title, titleZh)} <code>${stage.id}</code></h2><p class="status">${bilingual(status, statusZh)}</p>${offered}${groups}${empty}</li>`;
   }).join("\n");
   const registry = preview.references.map((reference) => referenceDetails(reference, publishedSnapshots)).join("\n");
   const note = waiting
