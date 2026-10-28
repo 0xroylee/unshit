@@ -37,6 +37,19 @@ import {
 } from "./model-schema.ts";
 import { EXCERPT_BUDGET, MAX_REQUESTED_FILES, addRequestedEvidence, excerptPromptData, finalSources, loadSelectedEvidence } from "./evidence.ts";
 import { UNAPPROVED_BRIEF_NOTE, briefSha256, inferredRequirementGaps } from "./brief-approval.ts";
+import {
+  PREVIEW_DECLINED,
+  PREVIEW_SAVE_FAILED,
+  PREVIEW_UNAVAILABLE,
+  candidateReference,
+  commitKey,
+  commitReference,
+  createPreviewRecorder,
+  evidenceReferences,
+  fileReference,
+  planCitations,
+  reviewCitations,
+} from "./preview.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import type {
   ApprovedBrief,
@@ -59,10 +72,12 @@ import type {
   ValidationRecord,
   SelectedFile,
   TreeFile,
+  WorkflowPreview,
 } from "./types.ts";
 
 export type AnswerQuestion = (question: MaterialQuestion) => Promise<string>;
 export type ApproveBrief = (brief: IntakeBrief) => Promise<boolean>;
+export type ConfirmPreview = (preview: WorkflowPreview) => Promise<boolean>;
 
 export interface WorkflowArtifactInput {
   brief: IntakeBrief;
@@ -78,6 +93,10 @@ export interface WorkflowArtifactInput {
   validationHistory: ValidationRecord[];
   evidence: LoadedEvidence;
   commands: ReturnType<typeof extractExistingCommands>;
+  preview?: WorkflowPreview;
+  // Only for onArtifacts: marks the save stage completed and returns that revision. The writer calls it once the source
+  // snapshots are saved.
+  completePreview?: () => WorkflowPreview;
 }
 
 export type { CheckpointStage };
@@ -99,6 +118,12 @@ export interface WorkflowOptions {
   signal?: AbortSignal;
   modelGateway: ModelGateway;
   researcher: GitHubResearcher;
+  // Asks a person to confirm the stage-and-reference preview once the search has returned. Only true continues to
+  // ranking and tree checks; false, or no confirmPreview, ends the run as needs_input with previewStop.
+  confirmPreview?: ConfirmPreview;
+  // Publishes one preview revision: the source snapshots it links, then its page. The run waits for it before the next
+  // stage starts.
+  onPreview?: (preview: WorkflowPreview, evidence: LoadedEvidence) => Promise<void>;
   onProgress?: (event: ProgressEvent) => void;
   onCheckpoint?: (input: WorkflowArtifactInput, stage: CheckpointStage) => Promise<string | undefined>;
   onArtifacts?: (input: WorkflowArtifactInput) => Promise<RunArtifacts | undefined>;
@@ -151,6 +176,10 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
   let planTestGaps: ResearchGap[] = [];
   const progress = (event: ProgressEvent): void => options.onProgress?.(event);
   const now = options.now ?? (() => new Date());
+  const preview = createPreviewRecorder();
+  const publishPreview = async (): Promise<void> => {
+    if (options.onPreview) await options.onPreview(preview.snapshot(), checkpointEvidence ?? emptyEvidence());
+  };
 
   const saveCheckpoint = async (stage: CheckpointStage, placeholderNotes: string[] = []): Promise<void> => {
     // A timeout leaves a checkpoint even before intake or the source reads finished.
@@ -173,6 +202,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         validationHistory: [...validationHistory],
         evidence: savedEvidence,
         commands: [...checkpointCommands],
+        preview: preview.snapshot(),
       }, stage);
     } catch {
       savedCheckpointPath = undefined;
@@ -200,6 +230,8 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       brief = options.approvedBrief.brief;
       resolvedAnswerContext = options.approvedBrief.resolvedAnswers;
       briefApproval = options.approvedBrief.approval;
+      for (const stage of ["intake", "answer_gate", "brief_rebuild"] as const) preview.setStatus(stage, "skipped");
+      preview.setStatus("brief_approval", "completed");
       progress({ stage: "intake", state: "skipped", message: `Using the brief approved in the answers file: ${brief.requirements.length} requirements; no intake, answer or rebuild turn.` });
     } else {
       progress({ stage: "intake", state: "started", message: "Extracting requirements and material questions." });
@@ -222,6 +254,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         }
         brief = { ...brief, materialQuestions: options.priorQuestions };
       }
+      preview.setStatus("intake", "completed");
       progress({ stage: "intake", state: "completed", message: `Captured ${brief.requirements.length} requirements and ${brief.materialQuestions.length} material questions.` });
 
       const answers = await resolveAnswers(brief, options.answers ?? {}, options.answerQuestion, options.signal);
@@ -229,8 +262,10 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         progress({ stage: "answer_gate", state: "warning", message: "Waiting for material answers. No reference search has started." });
         return { status: "needs_input", questions: answers.unanswered, brief };
       }
+      preview.setStatus("answer_gate", brief.materialQuestions.length > 0 ? "completed" : "skipped");
       progress({ stage: "answer_gate", state: "completed", message: "Material questions are resolved." });
       resolvedAnswerContext = materialAnswerContext(brief, answers.resolved);
+      preview.setStatus("brief_rebuild", resolvedAnswerContext.length > 0 ? "completed" : "skipped");
       if (resolvedAnswerContext.length > 0) {
         initialBrief = brief;
         try {
@@ -248,6 +283,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
           if (error instanceof NeedsInputError || error instanceof InterruptedWorkflowError || options.signal?.aborted) throw error;
           // After a timeout the native session can be unusable; the search and planning turns need a working one.
           if (error instanceof TurnTimeoutError) planningSession = await replaceSession(options.modelGateway, planningSession);
+          preview.setStatus("brief_rebuild", "failed");
           gaps.push({
             kind: "validation",
             material: true,
@@ -267,7 +303,10 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         return { status: "needs_input", questions: [], brief, approvalRequested: true, resolvedAnswers: resolvedAnswerContext };
       }
       briefApproval = { briefSha256: briefSha256(brief), via: "tty", approvedAt: now().toISOString() };
+      preview.setStatus("brief_approval", "completed");
       progress({ stage: "brief_approval", state: "completed", message: "The brief was approved: yes was typed at the terminal prompt." });
+    } else if (!briefApproval) {
+      preview.setStatus("brief_approval", "skipped");
     }
 
     throwIfAborted(options.signal);
@@ -278,6 +317,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     if (!local.files.some((file) => isTestPath(file.path))) {
       gaps.push({ kind: "local", message: "No local test file was found in the bounded file list; the plan should establish the target project's test conventions or add them.", material: false });
     }
+    preview.setStatus("local_baseline", "completed");
     progress({ stage: "local_baseline", state: "completed", message: `Indexed ${local.files.length} eligible local files without running project code.` });
 
     throwIfAborted(options.signal);
@@ -291,6 +331,39 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     gaps.push(...discovery.gaps);
     research = discovery.research;
     progress({ stage: "repository_search", state: "completed", message: `Matched ${discovery.research.matched} unique repositories; ${discovery.candidates.length} passed the metadata bar.` });
+    const discovered = [...discovery.candidates, ...discovery.excluded.map((entry) => entry.candidate)];
+    preview.register(discovered.map(candidateReference));
+    preview.record("repository_search", "found", discovered.map((candidate) => candidate.id));
+    preview.setStatus("repository_search", "completed");
+    preview.record("metadata_screening", "passed", discovery.candidates.map((candidate) => candidate.id));
+    preview.record("metadata_screening", "excluded", discovery.excluded.map((entry) => entry.candidate.id), reasonNotes(discovery.excluded));
+    preview.setStatus("metadata_screening", "completed");
+
+    // The gate: the page is written before anyone is asked, and no ranking, tree check or source read starts until the
+    // confirmation returns true.
+    throwIfAborted(options.signal);
+    preview.setStatus("preview_confirmation", options.confirmPreview ? "waiting" : "stopped");
+    progress({ stage: "preview_confirmation", state: "started", message: "Publishing the reference preview. No ranking, tree check or source read has started." });
+    try {
+      await publishPreview();
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      throw new Error(PREVIEW_SAVE_FAILED);
+    }
+    if (!options.confirmPreview) {
+      progress({ stage: "preview_confirmation", state: "warning", message: PREVIEW_UNAVAILABLE });
+      return { status: "needs_input", questions: [], brief, resolvedAnswers: resolvedAnswerContext, previewStop: "unavailable", message: PREVIEW_UNAVAILABLE };
+    }
+    const confirmed = await options.confirmPreview(preview.snapshot());
+    throwIfAborted(options.signal);
+    if (confirmed !== true) {
+      preview.setStatus("preview_confirmation", "stopped");
+      await publishPreview().catch(() => undefined);
+      progress({ stage: "preview_confirmation", state: "warning", message: PREVIEW_DECLINED });
+      return { status: "needs_input", questions: [], brief, resolvedAnswers: resolvedAnswerContext, previewStop: "declined", message: PREVIEW_DECLINED };
+    }
+    preview.setStatus("preview_confirmation", "completed");
+    progress({ stage: "preview_confirmation", state: "completed", message: "The reference preview was confirmed: yes was typed at the terminal prompt." });
 
     let treeCandidates = discovery.candidates;
     const treeChecks = options.researcher.treeResolutionLimit;
@@ -307,15 +380,21 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         );
         const ranked = parseCandidateRanking(rankingValue, discovery.candidates);
         treeCandidates = rankedFirst(discovery.candidates, ranked);
+        preview.record("candidate_ranking", "ranked", ranked.filter((id) => preview.has(id)));
+        preview.setStatus("candidate_ranking", "completed");
         progress({ stage: "candidate_ranking", state: "completed", message: `The model put ${ranked.length} repositories first for tree checks.` });
       } catch (error) {
         if (options.signal?.aborted || error instanceof InterruptedWorkflowError || error instanceof NeedsInputError) throw error;
         // After a timeout the native session can be unusable; the selection and planning turns need a working one.
         if (error instanceof TurnTimeoutError) planningSession = await replaceSession(options.modelGateway, planningSession);
         gaps.push({ kind: "repository", material: false, message: `The model ranking of metadata-passing repositories failed, so tree checks used the host keyword order.${error instanceof TurnTimeoutError ? ` ${error.message}` : ""}` });
+        preview.setStatus("candidate_ranking", "failed");
         progress({ stage: "candidate_ranking", state: "warning", message: "Tree checks use the host keyword order." });
       }
+    } else {
+      preview.setStatus("candidate_ranking", "skipped");
     }
+    await publishPreview();
 
     throwIfAborted(options.signal);
     progress({ stage: "repository_trees", state: discovery.candidates.length > 0 ? "started" : "skipped", message: discovery.candidates.length > 0 ? "Verifying candidate commits, tests, and license evidence before selection." : "No candidate passed the metadata quality bar." });
@@ -336,6 +415,12 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       gaps.push({ kind: "search", message: noTrustworthyReferenceMessage(research), material: true });
     }
     progress({ stage: "repository_trees", state: treeResolution.snapshots.length > 0 ? "completed" : "skipped", message: treeResolution.snapshots.length > 0 ? `Verified ${treeResolution.snapshots.length} commit-pinned repositories before model selection.` : "No trustworthy repository passed commit-pinned tree checks." });
+    preview.register(treeResolution.snapshots.map(commitReference));
+    preview.register(treeResolution.excluded.map((entry) => candidateReference(entry.candidate)));
+    preview.record("repository_trees", "tree_checked", treeResolution.snapshots.map(commitKey));
+    preview.record("repository_trees", "excluded", treeResolution.excluded.map((entry) => entry.candidate.id), reasonNotes(treeResolution.excluded));
+    preview.setStatus("repository_trees", discovery.candidates.length > 0 ? "completed" : "skipped");
+    await publishPreview();
 
     let selection: ReturnType<typeof parseRepositorySelection> = { selected: [], rejected: [] };
     const shortlistCandidates = treeResolution.snapshots.map((snapshot) => snapshot.candidate);
@@ -367,10 +452,17 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         options.signal,
       );
       selection = parseRepositorySelection(selectionValue, shortlistCandidates);
+      const commitKeys = new Map(treeResolution.snapshots.map((snapshot) => [snapshot.candidate.id, commitKey(snapshot)]));
+      const keysOf = (entries: Array<{ candidateId: string }>): string[] => entries.flatMap((entry) => commitKeys.get(entry.candidateId) ?? []);
+      preview.record("candidate_selection", "selected", keysOf(selection.selected));
+      preview.record("candidate_selection", "rejected", keysOf(selection.rejected));
+      preview.setStatus("candidate_selection", "completed");
       progress({ stage: "candidate_selection", state: "completed", message: `Selected ${selection.selected.length} comparators from ${shortlistCandidates.length} tree-verified candidates.` });
     } else {
+      preview.setStatus("candidate_selection", "skipped");
       progress({ stage: "candidate_selection", state: "skipped", message: "No trustworthy repository was available for selection." });
     }
+    await publishPreview();
     if (treeResolution.snapshots.length > 0 && selection.selected.length === 0) {
       gaps.push({ kind: "repository", message: "The model selected no comparator repository for deep inspection.", material: true });
     }
@@ -405,11 +497,23 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       if (parsed.ignored > 0) {
         gaps.push({ kind: "file", material: false, message: `The model chose ${parsed.ignored} file ID(s) that were not offered or were repeated; the host ignored them.` });
       }
+      const offeredFiles = new Map<string, { file: TreeFile; snapshot?: RepositorySnapshot }>([
+        ...local.files.map((file) => [file.id, { file }] as const),
+        ...selectedSnapshots.flatMap((snapshot) => snapshot.files.map((file) => [file.id, { file, snapshot }] as const)),
+      ]);
+      preview.register(fileSelection.flatMap((selected) => {
+        const entry = offeredFiles.get(selected.fileId);
+        return entry ? [fileReference(entry.file, entry.snapshot)] : [];
+      }));
+      preview.record("file_selection", "selected", fileSelection.map((selected) => selected.fileId).filter((id) => preview.has(id)));
+      preview.setStatus("file_selection", "completed");
       progress({ stage: "file_selection", state: "completed", message: `Selected ${fileSelection.length} source files for bounded reads.` });
     } else {
       gaps.push({ kind: "file", message: "No eligible source or test file IDs were available for evidence selection.", material: true });
+      preview.setStatus("file_selection", "skipped");
       progress({ stage: "file_selection", state: "skipped", message: "No file candidates were available." });
     }
+    await publishPreview();
 
     throwIfAborted(options.signal);
     progress({ stage: "source_reads", state: "started", message: "Reading selected files, hashing source bytes, and assigning exact line ranges." });
@@ -430,6 +534,10 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     gaps.push(...evidence.gaps);
     if (evidence.excerpts.length === 0) gaps.push({ kind: "file", message: "No source excerpt could be prepared for evidence-backed planning.", material: true });
     progress({ stage: "source_reads", state: "completed", message: `Prepared ${evidence.sources.length} hashed source snapshots and ${evidence.excerpts.length} line-validated excerpts.` });
+    preview.register(evidenceReferences(evidence));
+    preview.record("source_reads", "read", evidence.sources.map((source) => source.id));
+    preview.setStatus("source_reads", "completed");
+    await publishPreview();
 
     if (evidence.excerpts.length > 0) {
       progress({ stage: "evidence_requests", state: "started", message: "Asking the model which source the plan needs beyond the excerpts." });
@@ -455,8 +563,12 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
           signal: options.signal,
         });
         throwIfAborted(options.signal);
+        const known = new Set([...evidence.sources.map((source) => source.id), ...evidence.excerpts.map((excerpt) => excerpt.id)]);
         evidence = result.evidence;
         checkpointEvidence = evidence;
+        preview.register(evidenceReferences(evidence));
+        preview.record("evidence_requests", "added", [...evidence.sources.map((source) => source.id), ...evidence.excerpts.map((excerpt) => excerpt.id)].filter((id) => !known.has(id)));
+        preview.setStatus("evidence_requests", "completed");
         research.trustworthyReferenceFound = selectedSnapshots.some((snapshot) => hasComparatorSource(snapshot, evidence));
         gaps.push(...result.gaps);
         progress({ stage: "evidence_requests", state: "completed", message: `Added ${result.added} excerpts for ${result.served} of ${requests.length} requests.` });
@@ -465,9 +577,13 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         // After a timeout the native session can be unusable; the planning turn needs a working one.
         if (error instanceof TurnTimeoutError) planningSession = await replaceSession(options.modelGateway, planningSession);
         gaps.push({ kind: "file", material: false, message: `The model's requests for more source failed, so the plan uses the first excerpts.${error instanceof TurnTimeoutError ? ` ${error.message}` : ""}` });
+        preview.setStatus("evidence_requests", "failed");
         progress({ stage: "evidence_requests", state: "warning", message: "The plan uses the first excerpts." });
       }
+    } else {
+      preview.setStatus("evidence_requests", "skipped");
     }
+    await publishPreview();
 
     const localCommands = evidence.sources.flatMap((source) => {
       if (source.kind !== "local") return [];
@@ -531,6 +647,10 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     }
     checkpointPlan = plan;
     await saveCheckpoint("plan");
+    preview.record("plan", "supplied_to_model", evidence.excerpts.map((excerpt) => excerpt.id));
+    preview.record("plan", "cited", parsedPlan ? planCitations(plan).filter((id) => preview.has(id)) : []);
+    preview.setStatus("plan", parsedPlan ? "completed" : "failed");
+    await publishPreview();
 
     if (!parsedPlan) {
       const message = "Plan generation and its bounded validation repair did not produce a usable task map.";
@@ -610,6 +730,12 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         }
       }
       progress({ stage: "review", state: "completed", message: `Independent review recorded ${reviews.reduce((count, review) => count + review.findings.length, 0)} finding(s) and ${reviews.reduce((count, review) => count + review.survivingMutants.length, 0)} surviving mutant(s).` });
+      // A repair replaces the plan, so the plan stage now cites what the repaired plan cites.
+      preview.record("plan", "cited", planCitations(plan).filter((id) => preview.has(id)));
+      preview.record("review", "supplied_to_model", evidence.excerpts.map((excerpt) => excerpt.id));
+      preview.record("review", "cited", reviewCitations(reviews).filter((id) => preview.has(id)));
+      preview.setStatus("review", "completed");
+      await publishPreview();
     }
 
     // Computed from the final plan, so a repair that cites a reference test clears it. From here on it is in gaps, and
@@ -630,6 +756,8 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     plan.readinessNotes = [...new Set([...plan.readinessNotes, ...materialGaps, ...(severeReview ? ["Independent review left blocking or material findings unresolved."] : []), ...(briefApproval ? [] : [UNAPPROVED_BRIEF_NOTE]), ...openDecisions, ...validationIssues])];
     checkpointPlan = plan;
     await saveCheckpoint("plan");
+    preview.setStatus("readiness", "completed");
+    await publishPreview();
 
     const sources = finalSources(evidence.sources, evidence.excerpts);
     let artifacts: RunArtifacts | undefined;
@@ -649,6 +777,11 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
         validationHistory,
         evidence,
         commands,
+        preview: preview.snapshot(),
+        completePreview: () => {
+          preview.setStatus("save", "completed");
+          return preview.snapshot();
+        },
       });
       progress({ stage: "save", state: "completed", message: artifacts ? `Saved ${artifacts.reportPath}.` : "No artifact writer was configured." });
     }
@@ -1307,6 +1440,11 @@ function placeholderPlan(brief: IntakeBrief, repositoryChoices: RepositoryChoice
     readiness: "draft",
     readinessNotes: notes,
   };
+}
+
+// The host's exclusion reasons for each excluded repository, as preview notes.
+function reasonNotes(excluded: Array<{ candidate: RepositoryCandidate; reasons: string[] }>): Map<string, string> {
+  return new Map(excluded.map((entry) => [entry.candidate.id, entry.reasons.join("; ")]));
 }
 
 function noTrustworthyReferenceMessage(research: ResearchSummary): string {

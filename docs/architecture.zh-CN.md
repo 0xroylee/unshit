@@ -4,7 +4,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/how-it-works-dark.svg">
-  <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索候选，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="images/how-it-works-light.svg" width="900">
+  <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索与预览，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="images/how-it-works-light.svg" width="900">
 </picture>
 
 ## 处理步骤与模块
@@ -16,12 +16,12 @@
 | 1 提问 | 需求提取回合、业务问题、补答后的 brief 重建 | [workflow.ts](../src/workflow.ts)、[model-schema.ts](../src/model-schema.ts)、[cli.ts](../src/cli.ts) |
 | 2 批准 brief | 终端输入 `yes`，或补答文件里的 `approveBrief: true`；记录 brief 的 SHA-256 | [brief-approval.ts](../src/brief-approval.ts)、[cli.ts](../src/cli.ts)、[storage.ts](../src/storage.ts) |
 | 3 本地项目 | 有界文件列表、排除规则、凭证遮蔽、已有脚本 | [local.ts](../src/local.ts) |
-| 4 搜索候选 | 分档的 GitHub 查询、Grep 发现、批量元数据查询、GitLab 回退 | [github.ts](../src/github.ts)、[code-search.ts](../src/code-search.ts)、[repository-screening.ts](../src/repository-screening.ts) |
+| 4 搜索与预览 | 分档的 GitHub 查询、Grep 发现、批量元数据查询、GitLab 回退；搜索之后的步骤与参考预览，以及放行排序的 `yes` | [preview.ts](../src/preview.ts)、[cli.ts](../src/cli.ts)、[github.ts](../src/github.ts)、[code-search.ts](../src/code-search.ts)、[repository-screening.ts](../src/repository-screening.ts) |
 | 5 筛选参考 | 元数据门槛、模型排序回合、固定提交的文件树检查、模型选择回合 | [repository-screening.ts](../src/repository-screening.ts)、[github.ts](../src/github.ts)、[workflow.ts](../src/workflow.ts) |
 | 6 固定读取 | 选文件回合、有界读取、哈希、行范围、摘录、补充请求回合 | [file-ranking.ts](../src/file-ranking.ts)、[evidence.ts](../src/evidence.ts)、[workflow.ts](../src/workflow.ts) |
 | 7 生成计划 | 计划回合，host 校验 ID、引用、覆盖、依赖和具名错误实现 | [workflow.ts](../src/workflow.ts)、[model-schema.ts](../src/model-schema.ts) |
 | 8 独立复核 | 新会话复核、一次修正、再复核、Ready 或 Draft 的判断 | [workflow.ts](../src/workflow.ts)、[model-schema.ts](../src/model-schema.ts) |
-| 9 保存结果 | `plan.md`、两种 manifest、源码快照、补答文件的原子写入 | [report.ts](../src/report.ts)、[storage.ts](../src/storage.ts) |
+| 9 保存结果 | `plan.md`、`preview.html`、两种 manifest、源码快照、补答文件的原子写入，每次运行的写入都经过同一个队列 | [report.ts](../src/report.ts)、[storage.ts](../src/storage.ts) |
 
 流程图由 [images/how-it-works.mjs](images/how-it-works.mjs) 从 Hairline 的线条图生成，生成方法见 README 的[致谢](usage.zh-CN.md#流程图与致谢)。
 
@@ -31,7 +31,7 @@
 CLI / JSON caller
        |
        v
-workflow: intake -> answers -> brief rebuild -> brief approval -> search -> tree screen -> selection -> evidence -> plan -> fresh review
+workflow: intake -> answers -> brief rebuild -> brief approval -> search -> preview gate -> tree screen -> selection -> evidence -> plan -> fresh review
     |                |          |                  |
     v                v          v                  v
 Codex App Server   public APIs  snapshots        PlanDoc
@@ -47,6 +47,7 @@ turn / interrupt                                  v
 | [cli.ts](../src/cli.ts) | 参数、终端澄清与 brief 批准、读取带已批准 brief 的补答文件、为 `needs_input` 和未批准的计划写出补答文件、ASCII 进度、JSON/JSONL 和退出码 |
 | [skill-install.ts](../src/skill-install.ts) | 内嵌 unshit agent skill（`src/resources/unshit-skill/SKILL.md`），写入 Claude Code 的 skills 目录和 Codex 的两个 skills 目录（`$CODEX_HOME/skills`、`~/.agents/skills`）；先写临时文件再改名；不覆盖非 unshit 安装的同名 skill（除非 `--force`）；`unshit` 文件夹或 `SKILL.md` 是符号链接时不跟随，skills 目录本身或更上层的符号链接照常跟随 |
 | [workflow.ts](../src/workflow.ts) | 需求门槛、答复后的 brief 重建、brief 批准门槛、候选预排序、筛选与选择、读取、计划生成、参考测试缺口、独立复核与有界修正（含存活错误实现和待决事项）、超时结果与检查点 |
+| [preview.ts](../src/preview.ts) | 运行步骤的顺序；预览记录器：登记 host 的记录（仓库、提交、文件、源码、摘录）并固定其类别，记录每一步用了哪些参考、怎么用；两版之间有变化的步骤；计划或复核引用的摘录 |
 | [app-server.ts](../src/app-server.ts) | 原生双向 RPC、活动回合关联、最终文本、取消、空闲与总时长超时、失败原因和进程清理 |
 | [github.ts](../src/github.ts) | host-built GitHub 查询、Grep 代码搜索、质量门槛、固定提交树验证与 GitLab 官方 API 回退 |
 | [code-search.ts](../src/code-search.ts) | Grep 请求体、响应解析、按仓库聚合命中、批量 GitHub 元数据查询条件 |
@@ -69,6 +70,8 @@ Codex 管理认证与会话。CLI 在内存中关联 RPC 和当前回合；应�
 已回答的问题以 `resolvedAnswers` 传给候选选择、规划、复核及修正回合，并写入最终结果、报告、manifest 和中断检查点。报告将初始摘要与最终范围分别标注。
 
 brief 定稿后、本地扫描和参考检索之前，交互运行通过 `approveBrief` 回调请人批准。批准记为 `BriefApproval`：`briefSha256` 是可编辑 brief（不含 R*/A* ID 和来源标签）JSON 的 SHA-256，`via` 为 `tty` 或 `answers_file`，`approvedAt` 是 host 记录批准的时间（终端回复时取 `WorkflowOptions.now`，或 CLI 读取补答文件时）。批准写入最终结果、报告、两种 manifest（没有时为 null）和检查点；`Ready` 在原有条件之外还需要这条批准。批准只由 host 执行：计划生成、两次独立复核和复核修正的提示词各有一句 host 记录的批准状态（终端输入 yes、补答文件的 `approveBrief: true`，或还没有人批准），并要求模型不为批准设 `shouldDraft`、不为此报告问题，host 不核对模型是否照做，没有批准的计划由 host 自己保持 Draft；规则包的 intake 模块要求模型给每条要求标出用户原话或推断，并写明只在交互终端运行时由 host 请人批准，其他运行由 host 把 brief 存进补答文件，没有人批准的计划由 host 保持 Draft；plan 模块写明批准由 host 执行，要求模型不为此设 Draft 或报告问题；没有 unshit CLI 这样的 host 程序、直接调用 skill 时，intake 模块要求模型自己把带标签的最终要求和验收交给用户批准，plan 模块要求在用户批准前保持 Draft；入口 SKILL.md 没有改动，阶段表没有把批准列为继续条件。intake 和 plan 模块的改动使规则包摘要改变。共同指令的 host 约束多了一句：从用户已批准 brief 的补答文件开始的运行，host 把这份 brief 当作已批准；其他情况下，只在交互终端运行时 host 向用户展示最终要求和验收并记录是否批准，其他运行不询问、计划保持 Draft，brief 存进补答文件供用户批准后重跑；模型不要把 host 的批准当作重大问题来问；host 约束不计入规则包摘要。补答文件可以携带已批准的 brief：CLI 照旧核对提示词、目录和规则版本摘要，要求 `brief` 和 `approveBrief` 同时出现，要求 request 里的每个问题都有答案，再用 `parseApprovedBrief` 按需求提取的规则校验（不能含 `materialQuestions`），重新分配 ID 和来源，作为 `approvedBrief` 交给 workflow，workflow 不再做需求提取、补答和重建回合；这样的运行没有初始摘要，plan.md 的范围一节写 `Approved brief (from the answers file)`。完成时没有批准的结果和批准被拒的 `needs_input` 结果，由 CLI 的 `withAnswersFile` 写出补答文件（可编辑的 brief、已有答案和 `approveBrief: false`），结果带 `answersFile`；完成结果的补答文件写入失败时，结果照常返回，只是没有 `answersFile`；skill 和待决事项的说明都让用户用相同命令重新运行，得到补答文件。终端提问来自 `terminalPrompts`，只在交互运行（没有 `--json`、`--jsonl`，stdin 和 stderr 都是终端）时提供；所有提示共用 `createTerminalAsk` 打开的一个 readline，在提示处按 Ctrl+C 或输入结束时中断运行，等待中的提问随即失败，结果为 `interrupted`；输入在两次提问之间结束时，下一次提问先中断运行再失败，结果同样为 `interrupted`。要求来源由 `verifiedUserWords` 判定：只保留归一化后至少 4 个码位、出现在需求原文或某个已确认答案里的引文。
+
+搜索返回之后，workflow 只用 host 的记录构建步骤与参考预览（`createPreviewRecorder`）：候选始终是搜索线索，固定提交文件树里的文件始终是“已列出、未读取”，只有 host 读取的源码或从中截取的摘录才是证据；模型返回的、不是 host 发出的 ID 不会显示。workflow 把每一版交给 `onPreview`，等它完成后才进入下一步；第一版页面写好之后调用一次 `confirmPreview`，只有返回 true 才放行候选排序，没有 `confirmPreview` 时返回带 `previewStop` 的 `needs_input`。CLI 里，预览页面、检查点和最终结果都经过每次运行的同一个队列（`createRunPublisher`）；页面只在队列写好源码快照之后才链接它；最终结果会关闭队列，把同一版（保存步骤已完成）写入 `plan.md`、`preview.html` 和 manifest。
 
 复核回合的 outputSchema 除 `findings` 外还要求 `survivingMutants`，最多 12 项：复核者为某个 A* 构造、而所有计划检查仍会通过的错误实现，每项有 `acceptanceId`、`wrongImplementation`、`whyPlannedChecksPass` 和 `decisionNeeded`（字符串或 null）。`findings` 仍按原规则严格校验，有问题时复核失败；`survivingMutants` 只是建议，`parseReview` 不会因为它让复核失败：`acceptanceId` 不是 brief 中 A* ID 的项、不是对象或缺少字段的项、`wrongImplementation` 或 `whyPlannedChecksPass` 去掉首尾空白后为空或超过 1200 个字符的项、`decisionNeeded` 超过 700 个字符的项，以及第 12 项之后的项都被丢弃，整个字段不是列表时按没有处理。每次丢弃记为一条 `review` 类信息性缺口（`In review N, the host dropped ...`，字段不是列表时为 `In review N, the host read survivingMutants as none ...`），出现在报告的缺口列表和 manifest 的 `gaps` 里，不影响就绪状态。null 或空白的 `decisionNeeded` 记为没有决定；没有 `survivingMutants` 键的复核结果按没有错误实现处理。复核提示写明 `acceptanceId` 用 brief 的 A* ID，不用 T1-A1 这样的任务验收 ID，并给出 12 项上限；还要求复核者把 brief 和已确认答案没有定下的业务选择只作为带 `decisionNeeded` 的存活错误实现报告，不写成问题或修正建议。第一次复核中没有 `decisionNeeded` 的错误实现转成针对所属 R* 的重大问题，与其他重大问题一起进入唯一一次复核修正；最新一次复核仍报告的这类错误实现只留在该次复核的记录里，不影响就绪状态。有 `decisionNeeded` 的错误实现不进入修正回合；任何一次复核报告的，都成为一条 `Open decision for A* ("<验收标准原文>"): ...` 的 Draft 原因，按 brief 的批准方式写明做法：没有批准的运行修改它保存的补答文件（没有保存时先用相同命令重新运行，得到一份）；终端批准的运行重新运行，在批准提示处回复 yes 以外的内容，再修改保存下来的补答文件；从已批准补答文件开始的运行修改同一个文件后再传入，说明写明这个文件的 `approveBrief` 已经是 true，重读并保存修改后的 brief 就是批准这次修改。修正通过 host 校验、但后续复核没有完成时，计划保持 Draft，Draft 原因写明没有完成的复核覆盖修正后的计划，第一次复核的重大问题和没有 `decisionNeeded` 的存活错误实现不再写成 Draft 原因（报告的复核记录里仍列出它们），任何一次复核的待决事项仍是 Draft 原因；修正本身没有通过校验时仍写 `The bounded review repair did not complete.`。复核提示要求：检查仍会通过的已命名错误实现也报告在 `survivingMutants` 中，`wrongImplementation` 以它的 ID 开头；与正确实现等价的已命名错误实现报告为重大问题。host 不核对 ID 前缀，也不判断等价。“Trusted, not checked”有一行写明存活错误实现和没有存活错误实现都只是复核模型的推理，unshit 没有应用或运行其中任何一个。review.md 加了同一规则，规则包摘要随之改变，旧的补答文件不再适用。
 

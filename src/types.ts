@@ -443,6 +443,81 @@ export interface RunArtifacts {
   reportPath: string;
   evidenceDirectory: string;
   manifestPath: string;
+  // The stage-and-reference page, when the run wrote one.
+  previewPath?: string;
+}
+
+// The stages of a run in the stage-and-reference preview, in run order (PREVIEW_STAGES in src/preview.ts).
+export type PreviewStageId =
+  | "intake"
+  | "answer_gate"
+  | "brief_rebuild"
+  | "brief_approval"
+  | "local_baseline"
+  | "repository_search"
+  | "metadata_screening"
+  | "preview_confirmation"
+  | "candidate_ranking"
+  | "repository_trees"
+  | "candidate_selection"
+  | "file_selection"
+  | "source_reads"
+  | "evidence_requests"
+  | "plan"
+  | "review"
+  | "readiness"
+  | "save";
+
+export type PreviewStageStatus = "pending" | "waiting" | "completed" | "skipped" | "failed" | "stopped";
+
+// How a stage used a reference: found by search, passed or excluded by the metadata bar, ranked for tree checks, tree
+// checked at a commit, selected or rejected, read and hashed by the host, added on the model's request, supplied to a
+// model turn, or cited in what the model returned.
+export type PreviewRelation = "found" | "passed" | "excluded" | "ranked" | "tree_checked" | "selected" | "rejected" | "read" | "added" | "supplied_to_model" | "cited";
+
+// discovery: a search result, never evidence. listed: a commit or file of a tree listing, not read. evidence: source
+// the host read and hashed, at a pinned commit for a remote file, or an excerpt it cut from that source.
+export type PreviewClassification = "discovery" | "listed" | "evidence";
+
+// A host record shown in the preview. The key is the host-issued ID (C1, C1@<commit>, C1F3, LFILE2, S1, E1); every
+// field comes from the record, never from model output.
+export interface PreviewReference {
+  key: string;
+  kind: "repository" | "commit" | "file" | "source" | "excerpt";
+  classification: PreviewClassification;
+  label: string;
+  provider?: "github" | "gitlab" | "local";
+  repository?: string;
+  commitSha?: string;
+  path?: string;
+  url?: string;
+  sha256?: string;
+  startLine?: number;
+  endLine?: number;
+  // For an excerpt, the key of the source it was cut from.
+  sourceKey?: string;
+  snapshotPath?: string;
+}
+
+export interface PreviewUse {
+  relation: PreviewRelation;
+  key: string;
+  // Host text, such as the reasons the metadata bar excluded a repository.
+  note?: string;
+}
+
+export interface PreviewStage {
+  id: PreviewStageId;
+  status: PreviewStageStatus;
+  uses: PreviewUse[];
+}
+
+// One revision of the stage-and-reference preview. `references` holds every reference that a stage uses, and the
+// source of each excerpt among them.
+export interface WorkflowPreview {
+  revision: number;
+  stages: PreviewStage[];
+  references: PreviewReference[];
 }
 
 export interface ValidationRecord {
@@ -451,7 +526,9 @@ export interface ValidationRecord {
 }
 
 export type RunOutcome =
-  | { status: "needs_input"; questions: MaterialQuestion[]; brief: IntakeBrief; answersFile?: string; checkpointPath?: string; approvalRequested?: boolean; resolvedAnswers?: ResolvedAnswer[] }
+  // previewStop: the run stopped at the reference preview after the search, because the reply was not yes (declined)
+  // or because no person could be asked (unavailable); message says which, and previewPath names the page.
+  | { status: "needs_input"; questions: MaterialQuestion[]; brief: IntakeBrief; answersFile?: string; checkpointPath?: string; approvalRequested?: boolean; resolvedAnswers?: ResolvedAnswer[]; previewStop?: "declined" | "unavailable"; message?: string; previewPath?: string }
   | { status: "completed"; readiness: Readiness; brief: IntakeBrief; initialBrief?: IntakeBrief; research?: ResearchSummary; resolvedAnswers: ResolvedAnswer[]; briefApproval?: BriefApproval; answersFile?: string; plan: PlanDocument; sources: FinalSource[]; gaps: ResearchGap[]; reviews: ReviewResult[]; artifacts?: RunArtifacts; validationIssues: string[]; validationHistory: ValidationRecord[] }
   | { status: "interrupted"; message: string; checkpointPath?: string }
   | { status: "timed_out"; message: string; stage: string; limit: "idle" | "total"; limitSeconds: number; checkpointPath?: string }

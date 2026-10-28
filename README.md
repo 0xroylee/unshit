@@ -11,7 +11,7 @@ unshit turns a plain-language requirement into an implementation plan built on r
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-en-dark.svg">
-  <img alt="The nine steps of unshit: 1 Ask, 2 Approve the brief, 3 Local project, 4 Search, 5 Screen references, 6 Pinned reads, 7 Plan, 8 Independent review, 9 Save" src="docs/images/how-it-works-en-light.svg" width="900">
+  <img alt="The nine steps of unshit: 1 Ask, 2 Approve the brief, 3 Local project, 4 Search and preview, 5 Screen references, 6 Pinned reads, 7 Plan, 8 Independent review, 9 Save" src="docs/images/how-it-works-en-light.svg" width="900">
 </picture>
 
 ## Install
@@ -34,8 +34,8 @@ unshit "Build an event ticketing system for one team, with ticket sales, refunds
 ```
 
 1. Answer its business questions.
-2. Read the brief and type `yes`.
-3. Wait 15 to 30 minutes. The plan is saved in `.unshit/<run-id>/plan.md`.
+2. Read the brief and type `yes`. After the search, check the references it found and type `yes` again.
+3. Wait 15 to 30 minutes. The plan is saved in `.unshit/<run-id>/plan.md`, and `preview.html` next to it shows each step with the references it used.
 
 You can also ask Claude Code or Codex to "use unshit to plan …", and then to implement the plan.
 

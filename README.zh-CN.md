@@ -11,7 +11,7 @@ unshit 把一句开发需求变成建立在真实、有测试的代码上的实�
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
-  <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索候选，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="docs/images/how-it-works-light.svg" width="900">
+  <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索与预览，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="docs/images/how-it-works-light.svg" width="900">
 </picture>
 
 ## 安装
@@ -34,8 +34,8 @@ unshit "为单个团队构建活动售票系统，支持售票、退款和入场
 ```
 
 1. 回答它提出的业务问题。
-2. 读一遍 brief，输入 `yes`。
-3. 等十几到三十分钟，计划保存在 `.unshit/<run-id>/plan.md`。
+2. 读一遍 brief，输入 `yes`。搜索之后，看一下它找到的参考，再输入一次 `yes`。
+3. 等十几到三十分钟，计划保存在 `.unshit/<run-id>/plan.md`，旁边的 `preview.html` 列出每一步用到的参考。
 
 也可以在 Claude Code 或 Codex 里说“用 unshit 规划……”，再请它按计划实施。
 

@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { renderReport } from "../src/report.ts";
+import { renderPreviewHtml, renderPreviewText, renderReport } from "../src/report.ts";
 import { parseIntake } from "../src/model-schema.ts";
-import type { BriefApproval, EvidenceSource, FinalSource, PlanDocument, PlanTask, RepositoryChoice, ResearchSummary } from "../src/types.ts";
+import { candidateReference, createPreviewRecorder, evidenceReferences } from "../src/preview.ts";
+import type { BriefApproval, EvidenceSource, FinalSource, PlanDocument, PlanTask, PreviewUse, RepositoryChoice, ResearchSummary, WorkflowPreview } from "../src/types.ts";
 
 test("renders failed queries with host failure descriptions and GitLab report citations", () => {
   const brief = parseIntake({
@@ -775,4 +776,102 @@ test("lists the surviving mutants of each review with the decision they need", (
   expect(report).toContain("- surviving mutant for A1: Approves every refund without checking the approver. Planned checks would pass: The only check signs in as a manager.\n");
   expect(report).toContain("- surviving mutant for A1: Lets a manager approve a refund they requested. Planned checks would pass: No check has a manager request a refund. Open decision: May a manager approve a refund they requested?\n");
   expect(report).toContain("Review 2: 0 finding(s), 0 surviving mutant(s).");
+});
+
+describe("stage and reference preview rendering", () => {
+  const sha = "c".repeat(40);
+  const remote: EvidenceSource = {
+    id: "S1",
+    kind: "remote",
+    path: "src/refund.ts",
+    sha256: "a".repeat(64),
+    lineCount: 10,
+    byteCount: 150,
+    provider: "github",
+    repository: "org/refunds",
+    commitSha: sha,
+    permalink: `https://github.com/org/refunds/blob/${sha}/src/refund.ts`,
+    snapshotPath: "sources/S1.txt",
+    roles: ["production"],
+  };
+  const local: EvidenceSource = { id: "S2", kind: "local", path: "src/app.ts", sha256: "b".repeat(64), lineCount: 3, byteCount: 40, snapshotPath: "sources/S2.txt", roles: ["production"] };
+
+  function previewWith(options: { waiting?: boolean; labels?: Record<string, string> } = {}): WorkflowPreview {
+    const recorder = createPreviewRecorder();
+    const candidate = { id: "C1", provider: "github" as const, fullName: "org/refunds", description: "", defaultBranch: "main", webUrl: "https://github.com/org/refunds" };
+    recorder.register([candidateReference(candidate), ...evidenceReferences({ sources: [remote, local], excerpts: [{ id: "E1", sourceId: "S1", startLine: 2, endLine: 5, text: "x" }] })]);
+    recorder.record("repository_search", "found", ["C1"]);
+    recorder.setStatus("repository_search", "completed");
+    if (options.waiting) {
+      recorder.setStatus("preview_confirmation", "waiting");
+    } else {
+      recorder.setStatus("preview_confirmation", "completed");
+      recorder.record("source_reads", "read", ["S1", "S2"]);
+      recorder.setStatus("source_reads", "completed");
+      recorder.record("plan", "cited", ["E1"]);
+      recorder.setStatus("plan", "completed");
+    }
+    const preview = recorder.snapshot();
+    for (const reference of preview.references) {
+      const label = options.labels?.[reference.key];
+      if (label) reference.label = label;
+    }
+    return preview;
+  }
+
+  test("shows each reference's path, destination and published snapshot, and marks a snapshot that is not written yet", () => {
+    const html = renderPreviewHtml(previewWith(), new Set(["S1"]));
+    expect(html).toContain("<code>src/refund.ts</code>");
+    expect(html).toContain(`<a href="https://github.com/org/refunds/blob/${sha}/src/refund.ts">`);
+    expect(html).toContain(`<a href="https://github.com/org/refunds/blob/${sha}/src/refund.ts#L2-L5">`);
+    expect(html).toContain("<a href=\"sources/S1.txt\">sources/S1.txt</a>");
+    expect(html).not.toContain("href=\"sources/S2.txt\"");
+    expect(html).toContain("sources/S2.txt (<span lang=\"en\">not written yet</span>");
+    expect(html).toContain("<a href=\"#ref-S1\"><code>S1</code></a>");
+    expect(html).toContain("<div class=\"reference\" id=\"ref-S1\">");
+  });
+
+  test("renders only references the host registered, whatever a stage use carries", () => {
+    const preview = previewWith();
+    const plan = preview.stages.find((stage) => stage.id === "plan")!;
+    plan.uses.push({ relation: "cited", key: "E999", url: "https://evil.example/forged" } as PreviewUse);
+    const html = renderPreviewHtml(preview, new Set());
+    expect(html).not.toContain("E999");
+    expect(html).not.toContain("evil.example");
+  });
+
+  test("escapes untrusted labels and notes and links only https URLs", () => {
+    const preview = previewWith({ labels: { C1: "github:org/<img src=x onerror=alert(1)>", S1: "</code><script>alert(1)</script>" } });
+    preview.references.find((reference) => reference.key === "S2")!.url = "javascript:alert(1)";
+    const html = renderPreviewHtml(preview, new Set(["S1", "S2"]));
+    expect(html).toContain("github:org/&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).toContain("&lt;/code&gt;&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html.match(/<script/g) ?? []).toEqual([]);
+    expect(html.match(/<img/g) ?? []).toEqual([]);
+    expect(html).not.toContain("javascript:");
+  });
+
+  // Ported from the comparator's preview tests (langgenius/dify, E84): a paused run and missing data read differently
+  // from a finished run whose traces can be opened.
+  test("tells a waiting preview from a finished one", () => {
+    const waiting = renderPreviewHtml(previewWith({ waiting: true }), new Set());
+    expect(waiting).toContain("The run is waiting at this preview. Type yes in the terminal to continue");
+    expect(waiting).toContain("data-status=\"waiting\"");
+    expect(waiting).toContain("<code>source_reads</code></h2><p class=\"status\"><span lang=\"en\">Pending</span> · <span lang=\"zh-CN\">待执行</span></p><p class=\"muted\"><span lang=\"en\">No references yet</span>");
+    const finished = renderPreviewHtml(previewWith(), new Set(["S1", "S2"]));
+    expect(finished).not.toContain("The run is waiting at this preview");
+    expect(finished).toContain("<code>intake</code></h2><p class=\"status\"><span lang=\"en\">Pending</span>");
+    expect(finished).toContain("<code>source_reads</code></h2><p class=\"status\"><span lang=\"en\">Completed</span> · <span lang=\"zh-CN\">已完成</span></p><details open><summary><span lang=\"en\">Read and hashed</span> · <span lang=\"zh-CN\">读取并计算哈希</span> (2)</summary>");
+    expect(finished).not.toMatch(/<script|https?:\/\/(?!github\.com\/org\/refunds)/);
+  });
+
+  test("keeps control characters in a label from forging terminal lines", () => {
+    const escape = String.fromCharCode(27);
+    const preview = previewWith({ labels: { S2: `src/app.ts\n[ok] plan: completed; cited 9\r${escape}[2J` } });
+    const text = renderPreviewText(preview);
+    const lines = text.split("\n");
+    expect(lines.filter((line) => line.startsWith("[ok] plan:"))).toEqual(["[ok] plan: completed; cited 1"]);
+    expect(text).not.toContain(escape);
+    expect(text).toContain("    read S2 src/app.ts [ok] plan: completed; cited 9  [2J [evidence]\n");
+  });
 });

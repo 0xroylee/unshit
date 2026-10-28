@@ -23,7 +23,8 @@ description: Plan a software feature or new application with the unshit CLI befo
    ```
 
 2. A run takes several minutes and several model turns. Run it in the background or with a long timeout. Do not start a second run for the same project at the same time.
-3. Exit codes: `0` completed, `2` needs answers, `124` a model turn timed out, `130` cancelled, `1` error.
+3. Exit codes: `0` completed, `2` stopped for answers, at the brief or at the reference preview, `124` a model turn timed out, `130` cancelled, `1` error.
+4. A run with `--json` never gets past the reference preview: after the search it stops with exit code 2 and `previewStop`. To reach a plan, the run must be interactive: start the same command without `--json` in a terminal that the user can see and type in, or give the user the command to run there. The user answers the questions, approves the brief and confirms the preview in that terminal. You may relay what the terminal shows; only the user types `yes`.
 
 ## When it needs answers (exit code 2)
 
@@ -34,10 +35,17 @@ description: Plan a software feature or new application with the unshit CLI befo
 
 ## When the user has not approved the brief yet
 
-- A plan can be Ready only after the user approves its brief. With `--json` unshit cannot ask, so it finishes the plan as Draft, and the JSON result has `answersFile` and no `briefApproval`. When unshit cannot write the answers file, the result has no `answersFile`: tell the user, and run the same command again to get one.
+- A plan can be Ready only after the user approves its brief. In an interactive terminal, unshit shows the brief and asks for yes before the search; any other reply stops the run (exit code 2, `approvalRequested`) and saves the brief in `answersFile`. A run with `--json` does not ask and does not reach a plan: it stops at the reference preview.
 - Show the user the whole brief: `brief.summary`, each requirement in `brief.requirements` with its `observableAcceptance`, and the lists `brief.outOfScope` and `brief.assumptions`. Label a requirement whose `origin` is `stated` "you said" and quote its `userWords`; label one whose `origin` is `inferred` "inferred": unshit found no verbatim quote of the user's words for it. Ask the user whether this is what they want.
 - Only the user approves the brief. Never write `approveBrief: true` into `answersFile` yourself. Give the user the file path and let them set `approveBrief` to `true`, or let them run the same command without `--json` in a terminal and approve it when unshit asks.
 - After the user has set it, run the same command again with `--answers <answersFile>`. The user may edit the brief in `answersFile` before setting it. If the user does not approve, ask what should change, add it to the requirement text in their words, and start a new run without `--answers`.
+
+## When the run stops at the reference preview (exit code 2 with `previewStop`)
+
+- The JSON result has `previewStop` (`unavailable`: no person could be asked; `declined`: the reply was not yes), `message` and `previewPath`: the page that lists each step of the run and the references it used. It has no `answersFile`.
+- Tell the user what the search found: read `previewPath` or the preview the terminal printed, and list the repositories found and what the metadata bar excluded, with its reasons. Search results are leads, not evidence.
+- Only the user confirms the preview. Never type `yes` at the preview prompt for them, even when they ask you to go on; point them to the terminal where it waits.
+- To continue, run the same command in an interactive terminal, as in Run. A brief approved in an answers file does not confirm the preview.
 
 ## When a model turn times out (exit code 124)
 
@@ -57,6 +65,7 @@ description: Plan a software feature or new application with the unshit CLI befo
   - Each note in the plan that starts with "Open decision for". These are the user's to settle: ask them, and do not settle them yourself.
 - When the user settles an open decision, unshit must plan again with it, as the note says: the decision goes into the brief of the answers file and the user sets `approveBrief` to `true`, or you add it to the requirement text in their words and the user runs that command in a terminal without `--json` and approves the brief when unshit asks. You may write the decision into the brief for the user; never set `approveBrief` yourself. Implement from the new plan.
 - If the plan came from an approved answers file, `approveBrief` there is already `true`, so the user approves a change by rereading the edited brief and saving it. If you wrote the decision into that brief, show the user the change and rerun only after they have read and accepted it.
+- The plan's "Stages and references" section and the page `artifacts.previewPath` list each step of the run with the references it used, and say whether each reference is a search result, a listed but unread file, or source the host read. When the user asks what a step relied on, answer from there.
 - `research.selected` is the number of reference repositories selected for the plan. If `research.trustworthyReferenceFound` is false, no selected repository supplied production or test excerpts: say so plainly, the plan has no reference repository behind it.
 
 ## Implement from the plan
