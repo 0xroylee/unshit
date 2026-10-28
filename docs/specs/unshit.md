@@ -1,61 +1,61 @@
-# unshit 首版验收约定
+# unshit first-version acceptance agreement
 
-简体中文 · [English](unshit.en.md)
+English · [简体中文](unshit.zh-CN.md)
 
-本约定记录对话中已批准的 CLI 范围及审阅修正。实现使用 TypeScript 与 Bun，输入开发需求，生成有源码依据的实施计划。模型访问复用本机 Codex 登录和原生 App Server，不实现提示词要求的目标应用。
+This agreement records the CLI scope and the review corrections approved in conversation. The implementation uses TypeScript and Bun, takes a development requirement as input and produces an implementation plan backed by source code. Model access reuses the local Codex login and the native App Server. The CLI does not implement the target application that the prompt asks for.
 
-## 入口与结果
+## Entry and results
 
 ```text
 unshit "build an event ticketing system for a single team"
 ```
 
-只有一个主要命令。提供 `--cwd`、`--out`、`--answers`、`--json`、`--jsonl`、`--turn-timeout` 和可选模型设置；正常调用继承本机模型配置。另有 `--install-skill`（可配 `--skill-dir`、`--force`、`--json`），把内嵌的 unshit agent skill 安装到 Claude Code 和 Codex 的 skills 目录。skill 要求 agent 把整份需求摘要交给用户批准、不自行写入批准；实施前把“Trusted, not checked”和待决事项交给用户，待决事项定下后由 unshit 重新规划；实施后按任务给出符合性报告，具名错误实现写明杀死、存活、失败方式与预期不同（不算杀死）或没有运行，实际运行的检查和计划中的检查分开写。进度用 ASCII 显示真实阶段，引用在计划中内联。默认保存计划、证据 manifest 和源码快照。缺少重大业务答案时，交互模式询问，非交互模式返回结构化 `needs_input`，不开始参考检索。交互模式还要在参考检索前请人批准 brief，见下文。
+There is only one main command. It offers `--cwd`, `--out`, `--answers`, `--json`, `--jsonl`, `--turn-timeout` and optional model settings; a normal call inherits the local model configuration. There is also `--install-skill` (optionally with `--skill-dir`, `--force` and `--json`), which installs the embedded unshit agent skill into the skills directories of Claude Code and Codex. The skill requires the agent to give the whole brief to the user for approval and not to write the approval itself. Before implementation, the agent must give the user the “Trusted, not checked” section and the open decisions, and once the open decisions are settled, unshit must plan again. After implementation, the agent must give a conformance report per task: for each named wrong implementation, the report states whether it was killed, survived, failed in a different way than expected (which does not count as killed) or was not run, and it lists the checks that actually ran separately from the checks in the plan. Progress shows the real stages in ASCII, and citations are inline in the plan. By default, unshit saves the plan, the evidence manifest and the source snapshots. When material business answers are missing, interactive mode asks for them, non-interactive mode returns a structured `needs_input`, and the reference search does not start. Interactive mode also asks a person to approve the brief before the reference search; see below.
 
-不增加独立 resume/refs/export 命令，不引入 SQLite、后台服务、插件框架或完整作业恢复协议。不发布 npm 包、GitHub Issues、提交或部署。
+The first version adds no separate resume/refs/export commands and introduces no SQLite, background service, plugin framework or full job-recovery protocol. It does not publish an npm package, GitHub Issues, commits or deployments.
 
-## brief 批准（2026-10-25 批准）
+## Brief approval (approved 2026-10-25)
 
-brief 定稿后，即补答重建后的 brief（重建失败时是需求提取的 brief，补答作为上下文），或没有问题时需求提取的 brief，由人批准其中的要求 R* 与验收 A*，之后才开始本地扫描和参考检索。交互终端显示 brief 的概述、每条要求及其验收（标出用户原话 `you said: "…"` 或 `inferred`）、排除项和假设，只有输入 `yes`（不分大小写）才继续；其他回复返回 `needs_input`（`approvalRequested: true`），退出码 2，并生成带 brief 的补答文件。host 只知道有人在终端输入了 `yes`，不知道是谁；在提示处按 Ctrl+C 或输入结束时返回 `interrupted`，退出码 130；输入在两次提问之间结束时，下一次提问同样返回 `interrupted`。`--json`、`--jsonl` 或非终端运行不等待批准，计划保持 Draft，并生成同样的补答文件（`approveBrief: false`）；补答文件写入失败时计划照常保存，结果没有 `answersFile`。`Ready` 需要这条批准；完成结果、manifest 和 plan.md 记录批准的摘要、方式和时间，或没有批准。批准只由 host 执行：没有批准时由 host 让计划保持 Draft；计划和复核回合的提示写明 host 记录的批准状态，并要求模型不为批准把计划标为 Draft、不为此报告问题，host 不核对模型是否照做。
+The final brief is the brief rebuilt with the answers (when the rebuild fails, the intake brief, with the answers as context), or the intake brief when there were no questions. Once the brief is final, a person approves its requirements R* and acceptance criteria A*, and only then do the local scan and the reference search start. An interactive terminal run shows the brief's overview, each requirement with its acceptance criteria (marked `you said: "…"` with the user's own words, or `inferred`), the exclusions and the assumptions, and continues only when the input is `yes` (case-insensitive). Any other reply returns `needs_input` (`approvalRequested: true`) with exit code 2 and writes an answers file that contains the brief. The host knows only that someone typed `yes` at the terminal, not who it was. Ctrl+C at the prompt, or the end of input, returns `interrupted` with exit code 130; when the input ends between two questions, the next question also returns `interrupted`. A run with `--json` or `--jsonl`, or without a terminal, does not wait for approval; the plan stays Draft, and the run writes the same kind of answers file (`approveBrief: false`). If writing the answers file fails, the plan is still saved as usual and the result has no `answersFile`. `Ready` requires this approval; the completed result, the manifest and plan.md record the hash, method and time of the approval, or that there was no approval. Only the host enforces the approval: without an approval, the host keeps the plan Draft. The prompts of the plan and review turns state the approval status that the host recorded and require the model not to mark the plan Draft because of the approval and not to report a finding about it; the host does not check whether the model complies.
 
-补答文件可以携带已批准的 brief（`approveBrief: true`）。这不是新命令，也不是作业恢复协议：重跑仍然重新扫描本地项目、检索和读取参考源码，只是不再做需求提取、补答和重建。文件仍按提示词、目录和规则版本摘要绑定。批准不能代替补答：request 里的每个问题都必须有答案，否则读取失败并列出没有答案的问题 ID。brief 按需求提取的规则重新校验，不能含 `materialQuestions`，host 重新分配 R*/A* 并重新判定来源。host 无法分辨是谁改了 `approveBrief`，记录为 `via: "answers_file"`。
+An answers file can carry an approved brief (`approveBrief: true`). This is not a new command and not a job-recovery protocol: a rerun still rescans the local project and again searches for and reads the reference source; it only skips intake, answering and the rebuild. The file is still bound to the hashes of the prompt, the directory and the rule version. Approval cannot replace answers: every question in the request must have an answer; otherwise, reading the file fails and lists the IDs of the unanswered questions. The brief is validated again under the intake rules and must not contain `materialQuestions`; the host reassigns R*/A* and determines the origins again. The host cannot tell who changed `approveBrief` and records the approval as `via: "answers_file"`.
 
-## 要求、任务与验证
+## Requirements, tasks and verification
 
-| 要求 | 任务与依赖 | 可观察验收 | 验证 |
+| Requirement | Tasks and dependencies | Observable acceptance criteria | Verification |
 | --- | --- | --- | --- |
-| R1 需求门槛 | T2，在 T1 后 | A2：重大歧义先澄清；未解决前没有外部参考查询；交互模式在 brief 获批前没有外部参考查询；非 TTY 不无限等待，未获批准的计划保持 Draft | V2：明确、含糊、脚本补充答案、终端批准与拒绝、补答文件批准场景 |
-| R2 原生模型接入 | T1，首个任务 | A1：已有登录；按 ID 分流双向 RPC；每轮 schema；只有 completed 与有效最终结果才成功 | V1：真实 Bun/stdio 接入与故障协议夹具 |
-| R3 有界参考研究 | T3，在 T2 后 | A3：本地基线与 GitHub/GitLab 公开读取；深入比较最多三仓库；真实路径、固定提交；缺口明确 | V3：API 夹具与公开源码读取；超限、超时、不可访问场景 |
-| R4 可追溯证据 | T4，与 T3 同一读取流程 | A4：host 生成 ID、SHA、路径、有效行号、哈希和 permalink；保存可检查快照 | V4：有效证据与错误路径、范围、哈希场景 |
-| R5 完整计划与复核 | T5，在 T4 后 | A5：需求→任务→验收→验证；每个验证为它覆盖的每条验收写出至少一个必须让它失败的错误实现；依赖无环；重要设计有依据或必要的新设计理由；重大缺口保持 Draft | V5：覆盖遗漏、缺少错误实现、伪引用、循环依赖、独立复核与存活错误实现场景 |
-| R6 人类进度 | T6，支持前述任务 | A6：ASCII 反映实际阶段；取消清理子进程；无虚构百分比 | V6：终端、管道、SIGINT 场景 |
-| R7 脚本输出 | T6，支持前述任务 | A6：JSON/JSONL 稳定；进度与结果不混杂；需要输入时有明确状态及退出码 | V6：JSON 解析、非 TTY、服务端输入请求场景 |
-| R8 状态与交付 | T7/T8，在 T5/T6 后 | A7/A8：原生会话与取消；应用只保留证据和结果；原子保存；任意安装目录使用内嵌规则 | V7/V8：断连、保存失败、编译二进制及异地目录 smoke |
+| R1 Requirement bar | T2, after T1 | A2: material ambiguity is clarified first; no external reference query before it is resolved; in interactive mode, no external reference query before the brief is approved; a non-TTY run does not wait indefinitely, and a plan without approval stays Draft | V2: clear, vague, script-supplied answers, terminal approval and rejection, and answers-file approval scenarios |
+| R2 Native model integration | T1, the first task | A1: existing login; two-way RPC routed by ID; a schema for each turn; success only with completed and a valid final result | V1: real Bun/stdio integration and fault-protocol fixtures |
+| R3 Bounded reference research | T3, after T2 | A3: local baseline and public GitHub/GitLab reads; in-depth comparison of at most three repositories; real paths, pinned commits; explicit gaps | V3: API fixtures and public source reads; over-limit, timeout and inaccessible scenarios |
+| R4 Traceable evidence | T4, in the same read flow as T3 | A4: the host generates IDs, SHAs, paths, valid line numbers, hashes and permalinks; it saves snapshots that can be checked | V4: valid evidence, and wrong path, range and hash scenarios |
+| R5 Complete plan and review | T5, after T4 | A5: requirement → task → acceptance criterion → verification; each verification names, for each acceptance criterion it covers, at least one wrong implementation that must make it fail; dependencies have no cycles; important designs have evidence or the required reason for a new design; material gaps keep the plan Draft | V5: missing coverage, missing wrong implementation, fake citation, cyclic dependency, independent review and surviving mutant scenarios |
+| R6 Human-readable progress | T6, supports the tasks above | A6: ASCII reflects the actual stage; cancellation cleans up child processes; no invented percentages | V6: terminal, pipe and SIGINT scenarios |
+| R7 Script output | T6, supports the tasks above | A6: stable JSON/JSONL; progress and results do not mix; a clear status and exit code when input is needed | V6: JSON parsing, non-TTY and server input request scenarios |
+| R8 State and delivery | T7/T8, after T5/T6 | A7/A8: native sessions and cancellation; the application keeps only evidence and results; atomic saves; it uses the embedded rules in any install directory | V7/V8: disconnect, save failure, and compiled-binary and other-directory smoke tests |
 
-## 协议与证据边界
+## Protocol and evidence boundaries
 
-- `codex app-server` 持续运行。初始化响应后发送 `initialized`。区分响应、通知和服务端请求，匹配活动 thread/turn。收到 `turn/completed` 不等于成功；状态还有 failed/interrupted。
-- 内嵌技能入口和 host 约束通过 `thread/start.developerInstructions` 传入，各阶段的详细规则随对应 turn 输入提供。`outputSchema` 每个相关 turn 提交。读写策略使用实际版本协议，不能照抄不匹配的示例枚举。
-- 计划回合只读，不自动批准写入或权限升级。服务端请求必须回答或明确拒绝，不允许悬挂。断连不自动重放、不保证 exactly-once。
-- 原生会话历史由 Codex 管理。源码字节、哈希、行号和证据裁决由 unshit 管理。不能用会话历史替代证据。
-- 外部源码作为不可信数据传给模型。host 校验候选 ID、路径、提交与引用，不采信模型生成的任意 URL/命令或已运行测试声明。
-- 源码、测试、依赖、CI 与许可证读取记录分开；文件缺失须说明。计划中的验证命令需有已读项目脚本依据，或明确标为实施时创建。参考测试只读不代表执行通过。计划列出的错误实现交给实施者核对，unshit 没有应用或运行。采用的参考模式须引用该参考仓库中用到这段代码的测试摘录，或写明没有的原因；所有采用模式都没有引用参考测试时，计划保持 Draft。
-- 独立复核使用新会话，修正循环有界。复核者为每条可观察验收尝试构造一个计划检查都拦不住的错误实现；修正后仍拦不住的，以及只有业务决定才能排除的，都留在 Draft 中，业务决定不由模型代做。存活错误实现只是复核的建议：host 丢弃无法使用的项并记为信息性缺口，不因它们让运行失败；修正通过校验而之后的复核没有完成时，计划同样留在 Draft。无法消除的重大缺口留在 Draft 中。完成生成不等于目标项目已经实施或验证。
-- 报告列出计划信任但 host 没有核对的内容：选中的参考仓库（运行时默认分支的最新提交、星数、日期、按文件名统计的测试路径、读取但未运行的测试、许可证依据），模型写的引用说法，没有提交的本地源码，同一模型的复核，以及复核报告或没有报告的存活错误实现都只是模型的推理。计划有错误实现时写出个数，并写明没有应用或运行；引用了参考测试时写出不同参考测试摘录的个数，并写明只按路径名认定测试文件、没有运行；brief 已获批准时写明批准来自终端还是补答文件，host 不知道是谁批准的。没有选中参考仓库时直接写明。
+- `codex app-server` stays running. After the initialize response, the host sends `initialized`. It tells responses, notifications and server requests apart and matches the active thread/turn. Receiving `turn/completed` does not mean success; the status can also be failed/interrupted.
+- The embedded skill entry point and the host constraints are passed in through `thread/start.developerInstructions`, and the detailed rules of each stage come with the input of the matching turn. `outputSchema` is submitted with every relevant turn. The read/write policy uses the protocol of the actual version and must not copy example enums that do not match.
+- Plan turns are read-only and do not automatically approve writes or permission escalation. Server requests must be answered or explicitly declined; they must not be left hanging. There is no automatic replay after a disconnect and no exactly-once guarantee.
+- Codex manages the native session history. unshit manages source bytes, hashes, line numbers and evidence verdicts. Session history must not stand in for evidence.
+- External source code goes to the model as untrusted data. The host validates candidate IDs, paths, commits and citations, and does not accept arbitrary URLs/commands that the model generates or its claims that tests have run.
+- Reads of source, tests, dependencies, CI and licenses are recorded separately; a missing file must be stated. A verification command in the plan must have a basis in a project script that was read, or be marked explicitly as created during implementation. Reading a reference test does not mean it ran and passed. The wrong implementations that the plan lists are handed to the implementer to check; unshit has not applied or run them. An adopted reference pattern must cite an excerpt of a test in that reference repository that uses this code, or state why there is none; when none of the adopted patterns cites a reference test, the plan stays Draft.
+- Independent review uses a new session, and the repair loop is bounded. For each observable acceptance criterion, the reviewer tries to build a wrong implementation that no check in the plan catches. Those still not caught after the repair, and those that only a business decision can rule out, all stay in Draft; the model does not make business decisions on the user's behalf. Surviving mutants are only suggestions from the review: the host drops items it cannot use, records them as informational gaps and does not fail the run because of them. When the repair passes validation but the review after it does not complete, the plan also stays in Draft. Material gaps that cannot be removed stay in Draft. Finishing generation does not mean that the target project has been implemented or verified.
+- The report lists what the plan trusts but the host has not checked: the selected reference repositories (the latest commit on the default branch at run time, the star count, the dates, test paths counted by file name, tests that were read but not run, the license evidence), the citation claims that the model wrote, local source code without a commit, and a review by the same model; that review, and the surviving mutants it reports or does not report, are all only the model's reasoning. When the plan has wrong implementations, the report gives their count and states that they were not applied or run. When the plan cites reference tests, the report gives the count of distinct reference test excerpts and states that test files are identified by path name only and were not run. When the brief has been approved, the report states whether the approval came from the terminal or from the answers file, and that the host does not know who approved it. When no reference repository was selected, the report says so directly.
 
-## 固定源码依据
+## Pinned source evidence
 
-本机协议验证版本：Codex 0.160.0、Bun 1.3.8。固定参考 `openai/codex@322bbf4d8486efd7dbbcf49598711a9e3fefc282`。
+Versions used to verify the protocol on this machine: Codex 0.160.0, Bun 1.3.8. Pinned reference: `openai/codex@322bbf4d8486efd7dbbcf49598711a9e3fefc282`.
 
-- [RPC 消息与请求 ID](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/rpc.rs#L1-L79)
-- [Turn 状态](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L30-L38)
-- [每轮 outputSchema](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L273-L276)
-- [跨轮 schema 测试](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server/tests/suite/v2/output_schema.rs#L107-L217)
-- [内联 developerInstructions](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L99-L106)
-- [原生 thread/read](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L1705-L1722)
-- [Bun 内嵌资源与编译](https://bun.com/docs/bundler/executables)
+- [RPC messages and request IDs](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/rpc.rs#L1-L79)
+- [Turn status](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L30-L38)
+- [Per-turn outputSchema](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L273-L276)
+- [Cross-turn schema test](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server/tests/suite/v2/output_schema.rs#L107-L217)
+- [Inline developerInstructions](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L99-L106)
+- [Native thread/read](https://github.com/openai/codex/blob/322bbf4d8486efd7dbbcf49598711a9e3fefc282/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L1705-L1722)
+- [Bun embedded assets and compilation](https://bun.com/docs/bundler/executables)
 
-## 验证记录边界
+## Limits of the verification record
 
-对话审阅已读取上述固定源码、相关测试与配置，并生成本机协议类型。CLI 运行、模型请求、真实取消和打包测试在本约定建立时仍待执行；实际结果记入 `docs/verification.md`，不得把计划中的检查称为已通过。
+The review in conversation read the pinned source above and the related tests and configuration, and generated the local protocol types. CLI runs, model requests, real cancellation and packaging tests were still pending when this agreement was set up; actual results go into `docs/verification.md` (in Chinese), and planned checks must not be called passed.

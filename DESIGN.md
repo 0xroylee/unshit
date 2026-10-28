@@ -151,7 +151,7 @@ The mark is a stack of toy bricks with a poop on top: a 2×2 brick on the left h
 ## Language
 
 - Every visible string on the site has an English element (`lang="en"`) and a Chinese element (`lang="zh-CN"`). CSS shows the pair that matches `html[data-lang]`.
-- The page picks `?lang=` first, then the saved choice, then the browser language. Without script it shows English.
+- The page shows English unless `?lang=zh` or a saved choice asks for Chinese. Without script it shows English.
 - Chinese text is simplified Chinese. Product terms stay in English in both languages: brief, host, Codex, Ready, Draft, `plan.md`.
 - The two versions say the same thing. Change both in the same commit.
 

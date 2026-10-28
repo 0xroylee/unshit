@@ -1,218 +1,63 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
-  <img alt="unshit 标志：2×4 和 2×2 积木上面放着一坨便便" src="docs/images/logo-light.svg" width="96">
+  <img alt="unshit logo: a poop on top of a 2×2 and a 2×4 brick" src="docs/images/logo-light.svg" width="96">
 </picture>
 
 # unshit
 
-简体中文 · [English](README.en.md) · [网站](https://0xroylee.github.io/unshit/)
+English · [简体中文](README.zh-CN.md) · [Website](https://0xroylee.github.io/unshit/)
 
-用一个开发需求，生成带源码依据、任务清单和验收方式的实施计划。
-
-```text
-unshit "为单个团队构建活动售票系统，支持售票、退款和入场核验"
-```
+unshit turns a plain-language requirement into an implementation plan built on real, tested code. It finds mature public repositories, reads their source at pinned commits, and cites the files and lines behind each task. It writes the plan, not the app.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
-  <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索候选，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="docs/images/how-it-works-light.svg" width="900">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-en-dark.svg">
+  <img alt="The nine steps of unshit: 1 Ask, 2 Approve the brief, 3 Local project, 4 Search, 5 Screen references, 6 Pinned reads, 7 Plan, 8 Independent review, 9 Save" src="docs/images/how-it-works-en-light.svg" width="900">
 </picture>
 
-模型通过本机 Codex App Server 使用已有登录。CLI 负责读取参考代码、校验证据与保存结果，Codex 负责模型回合和会话。输出的是实施计划，不写应用本身。图中标 Codex 的步骤是模型回合，标“你”的是你的确认，其余由 CLI（下文称 host）完成。
+## Install
 
-## 安装
-
-需要 git、Bun 1.3 或更新版本，以及已登录的 Codex CLI（`codex login`）。
+You need git, [Bun](https://bun.sh) 1.3 or later, and the [Codex CLI](https://github.com/openai/codex) logged in with `codex login`.
 
 ```sh
 git clone https://github.com/0xroylee/unshit.git
 cd unshit
-
-# 生产安装：从 --ref（默认 main）的干净克隆构建 unshit，并安装到 ~/.local/bin
 ./install.sh
-
-# 开发安装：在这个仓库里安装依赖、运行检查，并安装直接运行源码的 unshit-dev
-./install.sh --dev
 ```
 
-两种模式安装完成后都会执行 `--install-skill`，安装 unshit 的 agent skill：Claude Code 的目录存在时装到 `~/.claude/skills/unshit`（或 `$CLAUDE_CONFIG_DIR/skills/unshit`）；Codex 的目录存在时装到 `$CODEX_HOME/skills/unshit`（默认 `~/.codex/skills`）；Codex 的目录或 `~/.agents` 存在时，也装到 `~/.agents/skills/unshit`。之后在 Claude Code 或 Codex 中提出“用 unshit 规划一个售票系统”，agent 可以按 skill 的说明运行 unshit。skill 要求 agent：把澄清问题交给你；把整份需求摘要（概述、要求及其验收、排除项和假设）按“你说的”和“推断的”标出后交给你批准，不替你批准；把计划里的“Trusted, not checked”和待决事项先交给你，待决事项定下后让 unshit 重新规划，再按新计划和固定版本的参考代码实施；实施完成后按任务报告每个具名错误实现被杀死、存活、失败方式与预期不同还是没有运行（错误实现在项目的临时副本或单独的 git worktree 里应用，不改你的工作区；失败方式与预期不同的不算杀死；改了测试或预期的失败要说明改了什么和原因，不能只为对上看到的失败而改预期）、实际运行了哪些验证命令和结果、每个参考模式是否沿用；有存活的错误实现时，先补强测试或如实报告，才算任务完成。这些都是 skill 对 agent 的要求，unshit 无法强制。unshit 也无法分辨补答文件里的 `approveBrief` 是谁改的，报告的“Brief approval”和“Trusted, not checked”两节会写明。计划是 Ready 不等于实现已验证。`./install.sh --help` 列出 `--ref`、`--bin-dir`、`--no-skill` 等选项。
+This puts the `unshit` command in `~/.local/bin` and adds the unshit skill to Claude Code and Codex.
 
-也可以单独安装或更新 skill：
-
-```sh
-unshit --install-skill                     # 本机已有的 agent
-unshit --install-skill --skill-dir <目录>   # 指定 skills 目录
-```
-
-## 快速上手
-
-新应用用一个空目录；已有项目直接在项目目录里运行（或用 `--cwd` 指定）。
+## Use
 
 ```sh
 mkdir my-app && cd my-app
-unshit "为单个团队构建活动售票系统，支持售票、退款和入场核验"
+unshit "Build an event ticketing system for one team, with ticket sales, refunds and entry check-in"
 ```
 
-在终端里运行时：
+1. Answer its business questions.
+2. Read the brief and type `yes`.
+3. Wait 15 to 30 minutes. The plan is saved in `.unshit/<run-id>/plan.md`.
 
-1. unshit 先问必要的业务问题（例如谁可以退款），你直接回答。
-2. 它显示整份 brief：每条要求和验收、排除项和假设，并标出哪些是你说的、哪些是推断的。输入 `yes` 才继续。
-3. 它搜索、筛选并读取参考代码，生成计划，再复核一次。一次运行通常要十几到三十分钟。
-4. 计划打印到终端，并保存为 `.unshit/<run-id>/plan.md`。
+You can also ask Claude Code or Codex to "use unshit to plan …", and then to implement the plan.
 
-在脚本或 agent 里运行（`--json`、`--jsonl`）时，unshit 不会停下来等输入：
+A plan is **Ready** only when you approved the brief and nothing material is left open: no material gap, no unresolved review finding, no open business decision. Otherwise it is **Draft**, and the plan says why.
 
-1. 有业务问题时，返回 `needs_input`，退出码为 2，并写出补答文件 `answers.json`。在文件的 `answers` 里填写答案，然后用同样的需求和目录、加上 `--answers <answers.json>` 重新运行。
-2. 计划照常生成，但没有人批准 brief，所以是 `Draft`，同时写出一份带 brief 的补答文件。读过 brief 后把其中的 `approveBrief` 改为 `true`，再用 `--answers` 重新运行，计划才可能是 `Ready`。
+## Docs
 
-退出码：0 完成，2 需要回答或批准，124 模型回合超时，130 中断，1 错误。
+- [Usage](docs/usage.md): install options, scripted runs, answers files, results, and how references are chosen
+- [Architecture](docs/architecture.md): modules and the pinned sources behind them
+- [Acceptance agreement](docs/specs/unshit.md)
+- [Verification records](docs/verification.md) (in Chinese)
+- [AGENTS.md](AGENTS.md) and [DESIGN.md](DESIGN.md): rules for coding agents and the design style
 
-拿到计划后，在 Claude Code 或 Codex 里请 agent 按计划实施（安装时已经装好 unshit skill）。agent 按任务顺序实施，读取计划引用的固定版本源码，并报告每个具名错误实现有没有被测试抓到。
-
-## 工作原理
-
-1. **提问**（Codex）：从需求中提取要求和验收。只有业务决定会影响范围、权限或验收时才提问。
-2. **批准 brief**（你）：host 记录批准时 brief 的 SHA-256。没有人批准的计划只能是 `Draft`。
-3. **本地项目**（host）：读取目标目录中有限数量的文本文件，排除生成物和私钥文件，遮蔽凭证值。项目里已有的脚本记为可用的验证命令。
-4. **搜索候选**（host）：用 brief 里的领域词构造 GitHub 仓库查询，并用 Grep by Vercel 搜索字面代码模式；GitHub 没有合格候选时改查 GitLab。搜索结果只是线索，不是证据。
-5. **筛选参考**（host 和 Codex）：元数据门槛排除不合格的仓库；模型给通过门槛的仓库排序；host 按这个顺序读取固定提交的文件树，检查测试文件和许可证；模型从通过检查的仓库中最多选三个作为参考。
-6. **固定读取**（host）：模型从真实的文件树里挑文件，host 在固定提交读取，记录 SHA-256、行号和摘录。模型还可以请求有限的补充源码。
-7. **生成计划**（Codex）：按依赖排序的任务、验收和验证方法，每个验证写出它必须拒绝的错误实现，重要设计引用摘录。host 校验 ID、引用、覆盖和依赖。
-8. **独立复核**（Codex，新会话）：复核者为每条验收尝试构造一个能通过全部计划检查的错误实现。第一次复核的重大问题进入唯一一次修正，然后再复核一次。
-9. **保存结果**（host）：`plan.md`、`manifest.json` 和源码快照原子写入 `.unshit/<run-id>/`。
-
-以下任一情况，计划保持 `Draft`：有重大缺口；最新一次复核仍有阻断或重大问题；有待决的业务决定；校验没有通过；没有人批准 brief。其他情况为 `Ready`。修正后的复核仍找到的错误实现只列在报告里，不影响 `Ready`。`Ready` 描述的是还没写代码时的计划，不代表实现已经验证。
-
-## 参考仓库
-
-unshit 要让计划建立在成熟、有测试、持续维护的公开代码上，而不是凭空设计。
-
-怎么找到候选：
-
-- **GitHub 仓库搜索**：host 从 brief 构造查询，限定未归档、不是 fork，分三档逐步放宽：至少 200 星且一年内有推送，至少 50 星且两年内，至少 20 星且三年内。
-- **Grep 代码搜索**：用 brief 里的字面代码模式搜索公开代码，命中的仓库也进入候选；在选中的仓库里，再用它定位相关文件。每次运行最多 12 个 Grep 请求，第一次失败后停用；Grep 请求不带任何 token。
-- **GitLab**：GitHub 没有合格候选时，用官方 API 回退。
-
-门槛：有许可证、至少 20 星、36 个月内有推送、创建至少 180 天、未归档、不是 fork、有测试文件。GitHub 报告 `NOASSERTION`（认不出许可证）时，根目录必须有标准的许可证文件。
-
-在计划里怎么用：
-
-- “Reference comparison”一节为每个选中的仓库写出固定提交、选择理由、要采用和要拒绝的模式，以及怎样改到本地项目。
-- 每个采用的模式引用该仓库在这个提交下的源码摘录，以及用到这段代码的参考测试（只读，没有运行）；没有这样的测试时写明原因。
-- “Repository screening”一节列出每个候选被选中、被模型拒绝或被门槛排除的原因。
-- “Trusted, not checked”一节写出计划依赖、但 host 没有核对的内容，例如提交是默认分支的最新提交而不是发布版本，参考测试没有运行。
-- 没有选中参考仓库时，计划明确写出它背后没有参考仓库。
-- 实施时按引用的模式改写。GPL 或 AGPL 仓库的代码只作为模式参考，不直接复制到许可证不同的项目里。
-
-## 从源码运行
-
-需要 Bun 和已登录的 Codex CLI。已验证环境记录见 [验证报告](docs/verification.md)。
+## Develop
 
 ```sh
 bun install
-bun run check
-bun run build
-./dist/unshit "构建一个面向单团队的活动售票系统"
+bun run check   # typecheck and tests
+bun run build   # compiles dist/unshit
+./install.sh --dev   # installs unshit-dev, which runs this checkout's source
 ```
 
-编译后的 `dist/unshit` 内含 Bun 运行时和规划规则。可将这个文件放入自己的 PATH；运行时仍需能找到本机 `codex`。
+## Credits
 
-开发时不必构建，可直接运行源码：
-
-```sh
-bun run dev "构建一个面向单团队的活动售票系统" --cwd ../my-project
-```
-
-`bun run dev` 在仓库根目录执行，所以要用 `--cwd` 指定目标项目；`--cwd` 和 `--answers` 的相对路径按仓库根目录解析，`--out` 的相对路径按 `--cwd` 解析。要在任意目录直接运行源码，用 `./install.sh --dev` 安装的 `unshit-dev`。
-
-## 使用
-
-```sh
-# 使用现有项目的约定、依赖与脚本作为基线
-./dist/unshit "增加订单退款流程" --cwd ../my-project
-
-# 指定计划文件
-./dist/unshit "为单团队构建活动售票系统" --out ./ticketing-plan.md
-
-# 单个 JSON 结果，适合脚本读取
-./dist/unshit "为单团队构建活动售票系统" --json
-
-# JSONL 进度事件及最终结果
-./dist/unshit "为单团队构建活动售票系统" --jsonl
-
-# 在非交互调用中补充澄清答案
-./dist/unshit "build a ticketing system" --answers ./answers.json --json
-
-# 单个模型回合连续 15 分钟没有任何活动才算超时，默认是 10 分钟
-./dist/unshit "为单团队构建活动售票系统" --turn-timeout 900
-```
-
-默认继承 Codex 的模型配置。`--model` 和 `--effort` 可覆盖本次规划设置，支持的值以当前 Codex 版本为准。公开代码读取默认无需额外凭证；现有 `GITHUB_TOKEN` 或 `GITLAB_TOKEN` 可用于对应服务的 API 配额。
-
-每个模型回合在 Codex 连续 10 分钟没有任何活动时超时；即使一直有活动，一个回合最长也只能运行这个时限的 3 倍，默认 30 分钟。`--turn-timeout <秒>` 设置空闲时限，范围 30 到 3600，总时长随之变为 3 倍。brief 重建、候选排序、补充请求、计划修正和复核修正这几个回合超时后，按它们原有的失败处理继续，并记录缺口；复核修正之后的那次复核超时后，计划保持 `Draft`，原因写明没有完成的复核覆盖修正后的计划；其他回合超时会结束运行，返回 `timed_out` 并保存检查点。
-
-必要业务问题未回答时，交互终端会询问。非交互模式会返回 `needs_input`、问题 ID 和 `answersFile`，退出码为 2。在生成的文件中填写 `answers` 对象，使用文件内的问题 ID 作为键、答案文本作为值，保留 `request` 上下文，再用相同提示词和目录重新调用。文件会校验提示词、目录和规则版本，避免把旧答案套到新问题上。模型回合超时退出码为 124，取消退出码为 130，无法完成的运行退出码为 1。
-
-brief 定稿后（有补答时是重建后的 brief；重建失败时是需求提取的 brief，补答作为上下文；没有问题时是需求提取的 brief），交互终端在扫描本地项目和检索参考仓库之前显示整份 brief：概述、每条要求 R* 和它的验收 A*、排除项和假设，每条要求标出来源：`you said: "…"` 是需求原文或已确认答案里的原话，`inferred` 是推断的。只有输入 `yes`（不分大小写，可带首尾空白）才继续，host 记录这次批准：brief 的 SHA-256、`via: "tty"` 和时间。host 只知道终端里有人输入了 `yes`，分辨不出是谁，报告的“Brief approval”和“Trusted, not checked”两节都这样写明。输入其他内容时运行结束，返回 `needs_input`，`approvalRequested` 为 true、`questions` 为空，退出码为 2，并生成补答文件，里面有不带 ID 的可编辑 brief、已有答案和 `approveBrief: false`。在这个提示或补答提问处按 Ctrl+C，或者提问时输入结束，运行以 `interrupted` 结束，退出码为 130；输入在两次提问之间结束时，运行在下一次提问时同样以 `interrupted` 结束。
-
-使用 `--json`、`--jsonl`，或者 stdin、stderr 有一个不是终端时，不会停下等待批准：计划照常生成，但保持 `Draft`，未通过原因写明没有人批准 brief；同样生成上述补答文件，结果中的 `answersFile` 指向它，不用 `--json` 或 `--jsonl` 时 stderr 也给出这个路径。补答文件写入失败时，计划照常保存，结果里没有 `answersFile`，stderr 也不给路径；这时用相同提示词和目录重新运行，以得到补答文件。读过 brief、需要时修改后，把 `approveBrief` 改为 `true`，用相同提示词和目录加 `--answers` 重新运行。文件里的 `brief` 和 `approveBrief` 要么都有、要么都没有，`approveBrief` 只能是 `true` 或 `false`，否则读取失败。批准 brief 不能代替回答问题：`request` 里的每个问题都必须在 `answers` 里有答案，否则读取失败，并列出没有答案的问题 ID。host 按需求提取的规则重新校验 brief（brief 里不能有 `materialQuestions`，有这个键时读取失败），重新编号 R* 和 A*、重新判定来源，然后直接使用这份 brief 和文件里的答案，不再做需求提取、补答和重建；批准记为 `via: "answers_file"`，时间是 host 读取文件的时间。host 无法分辨是谁把 `approveBrief` 改成了 `true`，报告的“Brief approval”和“Trusted, not checked”两节都如实写明。`approveBrief` 为 `false` 时，文件里的 brief 不起作用，重跑照旧从需求提取开始。来源由 host 判定：模型给出每条要求在用户原话中的一段（`userWords`）或 null；这段话做 NFKC 和空白归一化后至少 4 个码位，并且出现在需求原文（或某个已确认的答案）里（区分大小写），才标为原话，否则标为 `inferred`。推断的要求列在一条非重大缺口里，不会让计划变成 `Draft`。
-
-## 结果与依据
-
-默认结果保存在目标目录的 `.unshit/<run-id>/`。计划文件包含范围、已确认的业务答案、brief 的批准记录或未批准的说明、每条要求的来源标签、排除项、模块与数据设计、按依赖排序的任务、验收场景、验证方法，以及采用或淘汰参考模式的理由。每个采用的参考模式还要引用该参考仓库自己的测试摘录，说明哪个测试用到了这段代码；没有这样的测试时写明原因，二者只能有一个（测试摘录最多 6 个，原因最多 700 个字符）。引用的摘录必须来自同一仓库、同一提交，而且 host 读取时把这个文件记为测试文件。报告在模式下面写 `Reference test (read, not run)` 或 `No reference test`：参考测试只读取，没有运行；“Trusted, not checked”一节写出引用了几个不同的参考测试摘录（同一摘录引用多次只算一个），并说明 host 只按路径名认定测试文件。所有采用的模式都没有引用参考测试时，记一条重大缺口，计划保持 `Draft`；这条缺口同样说明 host 只按路径名认定测试文件，路径名认不出的参考测试无法引用。每个重要引用指向实际读取的文件与行号；远程引用固定到提交版本。初始需求摘要与最终范围分别标注，补答后的决定同时保存在报告和 manifest 中；从已批准的补答文件开始的运行没有需求提取回合，范围一节写 `Approved brief (from the answers file)`，没有初始摘要。
-
-每个验证方法还要为它覆盖的每条验收写出至少一个错误实现：计划中的代码可能犯的一个具体错误，以及检查在这个错误上报告的失败。人工检查也一样。每个错误实现只能指向这个验证覆盖的验收，一个验证最多 24 个，错误和失败两段文字各最多 500 个字符。缺少或不合格时走一次计划修正；修正后仍不合格时，和其他校验失败一样，运行以错误结束。host 给它们编号，形如 `T1-V1-M1`，模型给的 ID 不采用。plan.md 在每个验证下面逐条列出（`Must fail on …`），每个任务的验证之后有一句 `Done when`：每个错误实现单独放进完成的代码时，它的检查必须失败，未修改的代码通过全部检查。unshit 没有应用这些错误实现，也没有运行任何检查；它们交给实施者用自己的变异测试工具核对。“Trusted, not checked”一节写出错误实现的个数和这一点，“Checks performed”写明 host 核对了每个验证为它覆盖的每条验收写出了错误实现。
-
-报告的“Trusted, not checked”一节放在“Checks performed”之后，列出计划依赖、host 却没有核对的内容。每个选中的参考仓库一行：`提供方:仓库@提交`、星数、最近推送（GitLab 为最近活动）和创建日期，创建日期未知时照样通过门槛，这一行也会写明；提交是本次运行时默认分支的最新提交，不是发布版本或 tag（没有解析出提交时写明）；host 收到的文件树列表里按文件名判断的测试路径数（列表被截断时另有缺口记录，这个数只是下限）；host 读取了几个实现文件和测试文件，都没有运行；许可证依据来自 GitHub 的 SPDX 元数据，还是根目录许可证文件（host 不识别文件里是哪种许可证），没有记录依据时也写明。GitLab 仓库另注明搜索结果没有归档和 fork 状态。没有选中参考仓库时，这一节写明计划背后没有参考仓库。每份报告还有四行：引用旁的说法由模型撰写，host 只核对摘录 ID 存在、参考比较的摘录来自该仓库的固定提交（引用的参考测试还要来自 host 读作测试的文件），再换成 host 记录的行号；本地源码以本次读取、遮蔽凭证之后的内容的 SHA-256 标识，没有提交；独立复核是同一个模型的新会话；复核报告的存活错误实现，以及复核没有报告存活错误实现，都只是复核模型的推理，unshit 没有应用或运行其中任何一个，没有报告也不说明计划的检查能拒绝所有错误实现。另外三行视情况出现：计划写出了错误实现时，写出个数，说明它们由模型撰写，unshit 没有应用也没有运行任何检查；采用模式引用了参考测试时，写出不同参考测试摘录的个数，说明 host 只按路径名认定测试文件、只读取没有运行，测试是否用到采用的代码由规划和复核判断；brief 已获批准时，写明批准来自终端输入的 `yes` 还是补答文件的 `approveBrief: true`，两种情况 host 都分辨不出是谁。
-
-证据 manifest 和源码快照与计划一起保存。源码读取、已有测试文件和实际执行过的检查分别记录。存在重大问题或证据缺口，或者没有人批准 brief 时，结果保持 `Draft`；完整覆盖、复核通过并且 brief 已获批准时标为 `Ready`。批准只由 host 判断：没有批准时由 host 让计划保持 `Draft`；计划和复核的提示词写明 host 记录的批准状态，并要求模型不因为没有批准而把计划标为 Draft、复核也不为此报告问题，host 不核对模型是否照做。复核提示要求复核者为每条验收标准 A* 尝试构造一个错误实现，让覆盖这条标准的所有计划检查都仍会通过；验证里点名要拒绝的错误实现也要核对，检查在它上面仍会通过时同样报告，与正确实现等价的报告为重大问题。复核者先给出反例，而不是论证检查已经够用。host 不核对复核者是否这样做。第一次复核报告的、不需要业务决定的错误实现，作为针对所属要求 R* 的重大问题进入唯一一次修正；最新一次复核仍报告的这类错误实现只列在该次复核的记录里，不会让计划保持 `Draft`。只有用户的业务决定才能排除的，记为 `Open decision for A*`，附上这条验收标准的原文（补答文件里的 brief 没有 A* ID），不交给模型修正，计划保持 `Draft`。做法按 brief 的批准方式给出：没有人批准的运行保存了补答文件，把决定写进其中的 brief，把 `approveBrief` 设为 true，再用 `--answers` 重新运行（补答文件写入失败、没有保存时，先用相同命令重新运行得到一份）；终端批准的运行没有保存补答文件，重新运行，在批准提示处回复 yes 以外的内容，unshit 会把 brief 存进补答文件，再照前一种做法修改；从已批准的补答文件开始的运行，把决定写进同一个文件的 brief，再用 `--answers` 传入，这个文件里的 `approveBrief` 已经是 true，所以重读并保存修改后的 brief 就是批准这次修改。报告在每次复核下列出这些错误实现。`survivingMutants` 只是建议，不会让运行失败：host 把空白的 `decisionNeeded` 当作 null，丢弃 `acceptanceId` 不是 brief 中 A* ID 的项、无法使用的项和第 12 项之后的项，每次丢弃都作为信息性缺口写进计划和 manifest。修正通过校验、但后续复核没有完成时，计划保持 `Draft`，原因写明没有完成的复核覆盖修正后的计划，第一次复核的问题和不需要业务决定的错误实现不再写成修正后计划的 Draft 原因；任何一次复核报告的待决事项仍是 Draft 原因。
-
-本地文件中疑似凭证的单行值，例如 `apiKey = "..."` 或以 `ghp_` 开头的 token，在发给模型之前替换为 `[redacted by unshit]`。合法 JSON 文件遮蔽后仍是合法 JSON，`package.json` 的脚本依然可读。文件仍会读取，行号不变，保存的快照和哈希对应遮蔽后的内容，并记录一条非重大缺口。含私钥块的文件，以及成员名含疑似凭证值的合法 JSON 文件，整份排除，并记录一条重大缺口。
-
-公开参考仓库会先按需求提取的领域词和 topic 由 host 构建 GitHub 搜索条件，再按星数与最近推送时间逐级放宽。搜索结果先通过星数、年龄、活跃度、归档状态和 fork 检查；进入候选名单前还要在固定提交的文件树中找到测试文件，并确认许可证：GitHub 能识别的 SPDX 许可证，或根目录许可证文件。GitHub 返回 `NOASSERTION` 表示找到了许可证文件但无法识别，这时必须在根目录找到许可证文件；有多个时先选 `LICENSE`、`LICENSE.txt`、`COPYING` 这类标准文件名，`LICENSE-*` 只作备选，证据读取使用同一个文件。筛选条件、查询记录、仓库信号与排除原因保存在报告和 manifest 中。没有满足条件的参考仓库时，报告会明确标记，计划保持 `Draft`。
-
-通过元数据门槛的候选多于文件树检查名额时，默认名额为 8 个，模型先依描述、topic 和代码命中排出最多 12 个，host 按这个顺序检查文件树；排序失败或超时就退回 host 的关键词排序，并记录非重大缺口。关键词排序只算整词，复数也算命中；`code`、`reference` 这类泛用词和普通单词形式的代码 pattern 权重较低。超出大小上限的响应不再重试。`research.shortlisted` 是通过文件树检查的仓库数，`research.selected` 是模型选中的数量；只有至少一个被选中的仓库提供了实现或测试源码摘录，`research.trustworthyReferenceFound` 才为 true。
-
-参考仓库的文件列表按需求领域词排序，并为测试文件和实现文件保留名额。读取源码仍有独立大小限制；完整文件树使用更高的响应上限。GitHub 的 `treeTruncated` 使用提供方返回的截断标志；GitLab 若 host 达到 25 页上限且仍有下一页，也会将该树标为截断。
-
-需求提取时，模型还会给出 1–4 个代码 pattern，例如 `OrderRefund`、`refund_amount`。host 用 Grep by Vercel 按字面搜索这些 pattern，模型线程本身仍不能调用任何工具。命中的仓库会补进候选名单：host 用一次带多个 `repo:` 条件的 GitHub 搜索取回星数、日期和许可证，再走同一套门槛。示例、样例和文档目录里的命中不计入。通过固定提交文件树检查后，host 会在每个仓库内再搜最多两个 pattern，只保留仓库名完全一致、且路径存在于固定提交树中的命中。这些文件排在文件清单前面。选取摘录时，每个文件（包括本地文件）里含这些 pattern 的行都会加分。Grep 的结果只用来定位，证据仍按固定提交读取。整次运行最多发 12 次 Grep 请求；第一次失败后本次运行不再请求 Grep，其余流程照常。响应格式不对时，缺口信息写明是哪一种：没有可读的 JSON-RPC 响应、JSON-RPC 错误、工具报错，或结果里既没有命中也没有无结果提示；响应头里有合规的媒体类型、错误里有整数错误码时，也一并写出。只要有候选仓库通过门槛，这个失败就记为非重大缺口；没有任何候选通过时，它和其他搜索缺口一样记为重大缺口。代码 pattern 会发送到 Grep by Vercel。
-
-读完文件后、写计划前，模型可以根据已有摘录提出最多 8 项补充：已读文件里某个名称的定义、已读文件的一段行范围，或未读文件清单里的文件，最多 6 个。首轮摘录最多 220,000 个字符，补充内容和首轮合计不超过 260,000 个字符；放不下或无效的项目记为非重大缺口。这个回合失败或超时时，计划用首轮摘录。
-
-进度显示实际阶段。人类进度写入 stderr，JSON 结果写入 stdout；JSONL 模式的事件与结果均为逐行 JSON。
-
-## 开发与核验
-
-```sh
-bun run dev "<需求>" --cwd <目标项目>   # 直接运行源码
-bun run check                           # 类型检查与测试
-bun run build                           # 编译 dist/unshit
-```
-
-协议、需求门槛、源码校验、失败处理和机器输出通过公开接口夹具测试。真实登录与模型 smoke 单独记录，以免把测试夹具等同于真实服务验证。
-
-- [已批准的要求与验收](docs/specs/unshit.md)
-- [实现结构与固定源码参考](docs/architecture.md)
-- [实际验证结果与限制](docs/verification.md)
-
-`reference-plan` 使用一个入口和五个按需读取的模块：
-
-```text
-reference-plan/
-  SKILL.md
-  references/
-    intake.md    需求和业务决策门槛
-    research.md  本地基线、参考仓库和源码证据
-    design.md    最小设计、原生能力复用和取舍
-    plan.md      任务、验收、验证和 Draft / Ready
-    review.md    现有计划或系统的审查
-```
-
-CLI 内嵌[入口与模块](src/resources/reference-plan/SKILL.md)。原生 thread 的共同指令只含入口和 host 约束；每轮再提供对应阶段的模块，沿用 Codex 的会话历史。入口或任一模块改变都会更新规则包摘要，旧版本的补答文件需用新版本重新生成；host 约束和 unshit agent skill 不计入这个摘要。具名错误实现、参考测试引用、brief 批准和存活错误实现这几项规则改了 intake、research、plan、review 四个模块，所以此前版本生成的补答文件都会被拒绝，需要重新生成。普通技能调用也按入口中的条件读取模块。
-
-规划时优先复用项目和平台已有能力。新增模块、存储或抽象需要说明具体需求、已有能力缺口，以及更简单方案为何不足。
-
-## 致谢
-
-- 流程图用 [Hairline](https://hairline.lucasmarkes.com/figures) 的线条图绘制（`@lucasmarkes/hairline` 0.5.1，MIT 许可，© Lucas Marques）。Hairline 在浏览器中用脚本绘制 SVG；[`docs/images/how-it-works.mjs`](docs/images/how-it-works.mjs) 在无界面的 Chrome 中绘制这些图，把计算后的样式写成属性，得到不需要脚本的静态 SVG。步骤改变时，修改脚本里的 `STEPS` 后重新生成：在任意目录执行 `npm install @lucasmarkes/hairline playwright-core`，再运行 `node docs/images/how-it-works.mjs <该目录>`（需要安装 Google Chrome）。
-- 代码搜索使用 [Grep by Vercel](https://grep.app)。
+The diagram and the logo use [Hairline](https://hairline.lucasmarkes.com/figures) line figures (MIT, © Lucas Marques). Code search uses [Grep by Vercel](https://grep.app).
