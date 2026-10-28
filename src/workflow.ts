@@ -620,14 +620,14 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     // describes the plan in the report, and the unreviewed-repair note keeps it Draft instead.
     const latestReview = repairUnreviewed ? undefined : reviews.at(-1);
     const severeReview = latestReview?.findings.some((finding) => finding.severity === "blocking" || finding.severity === "material") ?? false;
-    // A surviving mutant that needs no decision counts while the latest review still reports it. An open decision counts
-    // from every review, because no repair may settle it.
-    const survivingNotes = (latestReview?.survivingMutants ?? []).filter((mutant) => !mutant.decisionNeeded).map((mutant) => `Independent review found a wrong implementation of ${mutant.acceptanceId} that every planned check for it would still pass: ${mutant.wrongImplementation}`);
+    // A surviving mutant that needs no decision is not a readiness condition: the first review's go into the one
+    // repair, and each review keeps its own in its record. An open decision counts from every review, because no repair
+    // may settle it.
     const openDecisions = openDecisionNotes(reviews, brief, briefApproval);
     const materialGaps = gaps.filter((gap) => gap.material).map((gap) => gap.message);
-    const planReadiness: PlanDocument["readiness"] = !parsedPlan || validationIssues.length > 0 || parsedPlan?.shouldDraft || severeReview || survivingNotes.length > 0 || openDecisions.length > 0 || materialGaps.length > 0 || !briefApproval ? "draft" : "ready";
+    const planReadiness: PlanDocument["readiness"] = !parsedPlan || validationIssues.length > 0 || parsedPlan?.shouldDraft || severeReview || openDecisions.length > 0 || materialGaps.length > 0 || !briefApproval ? "draft" : "ready";
     plan.readiness = planReadiness;
-    plan.readinessNotes = [...new Set([...plan.readinessNotes, ...materialGaps, ...(severeReview ? ["Independent review left blocking or material findings unresolved."] : []), ...(briefApproval ? [] : [UNAPPROVED_BRIEF_NOTE]), ...survivingNotes, ...openDecisions, ...validationIssues])];
+    plan.readinessNotes = [...new Set([...plan.readinessNotes, ...materialGaps, ...(severeReview ? ["Independent review left blocking or material findings unresolved."] : []), ...(briefApproval ? [] : [UNAPPROVED_BRIEF_NOTE]), ...openDecisions, ...validationIssues])];
     checkpointPlan = plan;
     await saveCheckpoint("plan");
 

@@ -2949,7 +2949,7 @@ describe("surviving mutants from independent review", () => {
     }
   });
 
-  test("keeps the plan Draft when the review after the repair still finds a surviving mutant", async () => {
+  test("keeps a surviving mutant from the review after the repair in its record without keeping the plan Draft", async () => {
     const cwd = await tempDirectory();
     const events: ProgressEvent[] = [];
     try {
@@ -2968,9 +2968,9 @@ describe("surviving mutants from independent review", () => {
       expect(events.map((event) => event.message)).toContain("Independent review recorded 0 finding(s) and 2 surviving mutant(s).");
       expect(outcome.status).toBe("completed");
       if (outcome.status === "completed") {
-        expect(outcome.readiness).toBe("draft");
-        expect(outcome.plan.readinessNotes).toContain(`${survivingNotePrefix} of A1 that every planned check for it would still pass: ${stillUnchecked.wrongImplementation}`);
-        expect(outcome.plan.readinessNotes).not.toContain(`${survivingNotePrefix} of A1 that every planned check for it would still pass: ${unchecked.wrongImplementation}`);
+        expect(outcome.readiness).toBe("ready");
+        expect(outcome.plan.readinessNotes.some((note) => note.startsWith(survivingNotePrefix))).toBe(false);
+        expect(outcome.reviews.map((review) => review.survivingMutants.map((mutant) => mutant.wrongImplementation))).toEqual([[unchecked.wrongImplementation], [stillUnchecked.wrongImplementation]]);
       }
     } finally {
       await rm(cwd, { recursive: true, force: true });
