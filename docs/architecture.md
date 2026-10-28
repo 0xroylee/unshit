@@ -1,5 +1,7 @@
 # 实现结构与参考
 
+简体中文 · [English](architecture.en.md)
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/how-it-works-dark.svg">
   <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索候选，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="images/how-it-works-light.svg" width="900">

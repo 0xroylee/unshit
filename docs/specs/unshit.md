@@ -1,5 +1,7 @@
 # unshit 首版验收约定
 
+简体中文 · [English](unshit.en.md)
+
 本约定记录对话中已批准的 CLI 范围及审阅修正。实现使用 TypeScript 与 Bun，输入开发需求，生成有源码依据的实施计划。模型访问复用本机 Codex 登录和原生 App Server，不实现提示词要求的目标应用。
 
 ## 入口与结果
