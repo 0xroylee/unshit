@@ -1,0 +1,153 @@
+# DESIGN.md
+
+The visual and writing style of the unshit site (`docs/index.html`) and its diagrams (`docs/images/`). Follow it when you change either, or when you add a page or a figure. The values below are the ones in the code. If you change a value, change it here and in the code in the same commit.
+
+## Principles
+
+- Thin lines carry the structure. There are no decorative fills, shadows, gradients or glows. As in Hairline's rules, the stroke is the only highlight.
+- Greys only. Emphasis comes from a darker (or, in dark mode, brighter) stroke or from text weight, never from a colour.
+- Content first: one idea per block and plenty of white space. Numbers and file names stay visible instead of being hidden behind icons.
+- English and simplified Chinese are equal. Every visible string exists in both languages.
+- Static first. The site loads no third-party script, font or style, and the diagrams are static SVG.
+
+## Colour tokens
+
+Site tokens are CSS custom properties in `docs/index.html`. Dark mode follows `prefers-color-scheme`.
+
+| Token | Light | Dark | Use |
+| --- | --- | --- | --- |
+| `--bg` | `#ffffff` | `#0d1117` | Page background. The dark value is GitHub's dark canvas, so diagram plates blend in. |
+| `--text` | `#232327` | `#f0f0f3` | Body text and headings (15.66:1 and 16.64:1 on `--bg`) |
+| `--muted` | `#6e6e78` | `#a1a1aa` | Secondary text, nav, captions (5.04:1 and 7.38:1 on `--bg`) |
+| `--line` | `#e0e0e4` | `#27272a` | Section dividers, card borders, grid lines |
+| `--line-strong` | `#c3c3c9` | `#52525b` | Buttons, the install box, code blocks, notes |
+| `--hi` | `#232327` | `#fafafa` | The emphasis stroke: primary button border, selected language |
+
+Diagram tokens are in `THEMES` in `docs/images/how-it-works.mjs`. They map to Hairline's `--hairline-*` properties.
+
+| Token | Light | Dark | Use |
+| --- | --- | --- | --- |
+| plate | `#ffffff` | `#0d1117` | Fill of Hairline plates; must equal the background |
+| hi | `#232327` | `#fafafa` | The lit stroke of a figure |
+| edge | `#a4a4ac` | `#a1a1aa` | Silhouettes |
+| mid | `#c3c3c9` | `#52525b` | Every other figure stroke |
+| lo | `#e0e0e4` | `#27272a` | What recedes: guides |
+| title | `#232327` | `#f0f0f3` | Step titles |
+| text | `#6e6e78` | `#a1a1aa` | Captions and actor tags |
+| line | `#a4a4ac` | `#71717a` | Connectors between steps |
+
+Text stays at WCAG AA contrast (4.5:1) or better. Line colours are decoration, never the only way to tell two things apart.
+
+## Lines and shapes
+
+- Every border, divider and connector is 0.9px, the same as Hairline's `--hairline-stroke`.
+- Diagram connectors are dashed (`2 3`), 0.9px, and end in a small open chevron (about 5px). There are no filled arrowheads.
+- Radius:
+  - `999px`: pills, such as buttons and the language switch.
+  - `12px`: cards.
+  - `10px`: boxes, such as the install command, code blocks and notes.
+  - `5px`: inline code.
+- Code blocks and boxes have a border and no background fill.
+
+## Typography
+
+- Text font: `-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif`
+- Code font: `ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`
+- Headings and buttons use sentence case.
+
+| Role | Size and line height | Weight | Tracking |
+| --- | --- | --- | --- |
+| H1 (hero) | `clamp(34px, 5.4vw, 56px)` / 1.12 | 650 | -0.025em |
+| H2 (section) | 30px | 650 | -0.015em |
+| H3 (card, step) | 16 to 17px | 620 | normal |
+| Lede | 18px, `--muted` | 400 | normal |
+| Body | 16px / 1.65 | 400 | normal |
+| Small text, notes, lists in cards | 14 to 15px | 400 | normal |
+| Labels, buttons, switch | 13 to 15px | 400 | normal |
+| Step numbers | 12px code font, `--muted` | 400 | normal |
+| Diagram step title | 15px | 600 | normal |
+| Diagram caption | 12.5px | 400 | normal |
+| Diagram actor tag | 11px | 400 | normal |
+
+## Layout
+
+- The content column is at most 980px wide, with 24px side padding.
+- Sections are separated by a 0.9px `--line` border. Their padding is 72px top and bottom; the hero has 96px and 72px.
+- Grids:
+
+  | Grid | Columns | Gap |
+  | --- | --- | --- |
+  | Steps | 3 | none; cells share borders |
+  | Cards | 3 | 20px |
+  | Two-column blocks | 2 | 28px |
+- Text widths: the H1 is at most 760px, ledes at most 680 to 720px, and the install box at most 780px.
+- Below 820px:
+  - Every grid becomes one column.
+  - The nav hides; the language switch stays.
+  - Section padding drops to 56px, and the hero to 64px and 56px.
+
+## Components
+
+- **Header:** a 60px bar with the brand, the nav links and the language switch.
+  - Nav links are `--muted` and turn `--text` on hover.
+  - The switch is a pill group; the selected language gets an inset `--hi` stroke.
+- **Hero:** H1, lede, install box, note, buttons.
+  - The install box holds the command and a Copy button, divided by a 0.9px line.
+  - The primary button has a `--hi` border, the secondary one a `--line-strong` border.
+- **Step grid:** each cell has a two-digit number in code font, the title with its actor tag (Codex, you, host), and one or two sentences.
+- **Note box:** a 0.9px `--line-strong` border and 10px radius, for rules the reader must not miss, such as when a plan is Ready.
+- **Card:** a 0.9px `--line` border, 12px radius and 24px padding, with an H3 and `--muted` text.
+- **Docs list:** rows divided by `--line`, with language links right-aligned.
+- **Footer:** 14px `--muted` text with the credits.
+
+## Figures and diagrams
+
+- Illustrations are Hairline figures only (`@lucasmarkes/hairline`, MIT, © Lucas Marques). Do not mix in another illustration style. Do not add colour, fills, shadows or text inside a figure.
+- Labels go outside a figure, below it, as captions.
+- The pipeline diagram:
+  - It is 900 units wide, in three columns of 300.
+  - Figures are scaled to 0.55, which is 220 by 176.
+  - Steps run in snake order: row 1 left to right, row 2 right to left, row 3 left to right. Each title is numbered.
+  - An actor tag follows each title.
+  - Dashed connectors with chevrons join the steps.
+- Never edit the SVG files by hand. Generate them with `docs/images/how-it-works.mjs`: four variants (Chinese and English captions, each in light and dark), shown with `<picture>` and `prefers-color-scheme`.
+
+Figures used for the steps:
+
+| Step | Figure | Why |
+| --- | --- | --- |
+| 1 Ask | `query` | a question mark |
+| 2 Approve the brief | `padlock` | a lock that opens |
+| 3 Local project | `drawer` | the project's files |
+| 4 Search | `loupe` | a magnifier over a sheet |
+| 5 Screen references | `sieve` | filtering |
+| 6 Pinned reads | `branches` | a commit graph |
+| 7 Plan | `rebuild` | a dependency tree of tasks |
+| 8 Independent review | `format` | crooked lines that snap square |
+| 9 Save | `cabinet` | stored snapshots |
+
+## Language
+
+- Every visible string on the site has an English element (`lang="en"`) and a Chinese element (`lang="zh-CN"`). CSS shows the pair that matches `html[data-lang]`.
+- The page picks `?lang=` first, then the saved choice, then the browser language. Without script it shows English.
+- Chinese text is simplified Chinese. Product terms stay in English in both languages: brief, host, Codex, Ready, Draft, `plan.md`.
+- The two versions say the same thing. Change both in the same commit.
+
+## Voice
+
+- Use plain words and specific facts. Prefer numbers to adjectives: "at most 12 requests a run", not "a few requests".
+- Say what the code does, and nothing it does not guarantee.
+- State limits plainly, for example "read, not run" or "the host does not check this".
+- Use short sentences. Do not use em dashes, hype words or exclamation marks.
+
+## Accessibility
+
+- Each diagram `<img>` has alt text in the page language that lists the nine steps. Each SVG has a `<title>` and a `<desc>`.
+- Controls are real `<button>` and `<a>` elements. The language switch has an `aria-label`.
+- Colour and line weight are never the only signal; there is always text.
+
+## Checks for a visual change
+
+1. Serve `docs/` at `/unshit/` (as GitHub Pages does) and render the page in Chrome in four setups: English desktop, Chinese at 390px, the dark scheme, and Chinese from the browser locale.
+2. In each setup, check that there is no horizontal overflow, no console error or failed request, and that the expected language and diagram variant loaded.
+3. Regenerate the diagrams. When no caption changed, the existing SVGs must come out byte-identical.
