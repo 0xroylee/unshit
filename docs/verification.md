@@ -157,9 +157,9 @@ Codex 先回应错误、随后进程退出、而回应仍在 stdout 缓冲区时
 
 这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求。真实执行的效果由第 9 次 CLI 自审验证。
 
-## CLI 自审实跑记录（2026-10-14 至 2026-10-21）
+## CLI 自审实跑记录（2026-10-14 至 2026-10-27）
 
-需求文字每次相同，都是请 unshit 检查自身并规划最需要的改进。第 1 次没有指定 `--effort`，使用 Codex 配置里的 xhigh；第 2 次和第 4 到 10 次用 `--effort medium` 直接运行 CLI；第 3 次用仓库外的驱动脚本调用同一个 `runWorkflow`，effort 为 medium，回合上限 900 秒。
+需求文字每次相同，都是请 unshit 检查自身并规划最需要的改进。第 1 次没有指定 `--effort`，使用 Codex 配置里的 xhigh；第 2 次和第 4 到 11 次用 `--effort medium` 直接运行 CLI；第 3 次用仓库外的驱动脚本调用同一个 `runWorkflow`，effort 为 medium，回合上限 900 秒。
 
 | 次数 | 版本 | 结果 |
 | --- | --- | --- |
@@ -172,8 +172,21 @@ Codex 先回应错误、随后进程退出、而回应仍在 stdout 缓冲区时
 | 8 | `77371a2` | 退出码 0，Draft，摘录 234,035 个字符，`src/code-search.ts` 整份摘录 |
 | 9 | `3b5e9e0` | 退出码 0，Draft，补充请求 8 项全部处理，摘录 255,461 个字符，复核 0 项发现 |
 | 10 | `9a7d6c8` | 退出码 0，Draft，6.7 分钟，1 个参考仓库；文件挑选选满 20 个文件，`src/app-server.ts` 有摘录，`src/cli.ts` 和 `src/storage.ts` 仍没有；补充请求的 6 个文件名额用了 4 个；摘录 257,292 个字符 |
+| 11 | `a97848e` | 退出码 0，Draft，9.9 分钟，2 个参考仓库（bgauryy/octocode、Graphify-Labs/graphify）；PDD Kit 借鉴改动之后的第一次实跑，见下文；文件挑选选满 20 个文件，`src/cli.ts`、`src/storage.ts`、`src/app-server.ts` 和 `src/local.ts` 都没有摘录；补充请求 8 项处理了 7 项 |
 
-每次都发出了真实的 GitHub 和 Grep 请求，发现阶段的 Grep 代码搜索每次匹配 6 到 13 个仓库。第 1 到 3 次的每个定位查询都返回 `ok`；第 6 到 9 次各用满 12 次的 Grep 请求额度，各有 1 到 3 个定位查询记为 `skipped`，没有发出。第 10 次的第 2 个发现查询（`evidence`）以 `invalid_response` 失败，之后的查询都记为 `skipped`；当时的记录只有失败类别。运行日志和输出保存在仓库之外。
+每次都发出了真实的 GitHub 和 Grep 请求，发现阶段的 Grep 代码搜索每次匹配 6 到 13 个仓库。第 1 到 3 次的每个定位查询都返回 `ok`；第 6 到 9 次各用满 12 次的 Grep 请求额度，各有 1 到 3 个定位查询记为 `skipped`，没有发出。第 10 次的第 2 个发现查询（`evidence`）以 `invalid_response` 失败，之后的查询都记为 `skipped`；当时的记录只有失败类别。第 11 次的 3 个发现查询和 8 个定位查询都返回 `ok`。运行日志和输出保存在仓库之外。
+
+第 11 次（2026-10-27，Codex CLI 0.162.1）是具名错误实现、参考测试引用、brief 批准、复核存活错误实现和“Trusted, not checked”这组改动合并之后的第一次实跑。用 `--jsonl` 运行，所以 host 没有请人批准 brief。结果如下：
+
+- 计划和修正后的计划第一次就通过 host 校验，没有校验修正回合；新增的必填字段（`rejectsMutants`、`testEvidence` 或 `untestedReason`、`userWords`、`survivingMutants`）都按 schema 和长度上限填写。
+- intake 得到 4 条要求，没有重大问题；4 条都在需求原文里找到引文，标为“you said”。
+- 6 个任务各有 1 个验证方法（2 个人工检查，4 个使用已读的项目脚本），共 21 个具名错误实现。
+- 两个参考仓库各有一个采用模式，各引用一个读作测试的参考测试摘录，所以没有记录“没有采用模式引用参考测试”的缺口。只有 octocode 的模式是真正成对的：`evidence` 引用实现文件 `research-output.ts` 的摘录，`testEvidence` 引用它的测试。graphify 的模式只引用了测试文件 `tests/test_evidence_binding.py` 的同一段摘录，`evidence` 和 `testEvidence` 都是它；这个测试所测的 `graphify.llm` 实现没有读到。host 只检查 `testEvidence` 来自读作测试的文件，没有要求同一模式引用实现摘录，所以没有拦下这种情况；计划自己的 Draft 原因提到了它。
+- 第一次复核报告 3 项重大问题和 5 个存活错误实现，都不需要业务决定，一起进入唯一一次修正；修正后的复核没有问题，也没有存活错误实现。第 10 次的第一次复核只有 1 项重大问题。
+- 计划为 Draft，原因有三条：两条是计划自己写的证据缺口（摘录里没有 CLI、App Server、本地扫描、存储、安装和失败处理的实现及测试；graphify 的证据绑定测试所测的实现没有读到），另一条是没有人批准 brief。补答文件保存了可编辑的 brief，`approveBrief` 为 false。
+- plan.md 的“Trusted, not checked”列出两个参考仓库的星数、日期、运行时解析的默认分支最新提交、按文件名统计的测试路径、读取但未运行的文件数和许可证依据，并写明 21 个错误实现、2 个参考测试摘录和复核结论都没有运行过。
+
+这次没有人批准 brief，所以 Ready 的完整路径还没有在实跑中验证；计划自己写的两条证据缺口也还没有解决。
 
 ## 后续修正验证（2026-10-17）
 
@@ -289,7 +302,7 @@ PDD Kit 的意图对照表把起草的性质和“你说的原话”并列，规
 
 复核后的修改：存活错误实现不再能让运行失败。`parseReview` 仍严格校验 `findings`；存活错误实现中空白的 `decisionNeeded` 当作没有决定，`acceptanceId` 不是 brief 中 A* ID 的项、不是对象或文字超长的项、第 12 项之后的项都被丢弃，字段不是列表时按没有处理；每次丢弃在计划的缺口列表和 manifest 的 `gaps` 里记一条信息性缺口，就绪状态不变。复核提示写明 `acceptanceId` 用 brief 的 A* ID 而不是 T1-A1 这样的任务验收 ID，最多 12 项，并要求 brief 没有定下的业务选择只作为带 `decisionNeeded` 的存活错误实现报告，不写成问题或修正建议。待决事项的说明引用验收标准原文，并按 brief 的批准方式给出做法。修正通过校验而后续复核没有完成时，计划为 Draft，原因写明没有完成的复核覆盖修正后的计划，第一次复核的问题和不需要决定的存活错误实现不再写成 Draft 原因，任何一次复核的待决事项仍是 Draft 原因；修正本身失败时仍写 `The bounded review repair did not complete.`。“Trusted, not checked”多了一行：存活错误实现和没有存活错误实现都只是复核模型的推理。新测试检查：只有修正后的复核报告的待定决定同样让计划为 Draft；有两条要求时，A2 的存活错误实现转成针对 R2 的完整重大问题；复核提示里 `decisionNeeded` 的条件、先给反例的要求、A* ID 与 12 项上限和业务选择这几句整句固定；两次复核里无法使用的存活错误实现都被丢弃，丢弃记录写进 plan.md 和 manifest，运行照常完成；修正后的复核失败时计划写明没有复核覆盖，去掉第一次复核过时的说明，并保留第一次复核的待决事项；三种批准方式各有对应的待决事项做法；复核 schema 的 `maxItems` 为 12；进度行写出存活错误实现的个数。
 
-这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求。复核者在真实计划上报告多少存活错误实现，要等下一次 CLI 自审实跑记录。
+这次没有运行 unshit，没有调用 Codex，也没有发出 GitHub 或 Grep 请求。复核者在真实计划上报告的存活错误实现见“CLI 自审实跑记录”的第 11 次。
 
 ## agent skill 符合性报告验证（2026-10-25）
 
