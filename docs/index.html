@@ -8,13 +8,13 @@
   <meta name="color-scheme" content="light dark">
   <link rel="icon" href="images/favicon.svg" type="image/svg+xml">
   <script>
-    // Language before first paint: ?lang= wins, then the saved choice, then the browser language. Without script
-    // the page stays English.
+    // Language before first paint: ?lang= wins, then the saved choice; otherwise English. Without script the page
+    // stays English.
     (function () {
       var query = new URLSearchParams(location.search).get("lang");
       var saved = null;
       try { saved = localStorage.getItem("unshit-lang"); } catch (error) {}
-      var lang = query === "zh" || query === "en" ? query : saved === "zh" || saved === "en" ? saved : (navigator.language || "").toLowerCase().indexOf("zh") === 0 ? "zh" : "en";
+      var lang = query === "zh" || query === "en" ? query : saved === "zh" || saved === "en" ? saved : "en";
       document.documentElement.setAttribute("data-lang", lang);
       document.documentElement.setAttribute("lang", lang === "zh" ? "zh-CN" : "en");
     })();
@@ -144,8 +144,8 @@
         <p class="note" lang="zh-CN">需要 git、Bun 1.3 或更新版本，以及已登录的 Codex CLI（<code class="inline">codex login</code>）。安装时也会把 unshit skill 装进 Claude Code 和 Codex。</p>
         <div class="actions">
           <a class="button primary" href="https://github.com/0xroylee/unshit"><span lang="en">View on GitHub</span><span lang="zh-CN">在 GitHub 查看</span></a>
-          <a class="button" lang="en" href="https://github.com/0xroylee/unshit/blob/main/README.en.md">Read the README</a>
-          <a class="button" lang="zh-CN" href="https://github.com/0xroylee/unshit/blob/main/README.md">阅读 README</a>
+          <a class="button" lang="en" href="https://github.com/0xroylee/unshit/blob/main/README.md">Read the README</a>
+          <a class="button" lang="zh-CN" href="https://github.com/0xroylee/unshit/blob/main/README.zh-CN.md">阅读 README</a>
         </div>
       </div>
     </section>
@@ -286,12 +286,14 @@ unshit "为单个团队构建活动售票系统，支持售票、退款和入场
       <div class="wrap">
         <h2><span lang="en">Documentation</span><span lang="zh-CN">文档</span></h2>
         <ul class="docs">
-          <li><span><span lang="en">README: install, usage and results</span><span lang="zh-CN">README：安装、使用和结果</span></span>
-            <span class="langs"><a href="https://github.com/0xroylee/unshit/blob/main/README.en.md">English</a><a href="https://github.com/0xroylee/unshit/blob/main/README.md">简体中文</a></span></li>
+          <li><span><span lang="en">README: what it is, install and use</span><span lang="zh-CN">README：简介、安装和使用</span></span>
+            <span class="langs"><a href="https://github.com/0xroylee/unshit/blob/main/README.md">English</a><a href="https://github.com/0xroylee/unshit/blob/main/README.zh-CN.md">简体中文</a></span></li>
+          <li><span><span lang="en">Usage: install options, scripted runs, results and references</span><span lang="zh-CN">使用说明：安装选项、脚本运行、结果和参考仓库</span></span>
+            <span class="langs"><a href="https://github.com/0xroylee/unshit/blob/main/docs/usage.md">English</a><a href="https://github.com/0xroylee/unshit/blob/main/docs/usage.zh-CN.md">简体中文</a></span></li>
           <li><span><span lang="en">Architecture: modules, steps and pinned references</span><span lang="zh-CN">实现结构：模块、步骤和固定源码参考</span></span>
-            <span class="langs"><a href="https://github.com/0xroylee/unshit/blob/main/docs/architecture.en.md">English</a><a href="https://github.com/0xroylee/unshit/blob/main/docs/architecture.md">简体中文</a></span></li>
+            <span class="langs"><a href="https://github.com/0xroylee/unshit/blob/main/docs/architecture.md">English</a><a href="https://github.com/0xroylee/unshit/blob/main/docs/architecture.zh-CN.md">简体中文</a></span></li>
           <li><span><span lang="en">Acceptance agreement for the first version</span><span lang="zh-CN">首版验收约定</span></span>
-            <span class="langs"><a href="https://github.com/0xroylee/unshit/blob/main/docs/specs/unshit.en.md">English</a><a href="https://github.com/0xroylee/unshit/blob/main/docs/specs/unshit.md">简体中文</a></span></li>
+            <span class="langs"><a href="https://github.com/0xroylee/unshit/blob/main/docs/specs/unshit.md">English</a><a href="https://github.com/0xroylee/unshit/blob/main/docs/specs/unshit.zh-CN.md">简体中文</a></span></li>
           <li><span><span lang="en">Verification records of checks and live runs</span><span lang="zh-CN">验证记录：检查与真实运行</span></span>
             <span class="langs"><a href="https://github.com/0xroylee/unshit/blob/main/docs/verification.md">简体中文</a></span></li>
           <li><span><span lang="en">Rules for coding agents</span><span lang="zh-CN">给编码 agent 的规则</span></span>
