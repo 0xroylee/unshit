@@ -6,26 +6,12 @@
 unshit "为单个团队构建活动售票系统，支持售票、退款和入场核验"
 ```
 
-```text
-prompt
-  |
-  v
-范围 / 必要澄清
-  |
-  v
-确认 brief（终端输入 yes，或补答文件）
-  |
-  v
-本地项目 + 公开参考仓库
-  |
-  v
-固定提交 / 文件 / 行号 / 内容校验
-  |
-  v
-实施计划 -> 独立复核 -> plan.md
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
+  <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索候选，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="docs/images/how-it-works-light.svg" width="900">
+</picture>
 
-模型通过本机 Codex App Server 使用已有登录。CLI 负责读取参考代码、校验证据与保存结果，Codex 负责模型回合和会话。输出的是实施计划。
+模型通过本机 Codex App Server 使用已有登录。CLI 负责读取参考代码、校验证据与保存结果，Codex 负责模型回合和会话。输出的是实施计划，不写应用本身。图中标 Codex 的步骤是模型回合，标“你”的是你的确认，其余由 CLI（下文称 host）完成。
 
 ## 安装
 
@@ -50,6 +36,66 @@ cd unshit
 unshit --install-skill                     # 本机已有的 agent
 unshit --install-skill --skill-dir <目录>   # 指定 skills 目录
 ```
+
+## 快速上手
+
+新应用用一个空目录；已有项目直接在项目目录里运行（或用 `--cwd` 指定）。
+
+```sh
+mkdir my-app && cd my-app
+unshit "为单个团队构建活动售票系统，支持售票、退款和入场核验"
+```
+
+在终端里运行时：
+
+1. unshit 先问必要的业务问题（例如谁可以退款），你直接回答。
+2. 它显示整份 brief：每条要求和验收、排除项和假设，并标出哪些是你说的、哪些是推断的。输入 `yes` 才继续。
+3. 它搜索、筛选并读取参考代码，生成计划，再复核一次。一次运行通常要十几到三十分钟。
+4. 计划打印到终端，并保存为 `.unshit/<run-id>/plan.md`。
+
+在脚本或 agent 里运行（`--json`、`--jsonl`）时，unshit 不会停下来等输入：
+
+1. 有业务问题时，返回 `needs_input`，退出码为 2，并写出补答文件 `answers.json`。在文件的 `answers` 里填写答案，然后用同样的需求和目录、加上 `--answers <answers.json>` 重新运行。
+2. 计划照常生成，但没有人批准 brief，所以是 `Draft`，同时写出一份带 brief 的补答文件。读过 brief 后把其中的 `approveBrief` 改为 `true`，再用 `--answers` 重新运行，计划才可能是 `Ready`。
+
+退出码：0 完成，2 需要回答或批准，124 模型回合超时，130 中断，1 错误。
+
+拿到计划后，在 Claude Code 或 Codex 里请 agent 按计划实施（安装时已经装好 unshit skill）。agent 按任务顺序实施，读取计划引用的固定版本源码，并报告每个具名错误实现有没有被测试抓到。
+
+## 工作原理
+
+1. **提问**（Codex）：从需求中提取要求和验收。只有业务决定会影响范围、权限或验收时才提问。
+2. **批准 brief**（你）：host 记录批准时 brief 的 SHA-256。没有人批准的计划只能是 `Draft`。
+3. **本地项目**（host）：读取目标目录中有限数量的文本文件，排除生成物和私钥文件，遮蔽凭证值。项目里已有的脚本记为可用的验证命令。
+4. **搜索候选**（host）：用 brief 里的领域词构造 GitHub 仓库查询，并用 Grep by Vercel 搜索字面代码模式；GitHub 没有合格候选时改查 GitLab。搜索结果只是线索，不是证据。
+5. **筛选参考**（host 和 Codex）：元数据门槛排除不合格的仓库；模型给通过门槛的仓库排序；host 按这个顺序读取固定提交的文件树，检查测试文件和许可证；模型从通过检查的仓库中最多选三个作为参考。
+6. **固定读取**（host）：模型从真实的文件树里挑文件，host 在固定提交读取，记录 SHA-256、行号和摘录。模型还可以请求有限的补充源码。
+7. **生成计划**（Codex）：按依赖排序的任务、验收和验证方法，每个验证写出它必须拒绝的错误实现，重要设计引用摘录。host 校验 ID、引用、覆盖和依赖。
+8. **独立复核**（Codex，新会话）：复核者为每条验收尝试构造一个能通过全部计划检查的错误实现。第一次复核的重大问题进入唯一一次修正，然后再复核一次。
+9. **保存结果**（host）：`plan.md`、`manifest.json` 和源码快照原子写入 `.unshit/<run-id>/`。
+
+以下任一情况，计划保持 `Draft`：有重大缺口；最新一次复核仍有阻断或重大问题；有待决的业务决定；校验没有通过；没有人批准 brief。其他情况为 `Ready`。修正后的复核仍找到的错误实现只列在报告里，不影响 `Ready`。`Ready` 描述的是还没写代码时的计划，不代表实现已经验证。
+
+## 参考仓库
+
+unshit 要让计划建立在成熟、有测试、持续维护的公开代码上，而不是凭空设计。
+
+怎么找到候选：
+
+- **GitHub 仓库搜索**：host 从 brief 构造查询，限定未归档、不是 fork，分三档逐步放宽：至少 200 星且一年内有推送，至少 50 星且两年内，至少 20 星且三年内。
+- **Grep 代码搜索**：用 brief 里的字面代码模式搜索公开代码，命中的仓库也进入候选；在选中的仓库里，再用它定位相关文件。每次运行最多 12 个 Grep 请求，第一次失败后停用；Grep 请求不带任何 token。
+- **GitLab**：GitHub 没有合格候选时，用官方 API 回退。
+
+门槛：有许可证、至少 20 星、36 个月内有推送、创建至少 180 天、未归档、不是 fork、有测试文件。GitHub 报告 `NOASSERTION`（认不出许可证）时，根目录必须有标准的许可证文件。
+
+在计划里怎么用：
+
+- “Reference comparison”一节为每个选中的仓库写出固定提交、选择理由、要采用和要拒绝的模式，以及怎样改到本地项目。
+- 每个采用的模式引用该仓库在这个提交下的源码摘录，以及用到这段代码的参考测试（只读，没有运行）；没有这样的测试时写明原因。
+- “Repository screening”一节列出每个候选被选中、被模型拒绝或被门槛排除的原因。
+- “Trusted, not checked”一节写出计划依赖、但 host 没有核对的内容，例如提交是默认分支的最新提交而不是发布版本，参考测试没有运行。
+- 没有选中参考仓库时，计划明确写出它背后没有参考仓库。
+- 实施时按引用的模式改写。GPL 或 AGPL 仓库的代码只作为模式参考，不直接复制到许可证不同的项目里。
 
 ## 从源码运行
 
@@ -158,3 +204,8 @@ reference-plan/
 CLI 内嵌[入口与模块](src/resources/reference-plan/SKILL.md)。原生 thread 的共同指令只含入口和 host 约束；每轮再提供对应阶段的模块，沿用 Codex 的会话历史。入口或任一模块改变都会更新规则包摘要，旧版本的补答文件需用新版本重新生成；host 约束和 unshit agent skill 不计入这个摘要。具名错误实现、参考测试引用、brief 批准和存活错误实现这几项规则改了 intake、research、plan、review 四个模块，所以此前版本生成的补答文件都会被拒绝，需要重新生成。普通技能调用也按入口中的条件读取模块。
 
 规划时优先复用项目和平台已有能力。新增模块、存储或抽象需要说明具体需求、已有能力缺口，以及更简单方案为何不足。
+
+## 致谢
+
+- 流程图用 [Hairline](https://hairline.lucasmarkes.com/figures) 的线条图绘制（`@lucasmarkes/hairline` 0.5.1，MIT 许可，© Lucas Marques）。Hairline 在浏览器中用脚本绘制 SVG；[`docs/images/how-it-works.mjs`](docs/images/how-it-works.mjs) 在无界面的 Chrome 中绘制这些图，把计算后的样式写成属性，得到不需要脚本的静态 SVG。步骤改变时，修改脚本里的 `STEPS` 后重新生成：在任意目录执行 `npm install @lucasmarkes/hairline playwright-core`，再运行 `node docs/images/how-it-works.mjs <该目录>`（需要安装 Google Chrome）。
+- 代码搜索使用 [Grep by Vercel](https://grep.app)。

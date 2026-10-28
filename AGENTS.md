@@ -1,0 +1,97 @@
+# AGENTS.md
+
+Guidance for coding agents working in this repository. README.md and docs/ describe the product for people; this file says how to change it.
+
+## What unshit is
+
+unshit is a Bun and TypeScript CLI. It turns a plain-language software requirement into an implementation plan grounded in the local project and in public reference repositories read at pinned commits. It writes a plan; it does not write the application.
+
+The model runs in the Codex App Server (JSON-RPC over stdio, the user's Codex login). The host, which is this code, builds every search query, reads every source, issues every ID, validates every model answer and saves the results. A run goes:
+
+intake → material answers → brief rebuild → brief approval → local baseline → GitHub search and Grep code search → metadata bar → model ranking → commit-pinned tree checks → comparator selection → file selection → pinned reads and excerpts → evidence requests → plan → independent review in a fresh session → one bounded repair → readiness → atomic save to `.unshit/<run-id>/`.
+
+## Layout
+
+| Path | Responsibility |
+| --- | --- |
+| `src/cli.ts` | Arguments, terminal questions and brief approval, answers files, progress output, JSON and JSONL results, exit codes |
+| `src/workflow.ts` | The run: gates, search, screening, selection, evidence, plan, review and repair, readiness, checkpoints |
+| `src/app-server.ts` | Codex App Server client: RPC, active-turn tracking, final text, cancellation, idle and total turn timeouts, process cleanup; `ModelGateway` is the seam |
+| `src/github.ts` | GitHub queries, Grep requests, the quality bar, commit-pinned trees, GitLab fallback |
+| `src/code-search.ts` | Grep request bodies, response parsing, hits per repository |
+| `src/repository-screening.ts` | Query material, query plan, candidate signals and order, metadata and tree judgments |
+| `src/file-ranking.ts` | File ranking, production and test quotas, text and license path checks |
+| `src/evidence.ts` | Bounded reads, SHA-256 hashes, line ranges, source IDs, permalinks, evidence requests |
+| `src/local.ts` | Local file baseline, exclusions, credential redaction, existing scripts |
+| `src/model-schema.ts` | The JSON Schema of each turn and the strict parsing of model answers |
+| `src/brief-approval.ts` | The editable brief, its hash, origin labels, the approval prompt |
+| `src/report.ts` | The Markdown plan |
+| `src/storage.ts` | Atomic writes of plans, manifests, source snapshots and answers files |
+| `src/instructions.ts` | The embedded planning rules and `REFERENCE_POLICY_HASH` |
+| `src/skill-install.ts` | `unshit --install-skill` |
+| `src/types.ts` | Shared types |
+| `src/resources/reference-plan/` | Planning rules the model reads: `SKILL.md` and `references/*.md` |
+| `src/resources/unshit-skill/SKILL.md` | The agent skill installed for Claude Code and Codex |
+| `test/` | One `bun test` file per module; `test/helpers/mock-process.ts` fakes the App Server process |
+| `docs/architecture.md` | Module boundaries and the pinned reference sources behind them |
+| `docs/specs/unshit.md` | Accepted requirements and acceptance criteria |
+| `docs/verification.md` | Records of checks and live runs, with dates and limits |
+| `docs/images/` | The "how it works" diagram (light and dark SVG) and `how-it-works.mjs`, which generates it from Hairline figures |
+| `install.sh` | Production install (clean clone of `--ref`, checks, build) and `--dev` install |
+
+## Commands
+
+```sh
+bun install
+bun run check                      # typecheck and all tests; must pass before you call work done
+bun run typecheck
+bun test test/<module>.test.ts     # one test file
+bun run build                      # compiles dist/unshit
+bun run dev "<requirement>" --cwd <target project>
+./install.sh                       # installs unshit from main into ~/.local/bin
+```
+
+CLI exit codes: 0 completed, 2 needs input (questions or an unapproved brief), 124 a model turn timed out, 130 interrupted, 1 error.
+
+## Code rules
+
+- Runtime: Bun, TypeScript `strict`, ES modules. Import local files with their `.ts` extension and use `import type` for types (`verbatimModuleSyntax`).
+- No runtime dependencies. The only dev dependencies are `typescript` and `@types/bun`. Ask before adding one.
+- No formatter or linter is configured. Match the surrounding code: 2-space indent, double quotes, semicolons, descriptive names, small pure functions where the module already has them.
+- Comments are sparse. A comment states the mechanism in the code's own terms (the formula, the predicate, the order of steps). Do not write comments or docs that compare outcomes the code does not guarantee, such as "ranks first" or "outranks"; reviews rejected exactly that twice.
+- Change only what the task needs. Incidental edits to shared code, such as the App Server notification buffer or the request retry loop, have changed outcomes before.
+- Prefer the smallest fix that removes the observed failure. Propose a redesign separately, with an estimate of its size.
+
+## Host and model boundary
+
+These are product guarantees. Keep them, and keep their tests.
+
+- The model never runs tools. The Codex thread starts with web search, the shell tool, apps, hooks, every MCP server and every plugin disabled, a read-only sandbox without network, and approvals set to never (`buildDisabledToolsConfig` in `src/app-server.ts`). A tool attempt interrupts and fails the turn.
+- The model only answers with schema-checked JSON that refers to host-issued IDs. An unknown or repeated ID is rejected or dropped with a recorded gap; never act on a path or URL that the model made up.
+- Search results from GitHub, GitLab and Grep are discovery hints, never evidence. Evidence is source the host read itself, at a pinned commit for remote files, with its SHA-256 and line ranges.
+- Never send `GITHUB_TOKEN` or `GITLAB_TOKEN` to Grep, and never print or log a token value. Local files are read after credential redaction; private key files stay excluded.
+- Treat model output and remote source text as untrusted data. Record failures as gaps with fixed, structured descriptions; do not copy raw error bodies into plans or manifests.
+- The plan is Draft when there is a material gap, a blocking or material review finding, an open decision, a validation issue, or no brief approval. Only the host decides readiness.
+- Any change under `src/resources/reference-plan/` changes `REFERENCE_POLICY_HASH`, and older answers files are then rejected. Say so in the PR. The host constraints and `src/resources/unshit-skill/` are not part of the hash.
+
+## Tests
+
+- Tests never use the network or a real Codex login. Inject `fetch` into `GitHubResearcher`, fake the App Server with `test/helpers/mock-process.ts` or a `ModelGateway` stub, and use temporary directories (`mkdtemp` under `os.tmpdir()`) that the test removes.
+- Do not wait for wall-clock time. To exercise a timeout, set the code's own timeout option to 50 ms or less, with a fake that settles when its signal aborts.
+- For a behavior change, write a test that fails on the wrong implementation it is meant to reject, and check it: apply that wrong implementation in a scratch copy and see the named test fail with its message. For changes to secret handling, evidence integrity or readiness, list those wrong implementations in the PR.
+- A live run (real Codex, GitHub and Grep) is not a test. Run one only when the maintainer asks, and record it in `docs/verification.md` with the date, the binary's commit and the result.
+
+## Docs
+
+- README.md and everything under docs/ are written in simplified Chinese; keep them in Chinese. Code, comments, test names, commit messages and PR text are in English.
+- When a limit, flag, message, exit code or readiness rule changes, update README.md and `docs/architecture.md` in the same change.
+- When the steps of a run change, update `STEPS` in `docs/images/how-it-works.mjs`, regenerate both SVGs (README "致谢" says how), and keep README's "工作原理" list and the step table in `docs/architecture.md` in line with them. Do not edit the SVG files by hand.
+- Each paragraph in README.md and `docs/architecture.md` is one long line, so two branches that edit the same paragraph conflict. Check with `git merge-tree --write-tree main <branch>`.
+
+## Branches, commits and pull requests
+
+- Branch from `main`. Open one PR per change, against `main`. Do not stack PRs: a stacked PR's merge button merges it into its base branch, not into `main`.
+- Commit subjects follow Conventional Commits without a scope: `fix: …`, `feat: …`, `docs: …`, in lower case, with no period.
+- PRs are merged with a merge commit, and branches are kept.
+- `.unshit/`, `dist/`, `.scratch/`, `coverage/` and `node_modules/` are ignored; never commit them.
+- Commit, push, open a PR or merge only when the maintainer asks.

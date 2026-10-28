@@ -1,5 +1,30 @@
 # 实现结构与参考
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/how-it-works-dark.svg">
+  <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索候选，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="images/how-it-works-light.svg" width="900">
+</picture>
+
+## 处理步骤与模块
+
+各步骤做什么见 README 的[工作原理](../README.md#工作原理)。下表列出每一步由哪些模块完成。所有 Codex 回合都经过 [app-server.ts](../src/app-server.ts)。
+
+| 步骤 | 内容 | 主要模块 |
+| --- | --- | --- |
+| 1 提问 | 需求提取回合、业务问题、补答后的 brief 重建 | [workflow.ts](../src/workflow.ts)、[model-schema.ts](../src/model-schema.ts)、[cli.ts](../src/cli.ts) |
+| 2 批准 brief | 终端输入 `yes`，或补答文件里的 `approveBrief: true`；记录 brief 的 SHA-256 | [brief-approval.ts](../src/brief-approval.ts)、[cli.ts](../src/cli.ts)、[storage.ts](../src/storage.ts) |
+| 3 本地项目 | 有界文件列表、排除规则、凭证遮蔽、已有脚本 | [local.ts](../src/local.ts) |
+| 4 搜索候选 | 分档的 GitHub 查询、Grep 发现、批量元数据查询、GitLab 回退 | [github.ts](../src/github.ts)、[code-search.ts](../src/code-search.ts)、[repository-screening.ts](../src/repository-screening.ts) |
+| 5 筛选参考 | 元数据门槛、模型排序回合、固定提交的文件树检查、模型选择回合 | [repository-screening.ts](../src/repository-screening.ts)、[github.ts](../src/github.ts)、[workflow.ts](../src/workflow.ts) |
+| 6 固定读取 | 选文件回合、有界读取、哈希、行范围、摘录、补充请求回合 | [file-ranking.ts](../src/file-ranking.ts)、[evidence.ts](../src/evidence.ts)、[workflow.ts](../src/workflow.ts) |
+| 7 生成计划 | 计划回合，host 校验 ID、引用、覆盖、依赖和具名错误实现 | [workflow.ts](../src/workflow.ts)、[model-schema.ts](../src/model-schema.ts) |
+| 8 独立复核 | 新会话复核、一次修正、再复核、Ready 或 Draft 的判断 | [workflow.ts](../src/workflow.ts)、[model-schema.ts](../src/model-schema.ts) |
+| 9 保存结果 | `plan.md`、两种 manifest、源码快照、补答文件的原子写入 | [report.ts](../src/report.ts)、[storage.ts](../src/storage.ts) |
+
+流程图由 [images/how-it-works.mjs](images/how-it-works.mjs) 从 Hairline 的线条图生成，生成方法见 README 的[致谢](../README.md#致谢)。
+
+## 数据流
+
 ```text
 CLI / JSON caller
        |
