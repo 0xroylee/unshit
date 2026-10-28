@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-39.08 -45.98 78.16 78.16" width="32" height="32" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
+<style>.plate{fill:#ffffff}.hi{stroke:#232327}.edge{stroke:#6e6e78}.mid{stroke:#a4a4ac}@media (prefers-color-scheme: dark){.plate{fill:#0d1117}.hi{stroke:#fafafa}.edge{stroke:#a1a1aa}.mid{stroke:#71717a}}</style>
+<path d="M24.25 14 L0 28 L0 11.2 L24.25 -2.8 Z" class="plate edge"/>
+<path d="M-24.25 14 L0 28 L0 11.2 L-24.25 -2.8 Z" class="plate edge"/>
+<path d="M0 -16.8 L24.25 -2.8 L0 11.2 L-24.25 -2.8 Z" class="plate mid"/>
+<path d="M-17.5 -8.81 A17.5 10 0 1 1 17.5 -8.81 A17.5 10 0 1 1 -17.5 -8.81 Z" class="plate edge"/>
+<path d="M-14.5 -18.3 A13.01 8.2 0 1 1 11.51 -18.3 A13.01 8.2 0 1 1 -14.5 -18.3 Z" class="plate edge"/>
+<path d="M-7.1 -26.31 A8.6 6.4 0 1 1 10.09 -26.31 A8.6 6.4 0 1 1 -7.1 -26.31 Z" class="plate edge"/>
+<path d="M-4 -30.3 C -4 -36.62, 3.9 -38.34, 5 -41.79 C 7.47 -38.57, 7 -35.47, 7 -30.3 Z" class="plate hi"/>
+</svg>
