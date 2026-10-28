@@ -21,7 +21,7 @@
 | 6 固定读取 | 选文件回合、有界读取、哈希、行范围、摘录、补充请求回合 | [file-ranking.ts](../src/file-ranking.ts)、[evidence.ts](../src/evidence.ts)、[workflow.ts](../src/workflow.ts) |
 | 7 生成计划 | 计划回合，host 校验 ID、引用、覆盖、依赖和具名错误实现 | [workflow.ts](../src/workflow.ts)、[model-schema.ts](../src/model-schema.ts) |
 | 8 独立复核 | 新会话复核、一次修正、再复核、Ready 或 Draft 的判断 | [workflow.ts](../src/workflow.ts)、[model-schema.ts](../src/model-schema.ts) |
-| 9 保存结果 | `plan.md`、`preview.html`、两种 manifest、源码快照、补答文件的原子写入，每次运行的写入都经过同一个队列 | [report.ts](../src/report.ts)、[storage.ts](../src/storage.ts) |
+| 9 保存结果 | `plan.md`、`preview.html`、`stack.html`、两种 manifest、源码快照、补答文件的原子写入，每次运行的写入都经过同一个队列 | [report.ts](../src/report.ts)、[storage.ts](../src/storage.ts) |
 
 流程图由 [images/how-it-works.mjs](images/how-it-works.mjs) 从 Hairline 的线条图生成，生成方法见 README 的[致谢](usage.zh-CN.md#流程图与致谢)。
 
@@ -48,6 +48,7 @@ turn / interrupt                                  v
 | [skill-install.ts](../src/skill-install.ts) | 内嵌 unshit agent skill（`src/resources/unshit-skill/SKILL.md`），写入 Claude Code 的 skills 目录和 Codex 的两个 skills 目录（`$CODEX_HOME/skills`、`~/.agents/skills`）；先写临时文件再改名；不覆盖非 unshit 安装的同名 skill（除非 `--force`）；`unshit` 文件夹或 `SKILL.md` 是符号链接时不跟随，skills 目录本身或更上层的符号链接照常跟随 |
 | [workflow.ts](../src/workflow.ts) | 需求门槛、答复后的 brief 重建、brief 批准门槛、候选预排序、筛选与选择、读取、计划生成、参考测试缺口、独立复核与有界修正（含存活错误实现和待决事项）、超时结果与检查点 |
 | [preview.ts](../src/preview.ts) | 运行步骤的顺序；预览记录器：登记 host 的记录（仓库、提交、文件、源码、摘录）并固定其类别，记录每一步用了哪些参考、怎么用；两版之间有变化的步骤；计划或复核引用的摘录 |
+| [stack.ts](../src/stack.ts) | 计划从下往上的积木（先是数据模型的实体，再是模块），以及每块积木引用的 host 摘录，按仓库和固定提交分组；积木页面所用的 logo 积木画法 |
 | [app-server.ts](../src/app-server.ts) | 原生双向 RPC、活动回合关联、最终文本、取消、空闲与总时长超时、失败原因和进程清理 |
 | [github.ts](../src/github.ts) | host-built GitHub 查询、Grep 代码搜索、质量门槛、固定提交树验证与 GitLab 官方 API 回退 |
 | [code-search.ts](../src/code-search.ts) | Grep 请求体、响应解析、按仓库聚合命中、批量 GitHub 元数据查询条件 |

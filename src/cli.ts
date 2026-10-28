@@ -15,7 +15,7 @@ import { REFERENCE_POLICY_HASH } from "./instructions.ts";
 import { parseApprovedBrief, stableMaterialQuestionId } from "./model-schema.ts";
 import { briefSha256, isBriefApproval, renderBriefForApproval } from "./brief-approval.ts";
 import { SKILL_NAME, defaultSkillTargets, installSkill, type SkillTarget } from "./skill-install.ts";
-import type { ApprovedBrief, IntakeBrief, MaterialQuestion, ProgressEvent, ResolvedAnswer, RunOutcome, WorkflowPreview } from "./types.ts";
+import type { ApprovedBrief, IntakeBrief, MaterialQuestion, PlanDocument, ProgressEvent, ResolvedAnswer, RunOutcome, WorkflowPreview } from "./types.ts";
 
 interface CliArguments {
   requirement: string;
@@ -422,30 +422,35 @@ export function createRunWriters(options: {
   };
 }
 
-// Publishes each preview revision through `publisher`: its source snapshots and page, then a report of it. A terminal
-// gets the page path once, then the stages that changed; JSONL gets one preview line per revision.
+// Publishes each preview revision through `publisher`: its source snapshots and page, and with a plan its stack page,
+// then a report of it. A terminal gets each page path once, then the stages that changed; JSONL gets one preview line
+// per revision.
 function createPreviewPublication(options: {
   evidenceDirectory: string;
   publisher: RunPublisher;
   jsonl: boolean;
   write: (text: string) => void;
   writer?: FileWriter;
-}): { publish: (preview: WorkflowPreview, evidence: LoadedEvidence) => Promise<void>; pagePath: () => string | undefined } {
+}): { publish: (preview: WorkflowPreview, evidence: LoadedEvidence, plan?: PlanDocument) => Promise<void>; pagePath: () => string | undefined } {
   const published = new Set<string>();
   let previous: WorkflowPreview | undefined;
   let pagePath: string | undefined;
+  let stackPath: string | undefined;
   return {
-    publish: (preview, evidence) => options.publisher.run(async () => {
-      const page = await writePreviewRevision({ evidenceDirectory: options.evidenceDirectory, preview, evidence, published, ...(options.writer ? { writer: options.writer } : {}) });
+    publish: (preview, evidence, plan) => options.publisher.run(async () => {
+      const written = await writePreviewRevision({ evidenceDirectory: options.evidenceDirectory, preview, evidence, published, ...(plan ? { plan } : {}), ...(options.writer ? { writer: options.writer } : {}) });
+      const page = written.page;
       if (options.jsonl) {
         const stages = changedStages(preview, previous);
         const keys = new Set(stages.flatMap((stage) => stage.uses.map((use) => use.key)));
-        options.write(`${JSON.stringify({ type: "preview", revision: preview.revision, page, stages, references: preview.references.filter((reference) => keys.has(reference.key)) })}\n`);
+        options.write(`${JSON.stringify({ type: "preview", revision: preview.revision, page, ...(written.stack ? { stack: written.stack } : {}), stages, references: preview.references.filter((reference) => keys.has(reference.key)) })}\n`);
       } else {
         if (!pagePath) options.write(`Reference preview page: ${page}\n`);
+        if (written.stack && !stackPath) options.write(`Stack page: ${written.stack}\n`);
         options.write(renderPreviewText(preview, previous));
       }
       pagePath = page;
+      stackPath = written.stack ?? stackPath;
       previous = preview;
     }),
     pagePath: () => pagePath,

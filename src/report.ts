@@ -1,6 +1,7 @@
 import { topologicalTasks } from "./model-schema.ts";
 import { requirementLabel } from "./brief-approval.ts";
 import { changedStages, previewStageTitle } from "./preview.ts";
+import { brickDrawing, stackLayers, type StackLayer } from "./stack.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import type { ExistingCommand } from "./types.ts";
 import type {
@@ -229,6 +230,7 @@ export function renderReport(input: ReportInput): string {
     lines.push("");
   }
 
+  const stack = stackLayers(plan, input.evidence);
   lines.push("## Architecture and data design", "", plan.design.architecture, "", "### Modules and interfaces", "");
   if (plan.design.modules.length === 0) lines.push("No module design passed host validation.", "");
   for (const module of plan.design.modules) {
@@ -270,6 +272,8 @@ export function renderReport(input: ReportInput): string {
     }
     lines.push("");
   }
+
+  if (stack.length > 0) lines.push(...stackMarkdown(stack), "");
 
   if (input.gaps.length > 0) {
     lines.push("## Evidence gaps", "");
@@ -540,15 +544,52 @@ function escapeHtml(value: string): string {
 }
 
 function bilingual(english: string, chinese: string): string {
-  return `<span lang="en">${escapeHtml(english)}</span> · <span lang="zh-CN">${escapeHtml(chinese)}</span>`;
+  return `<span lang="en">${escapeHtml(english)}</span><span lang="zh-CN">${escapeHtml(chinese)}</span>`;
 }
+
+// The language of a page, as on the site: ?lang= wins, then the saved choice, otherwise English; without script a page
+// stays English. The switch shows one language at a time.
+const LANGUAGE_HEAD = `<script>
+(function () {
+  var query = new URLSearchParams(location.search).get("lang");
+  var saved = null;
+  try { saved = localStorage.getItem("unshit-lang"); } catch (error) {}
+  var lang = query === "zh" || query === "en" ? query : saved === "zh" || saved === "en" ? saved : "en";
+  document.documentElement.setAttribute("data-lang", lang);
+  document.documentElement.setAttribute("lang", lang === "zh" ? "zh-CN" : "en");
+})();
+</script>`;
+const LANGUAGE_CSS = `html[data-lang="en"] [lang="zh-CN"], html[data-lang="zh"] [lang="en"] { display: none !important; }
+header.top { border-bottom: 0.9px solid var(--line); }
+header.top .bar { display: flex; align-items: center; gap: 24px; height: 60px; }
+.brand { font-weight: 650; letter-spacing: -0.01em; font-size: 18px; }
+.switch { display: flex; margin-left: auto; border: 0.9px solid var(--line-strong); border-radius: 999px; overflow: hidden; }
+.switch button { font: 13px var(--font); color: var(--muted); background: none; border: 0; padding: 4px 12px; cursor: pointer; }
+html[data-lang="en"] .switch [data-set-lang="en"], html[data-lang="zh"] .switch [data-set-lang="zh"] { color: var(--hi); box-shadow: inset 0 0 0 0.9px var(--hi); border-radius: 999px; }`;
+const LANGUAGE_SWITCH = `<span class="brand">unshit</span><div class="switch" role="group" aria-label="Language"><button type="button" data-set-lang="en">EN</button><button type="button" data-set-lang="zh">中文</button></div>`;
+const LANGUAGE_SCRIPT = `document.querySelectorAll("[data-set-lang]").forEach(function (button) {
+  button.addEventListener("click", function () {
+    var lang = button.getAttribute("data-set-lang");
+    document.documentElement.setAttribute("data-lang", lang);
+    document.documentElement.setAttribute("lang", lang === "zh" ? "zh-CN" : "en");
+    try { localStorage.setItem("unshit-lang", lang); } catch (error) {}
+  });
+});`;
+const PAGE_TOKENS = `:root { color-scheme: light dark; --bg: #ffffff; --text: #232327; --muted: #6e6e78; --line: #e0e0e4; --line-strong: #c3c3c9; --hi: #232327; --edge: #a4a4ac; --mid: #c3c3c9;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --text: #f0f0f3; --muted: #a1a1aa; --line: #27272a; --line-strong: #52525b; --hi: #fafafa; --edge: #a1a1aa; --mid: #52525b; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.65 var(--font); -webkit-font-smoothing: antialiased; }
+a { color: inherit; text-decoration-thickness: 0.5px; text-underline-offset: 3px; }`;
 
 function referenceAnchor(key: string): string {
   return `ref-${key.replace(/[^A-Za-z0-9_-]/g, "_")}`;
 }
 
-// The page of one preview revision, readable from disk with no remote asset or script. A snapshot link appears only for
-// a source whose file this run has written (`publishedSnapshots`); other links are host-built https URLs.
+// The page of one preview revision, readable from disk with no remote asset; its only script switches the language. A
+// snapshot link appears only for a source whose file this run has written (`publishedSnapshots`); other links are
+// host-built https URLs.
 export function renderPreviewHtml(preview: WorkflowPreview, publishedSnapshots: ReadonlySet<string>): string {
   const references = new Map(preview.references.map((reference) => [reference.key, reference]));
   const waiting = preview.stages.some((stage) => stage.id === "preview_confirmation" && stage.status === "waiting");
@@ -569,18 +610,18 @@ export function renderPreviewHtml(preview: WorkflowPreview, publishedSnapshots: 
     ? `<p class="note">${bilingual("The run is waiting at this preview. Type yes in the terminal to continue; any other reply stops it.", "运行在此预览处等待。在终端输入 yes 继续；其他回答会停止运行。")}</p>`
     : "";
   return `<!doctype html>
-<html lang="en">
+<html lang="en" data-lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>unshit: stages and references</title>
 <link rel="icon" href="data:,">
+${LANGUAGE_HEAD}
 <style>
-:root { color-scheme: light dark; --bg: #ffffff; --text: #232327; --muted: #6e6e78; --line: #e0e0e4; --line-strong: #c3c3c9; --hi: #232327; }
-@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --text: #f0f0f3; --muted: #a1a1aa; --line: #27272a; --line-strong: #52525b; --hi: #fafafa; } }
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
-main { max-width: 980px; margin: 0 auto; padding: 48px 24px 72px; }
+${PAGE_TOKENS}
+${LANGUAGE_CSS}
+header.top .bar, main { max-width: 980px; margin: 0 auto; padding-left: 24px; padding-right: 24px; }
+main { padding-top: 48px; padding-bottom: 72px; }
 h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.2; margin: 0 0 12px; }
 h2 { font-size: 16px; font-weight: 620; margin: 0; }
 code, .num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
@@ -606,10 +647,11 @@ section.references { margin-top: 48px; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 8px 0 0; font-size: 14px; }
 dt { color: var(--muted); }
 dd { margin: 0; overflow-wrap: anywhere; }
-@media (max-width: 820px) { main { padding: 32px 16px 56px; } dl { grid-template-columns: 1fr; } dd { margin-bottom: 6px; } }
+@media (max-width: 820px) { header.top .bar, main { padding-left: 16px; padding-right: 16px; } main { padding-top: 32px; padding-bottom: 56px; } dl { grid-template-columns: 1fr; } dd { margin-bottom: 6px; } }
 </style>
 </head>
 <body>
+<header class="top"><div class="bar">${LANGUAGE_SWITCH}</div></header>
 <main>
 <h1>${bilingual("Stages and references", "步骤与参考")}</h1>
 <p class="lede">${bilingual(`Revision ${preview.revision}. ${PREVIEW_INTRO}`, `第 ${preview.revision} 版。${PREVIEW_INTRO_ZH}`)}</p>
@@ -622,9 +664,191 @@ ${stages}
 ${registry}
 </section>
 </main>
+<script>
+${LANGUAGE_SCRIPT}
+</script>
 </body>
 </html>
 `;
+}
+
+const STACK_PITCH = 32;
+// How far the bricks above an open brick lift, in px.
+const STACK_GAP = 96;
+
+// The plan's modules and data model as one tower of toy bricks, drawn as the logo draws its bricks, in a full-width
+// viewer of fixed height. At rest the bricks sit on each other. Hovering a brick, focusing it or pressing it opens it:
+// the bricks above lift, and the right pane shows the repositories and code behind it. With script, the last brick
+// opened stays open until another one opens; without script, a brick is open while it is hovered or focused. Links are
+// host-built https permalinks, and snapshot links only for sources whose file this run has written.
+export function renderStackHtml(plan: PlanDocument, layers: StackLayer[], publishedSnapshots: ReadonlySet<string>): string {
+  const brick = brickDrawing(STACK_PITCH);
+  const count = layers.length;
+  const repositories = new Set(layers.flatMap((layer) => layer.support.flatMap((support) => support.repository ? [support.repository] : [])));
+  const brickSvg = (dashed: boolean): string => `<svg class="brick${dashed ? " new" : ""}" viewBox="${brick.viewBox}" width="${Math.round(brick.width)}" height="${Math.round(brick.height)}" aria-hidden="true">${brick.paths.map((path) => `<path class="${path.kind}" d="${path.d}"/>`).join("")}</svg>`;
+  // The tower lists the top brick first; brick 01 is the bottom one.
+  const ordered = layers.map((layer, index) => ({ layer, number: index + 1 })).reverse();
+  const rows = ordered.map(({ layer, number }, position) => {
+    const kind = layer.kind === "data" ? ` · ${bilingual("Data", "数据")}` : "";
+    return `<li class="layer" data-i="${number}" style="--top:${(STACK_GAP + position * brick.step).toFixed(1)}; z-index:${count - position}">
+<button type="button" class="face" aria-expanded="false" aria-controls="brick-${number}">${brickSvg(layer.support.length === 0)}<span class="tag"><span class="n">${String(number).padStart(2, "0")}${kind}</span> <span class="name">${escapeHtml(layer.name)}</span></span></button>
+</li>`;
+  }).join("\n");
+  const details = ordered.map(({ layer, number }) => {
+    const groups = layer.support.map((support) => {
+      const heading = support.repository
+        ? `${escapeHtml(support.repository)}${support.commitSha ? ` <code>@${escapeHtml(support.commitSha.slice(0, 12))}</code>` : ""}`
+        : bilingual("Local project", "本地项目");
+      const files = support.files.map((file) => {
+        const label = `${escapeHtml(file.path)} L${file.startLine}-L${file.endLine}`;
+        const url = safePreviewUrl(file.url);
+        const local = !url && publishedSnapshots.has(file.sourceId) && /^sources\/[A-Za-z0-9_-]+\.txt$/.test(file.snapshotPath);
+        const where = url ? `<a class="path" href="${escapeHtml(url)}">${label}</a>` : local ? `<a class="path" href="${escapeHtml(file.snapshotPath)}">${label}</a>` : `<code class="path">${label}</code>`;
+        return `<li>${where}<p class="claim">${escapeHtml(file.claim)}</p></li>`;
+      }).join("");
+      return `<div class="group"><h3>${heading}</h3><ul>${files}</ul></div>`;
+    });
+    if (layer.newDesignReason) groups.push(`<div class="group"><h3>${bilingual("New design", "新设计")}</h3><p class="claim">${escapeHtml(layer.newDesignReason)}</p></div>`);
+    if (groups.length === 0) groups.push(`<div class="group"><p class="claim">${bilingual("No cited source and no new-design reason.", "没有引用的源码，也没有新设计的理由。")}</p></div>`);
+    const names = layer.support.map((support) => support.repository ?? "local project");
+    const summary = names.length > 0
+      ? bilingual(`${names.join(", ")}${layer.newDesignReason ? "; new design" : ""}`, `${names.map((name) => name === "local project" ? "本地项目" : name).join("，")}${layer.newDesignReason ? "；新设计" : ""}`)
+      : layer.newDesignReason ? bilingual("new design, no reference", "新设计，没有参考") : bilingual("no reference", "没有参考");
+    return `<section class="detail" id="brick-${number}" data-i="${number}" aria-label="${escapeHtml(layer.name)}">
+<p class="label">${String(number).padStart(2, "0")} · ${bilingual(layer.kind === "data" ? "Data entity" : "Module", layer.kind === "data" ? "数据实体" : "模块")}</p>
+<h2>${escapeHtml(layer.name)}</h2>
+<p class="what">${escapeHtml(layer.description)}</p>
+<p class="sources">${summary}</p>
+${groups.join("\n")}
+</section>`;
+  }).join("\n");
+  const open = layers.map((_, index) => index + 1).flatMap((number) => [
+    `.stack[data-js]:has(.layer.active[data-i="${number}"]) .detail[data-i="${number}"]`,
+    `.stack:not([data-js]):has(.layer[data-i="${number}"]:hover) .detail[data-i="${number}"]`,
+    `.stack:not([data-js]):not(:has(.layer:hover)):has(.layer[data-i="${number}"] .face:focus-visible) .detail[data-i="${number}"]`,
+  ]).join(",\n");
+  const towerHeight = STACK_GAP + Math.max(0, count - 1) * brick.step + brick.height;
+  return `<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>unshit: stack</title>
+<link rel="icon" href="data:,">
+${LANGUAGE_HEAD}
+<style>
+${PAGE_TOKENS}
+${LANGUAGE_CSS}
+header.top .bar { padding: 0 32px; }
+.stack { display: grid; grid-template-columns: minmax(440px, 40%) 1fr; height: calc(100vh - 61px); }
+.left { display: flex; flex-direction: column; border-right: 0.9px solid var(--line); padding: 40px 32px 32px; min-height: 0; }
+.meta { font: 13px var(--mono); color: var(--muted); margin: 0 0 10px; }
+h1 { font-size: 30px; letter-spacing: -0.015em; font-weight: 650; line-height: 1.25; margin: 0 0 10px; }
+.lede { font-size: 17px; color: var(--muted); max-width: 560px; margin: 0; }
+/* --s scales the drawing; label text keeps its size. */
+.tower { --s: 1; position: relative; list-style: none; margin: auto 0; padding: 0; height: calc(${Math.round(towerHeight)}px * var(--s)); flex: none; }
+.layer { position: absolute; left: 0; right: 0; top: calc(var(--top) * var(--s) * 1px); height: calc(${Math.round(brick.height)}px * var(--s)); pointer-events: none; transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+.face { position: relative; display: block; width: 100%; height: 100%; padding: 0; margin: 0; border: 0; background: none; font: inherit; color: inherit; text-align: left; cursor: pointer; pointer-events: none; }
+.face:focus-visible { outline: none; }
+.face:focus-visible .tag { outline: 0.9px solid var(--hi); outline-offset: 4px; border-radius: 4px; }
+.brick { display: block; overflow: visible; width: calc(${Math.round(brick.width)}px * var(--s)); height: auto; }
+.brick path { fill: var(--bg); stroke-width: 0.9; stroke-linejoin: round; pointer-events: visiblePainted; }
+.brick path.open { fill: none; pointer-events: none; }
+.brick .edge { stroke: var(--edge); }
+.brick .mid { stroke: var(--mid); }
+.brick.new path { stroke-dasharray: 2 3; }
+.tag { position: absolute; left: calc(${Math.round(brick.width + 24)}px * var(--s)); right: 0; top: calc(${Math.round(brick.labelY)}px * var(--s) - 13px); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: auto; line-height: 26px; }
+.n { font: 13px var(--mono); color: var(--muted); margin-right: 8px; }
+.name { font-size: 17px; font-weight: 620; }
+/* Open: every brick above the open one lifts, and the open brick takes the lit stroke. */
+.stack[data-js] .layer:has(~ .layer.active), .stack:not([data-js]) .layer:has(~ .layer:hover),
+.stack:not([data-js]):not(:has(.layer:hover)) .layer:has(~ .layer .face:focus-visible) { transform: translateY(calc(-${STACK_GAP}px * var(--s))); }
+.stack[data-js] .layer.active .brick path, .stack:not([data-js]) .layer:hover .brick path,
+.stack:not([data-js]):not(:has(.layer:hover)) .layer:has(.face:focus-visible) .brick path { stroke: var(--hi); }
+.stack[data-js] .layer.active .name, .stack:not([data-js]) .layer:hover .name { text-decoration: underline; text-decoration-thickness: 0.9px; text-underline-offset: 5px; }
+.right { overflow-y: auto; padding: 48px 56px 64px; min-height: 0; }
+.detail { display: none; max-width: 700px; }
+${open} { display: block; }
+.hint { max-width: 620px; margin: 0; font-size: 18px; color: var(--muted); }
+.hint p { margin: 0 0 16px; }
+.stack[data-js]:has(.layer.active) .hint, .stack:not([data-js]):has(.layer:hover, .face:focus-visible) .hint { display: none; }
+.label { font: 13px var(--mono); color: var(--muted); margin: 0 0 6px; }
+.detail h2 { font-size: 30px; letter-spacing: -0.015em; font-weight: 650; line-height: 1.25; margin: 0 0 14px; }
+.what { font-size: 18px; line-height: 1.6; margin: 0 0 10px; }
+.sources { font-size: 15px; color: var(--muted); margin: 0 0 8px; }
+.group { border-top: 0.9px solid var(--line); padding: 20px 0 4px; margin-top: 20px; }
+.group h3 { font-size: 18px; font-weight: 620; margin: 0 0 12px; }
+.group h3 code { font: 14px var(--mono); color: var(--muted); font-weight: 400; margin-left: 4px; }
+.group ul { margin: 0; padding: 0; list-style: none; }
+.group li { margin: 0 0 16px; }
+.path { font: 15px/1.5 var(--mono); overflow-wrap: anywhere; }
+.claim { font-size: 16px; line-height: 1.65; margin: 4px 0 0; }
+@media (prefers-reduced-motion: reduce) { .layer { transition: none; } }
+@media (max-width: 820px) {
+  header.top .bar { padding: 0 20px; }
+  .stack { grid-template-columns: 1fr; height: auto; }
+  .left { border-right: 0; border-bottom: 0.9px solid var(--line); padding: 32px 20px 24px; }
+  .tower { --s: 0.75; margin: 32px 0 0; }
+  .right { overflow: visible; padding: 32px 20px 56px; }
+}
+</style>
+</head>
+<body>
+<header class="top"><div class="bar">${LANGUAGE_SWITCH}</div></header>
+<main class="stack">
+<div class="left">
+<p class="meta">${bilingual(`${count} bricks, ${repositories.size} reference repositories`, `${count} 块积木，${repositories.size} 个参考仓库`)}</p>
+<h1>${escapeHtml(plan.title)}</h1>
+<p class="lede">${bilingual("Each brick is a module of the plan or an entity of its data model, from the bottom up.", "每块积木是计划里的一个模块或数据实体，从下往上叠。")}</p>
+<ol class="tower">
+${rows}
+</ol>
+</div>
+<div class="right">
+<div class="hint">
+<p>${bilingual("Hover over a brick, or select it, to open it. This side then shows the repositories and the code behind it, and stays until you open another brick.", "把鼠标移到积木上，或选中它，积木就会打开。这一侧会显示支撑它的仓库和代码，直到你打开另一块积木。")}</p>
+<p>${bilingual("A dashed brick has no cited source. The sentence under each file is the model's claim: the host checked that each cited excerpt exists at the pinned commit, not that it supports the claim.", "虚线积木没有引用的源码。每个文件下的说明是模型的主张：host 只检查了引用的摘录在固定提交中存在，没有检查它是否支持这个主张。")}</p>
+</div>
+${details}
+</div>
+</main>
+<script>
+${LANGUAGE_SCRIPT}
+// The last brick opened by hover, focus or press stays open until another brick opens; Escape closes it.
+var stack = document.querySelector(".stack");
+stack.setAttribute("data-js", "");
+function openBrick(layer) {
+  stack.querySelectorAll(".layer").forEach(function (other) {
+    other.classList.toggle("active", other === layer);
+    other.querySelector(".face").setAttribute("aria-expanded", other === layer ? "true" : "false");
+  });
+}
+stack.querySelectorAll(".layer").forEach(function (layer) {
+  var face = layer.querySelector(".face");
+  face.addEventListener("pointerover", function () { openBrick(layer); });
+  face.addEventListener("focus", function () { openBrick(layer); });
+  face.addEventListener("click", function () { openBrick(layer); });
+});
+document.addEventListener("keydown", function (event) { if (event.key === "Escape") openBrick(null); });
+</script>
+</body>
+</html>
+`;
+}
+
+// One cell of a Markdown table: a single code span, with each pipe escaped so that it stays in its cell.
+function tableCode(value: string): string {
+  return markdownCode(value).replace(/\|/g, "\\|");
+}
+
+// The plan.md Stack section: one row per brick, from the bottom up. Names are untrusted text, so each is a code span.
+function stackMarkdown(layers: StackLayer[]): string[] {
+  const lines = ["## Stack", "", "Each brick is a module of the plan or an entity of its data model, from the bottom up. `stack.html` in the run folder shows the files behind each brick.", "", "| Brick | Name | Reference repositories | New design |", "| --- | --- | --- | --- |"];
+  layers.forEach((layer, index) => {
+    const repositories = layer.support.map((support) => support.repository ? tableCode(support.repository) : "local project").join(", ") || "none";
+    lines.push(`| ${String(index + 1).padStart(2, "0")}${layer.kind === "data" ? " (data)" : ""} | ${tableCode(layer.name)} | ${repositories} | ${layer.newDesignReason ? "yes" : "no"} |`);
+  });
+  return lines;
 }
 
 function referenceDetails(reference: PreviewReference, publishedSnapshots: ReadonlySet<string>): string {

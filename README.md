@@ -35,7 +35,7 @@ unshit "Build an event ticketing system for one team, with ticket sales, refunds
 
 1. Answer its business questions.
 2. Read the brief and type `yes`. After the search, check the references it found and type `yes` again.
-3. Wait 15 to 30 minutes. The plan is saved in `.unshit/<run-id>/plan.md`, and `preview.html` next to it shows each step with the references it used.
+3. Wait 15 to 30 minutes. The plan is saved in `.unshit/<run-id>/plan.md`. Next to it, `preview.html` shows each step with the references it used, and `stack.html` shows the plan's modules as a stack of bricks: open a brick to see the code behind it.
 
 You can also ask Claude Code or Codex to "use unshit to plan …", and then to implement the plan.
 

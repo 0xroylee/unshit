@@ -1,6 +1,6 @@
 # DESIGN.md
 
-The visual and writing style of the unshit site (`docs/index.html`) and its diagrams (`docs/images/`). Follow it when you change either, or when you add a page or a figure. The values below are the ones in the code. If you change a value, change it here and in the code in the same commit.
+The visual and writing style of the unshit site (`docs/index.html`), its diagrams (`docs/images/`), and the pages that each run writes (`preview.html` and `stack.html`). Follow it when you change either, or when you add a page or a figure. The values below are the ones in the code. If you change a value, change it here and in the code in the same commit.
 
 ## Principles
 
@@ -71,7 +71,7 @@ Text stays at WCAG AA contrast (4.5:1) or better. Line colours are decoration, n
 
 ## Layout
 
-- The content column is at most 980px wide, with 24px side padding.
+- The content column is at most 980px wide, with 24px side padding. The stack page is the exception: it fills the width of the window (see Stack page).
 - Sections are separated by a 0.9px `--line` border. Their padding is 72px top and bottom; the hero has 96px and 72px.
 - Grids:
 
@@ -102,7 +102,7 @@ Text stays at WCAG AA contrast (4.5:1) or better. Line colours are decoration, n
 
 ## Figures and diagrams
 
-- Illustrations are Hairline figures only (`@lucasmarkes/hairline`, MIT, © Lucas Marques). The logo is the one drawn mark, and it follows the same rules (see Logo). Do not mix in another illustration style. Do not add colour, fills, shadows or text inside a figure.
+- Illustrations are Hairline figures only (`@lucasmarkes/hairline`, MIT, © Lucas Marques). The logo is the one drawn mark, and it follows the same rules (see Logo); the bricks of the stack page are drawn the same way as the logo's bricks (see Stack page). Do not mix in another illustration style. Do not add colour, fills, shadows or text inside a figure.
 - Labels go outside a figure, below it, as captions.
 - The pipeline diagram:
   - It is 900 units wide, in three columns of 300.
@@ -125,6 +125,18 @@ Figures used for the steps:
 | 7 Plan | `rebuild` | a dependency tree of tasks |
 | 8 Independent review | `format` | crooked lines that snap square |
 | 9 Save | `cabinet` | stored snapshots |
+
+## Stack page
+
+`stack.html`, which `renderStackHtml` in `src/report.ts` writes for each run, shows the plan as a tower of toy bricks: one brick per entity of the data model, at the bottom, then one per module, in the plan's order.
+
+- **Bricks.** The logo's 2×4 brick (`brickDrawing` in `src/stack.ts`): isometric at 30°, 1.2 pitches high, eight studs, a pitch of 32px. Plates fill with the background colour; faces use `edge`, the top face and the stud tops `mid`, both 0.9px. A brick with no cited source is dashed (`2 3`).
+- **Tower.** At rest, each brick sits 1.2 pitches above the one below it, so the studs of a lower brick are covered. The number and name of each brick sit to the right of its right face, outside the drawing.
+- **Open.** Hovering a brick, focusing it with Tab or pressing it opens it: every brick above lifts by 96px in 180ms (no movement under `prefers-reduced-motion`), the open brick takes the `hi` stroke, and its name is underlined. With script, the last brick opened stays open until another one opens, and Escape closes it; without script, a brick is open while it is hovered or focused.
+- **Layout.** A full-width viewer, an exception to the 980px column: the 60px header, then two columns as tall as the rest of the window. The left one (at least 440px, 40%) holds the plan title and the tower; the right one scrolls on its own and holds the open brick's detail, at most 700px wide. Below 820px the columns stack, the page scrolls, and the drawing scales to 0.75 while the labels keep their size.
+- **Detail text.** Module name 30px; what it does 18px; claims and new-design reasons 16px/1.65 in `--text`; file paths 15px in the code font; labels and commit hashes in `--muted`.
+
+The step page `preview.html` keeps the 980px column. Both pages use the site's colour tokens and its language switch.
 
 ## Logo
 
@@ -150,7 +162,7 @@ The mark is a stack of toy bricks with a poop on top: a 2×2 brick on the left h
 
 ## Language
 
-- Every visible string on the site has an English element (`lang="en"`) and a Chinese element (`lang="zh-CN"`). CSS shows the pair that matches `html[data-lang]`.
+- Every visible string on the site, and on the pages each run writes, has an English element (`lang="en"`) and a Chinese element (`lang="zh-CN"`). CSS shows the pair that matches `html[data-lang]`.
 - The page shows English unless `?lang=zh` or a saved choice asks for Chinese. Without script it shows English.
 - Chinese text is simplified Chinese. Product terms stay in English in both languages: brief, host, Codex, Ready, Draft, `plan.md`.
 - The two versions say the same thing. Change both in the same commit.

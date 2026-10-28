@@ -445,6 +445,8 @@ export interface RunArtifacts {
   manifestPath: string;
   // The stage-and-reference page, when the run wrote one.
   previewPath?: string;
+  // The plan's modules and data model as a tower of bricks, when the plan has any.
+  stackPath?: string;
 }
 
 // The stages of a run in the stage-and-reference preview, in run order (PREVIEW_STAGES in src/preview.ts).
