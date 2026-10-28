@@ -3,7 +3,8 @@
 // script or stylesheet, and nine of them are laid out as a numbered pipeline with captions.
 // Usage: node docs/images/how-it-works.mjs <tool dir>
 //   <tool dir> is any directory with `npm install @lucasmarkes/hairline playwright-core` done in it; Google Chrome
-//   must be installed. Writes how-it-works-light.svg and how-it-works-dark.svg next to this script.
+//   must be installed. Writes, next to this script, how-it-works-{light,dark}.svg (Chinese captions) and
+//   how-it-works-en-{light,dark}.svg (English captions).
 import { createRequire } from "node:module";
 import { createServer } from "node:http";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
@@ -16,16 +17,17 @@ const outDir = dirname(fileURLToPath(import.meta.url));
 const { chromium } = createRequire(join(pkgDir, "package.json"))("playwright-core");
 
 const STEPS = [
-  { figure: "query", title: "提问", who: "Codex", lines: ["从需求提取要求与验收", "缺业务决定时先问你"] },
-  { figure: "padlock", title: "批准 brief", who: "你", lines: ["你确认整份 brief", "终端输入 yes 或补答文件"] },
-  { figure: "drawer", title: "本地项目", who: "", lines: ["读取目标项目的文件与脚本", "凭证先遮蔽"] },
-  { figure: "loupe", title: "搜索候选", who: "", lines: ["host 构造的 GitHub 查询", "加上 Grep 代码搜索"] },
-  { figure: "sieve", title: "筛选参考", who: "Codex", lines: ["元数据门槛、模型排序", "固定提交的测试与许可证检查"] },
-  { figure: "branches", title: "固定读取", who: "", lines: ["按提交读取源码", "记录 SHA-256 与行号"] },
-  { figure: "rebuild", title: "生成计划", who: "Codex", lines: ["按依赖排序的任务", "验收与具名错误实现"] },
-  { figure: "format", title: "独立复核", who: "Codex", lines: ["新会话复核", "最多修正一次"] },
-  { figure: "cabinet", title: "保存结果", who: "", lines: ["plan.md、manifest、源码快照", "Ready 或 Draft"] },
+  { figure: "query", zh: { title: "提问", who: "Codex", lines: ["从需求提取要求与验收", "缺业务决定时先问你"] }, en: { title: "Ask", who: "Codex", lines: ["Extracts requirements and acceptance", "Asks when a business decision is missing"] } },
+  { figure: "padlock", zh: { title: "批准 brief", who: "你", lines: ["你确认整份 brief", "终端输入 yes 或补答文件"] }, en: { title: "Approve the brief", who: "you", lines: ["You confirm the whole brief", "yes in the terminal, or the answers file"] } },
+  { figure: "drawer", zh: { title: "本地项目", who: "", lines: ["读取目标项目的文件与脚本", "凭证先遮蔽"] }, en: { title: "Local project", who: "", lines: ["Reads the target project's files and scripts", "Credentials are redacted first"] } },
+  { figure: "loupe", zh: { title: "搜索候选", who: "", lines: ["host 构造的 GitHub 查询", "加上 Grep 代码搜索"] }, en: { title: "Search", who: "", lines: ["Host-built GitHub queries", "plus Grep code search"] } },
+  { figure: "sieve", zh: { title: "筛选参考", who: "Codex", lines: ["元数据门槛、模型排序", "固定提交的测试与许可证检查"] }, en: { title: "Screen references", who: "Codex", lines: ["Metadata bar and model ranking", "Pinned checks for tests and a license"] } },
+  { figure: "branches", zh: { title: "固定读取", who: "", lines: ["按提交读取源码", "记录 SHA-256 与行号"] }, en: { title: "Pinned reads", who: "", lines: ["Reads source at a pinned commit", "Records SHA-256 and line ranges"] } },
+  { figure: "rebuild", zh: { title: "生成计划", who: "Codex", lines: ["按依赖排序的任务", "验收与具名错误实现"] }, en: { title: "Plan", who: "Codex", lines: ["Tasks in dependency order", "Acceptance, named wrong implementations"] } },
+  { figure: "format", zh: { title: "独立复核", who: "Codex", lines: ["新会话复核", "最多修正一次"] }, en: { title: "Independent review", who: "Codex", lines: ["A fresh session reviews the plan", "At most one repair"] } },
+  { figure: "cabinet", zh: { title: "保存结果", who: "", lines: ["plan.md、manifest、源码快照", "Ready 或 Draft"] }, en: { title: "Save", who: "", lines: ["plan.md, manifest, source snapshots", "Ready or Draft"] } },
 ];
+const LANGUAGES = { zh: "", en: "-en" };
 
 const THEMES = {
   light: { plate: "#ffffff", hi: "#232327", edge: "#a4a4ac", mid: "#c3c3c9", lo: "#e0e0e4", title: "#232327", text: "#6e6e78", line: "#a4a4ac" },
@@ -108,7 +110,7 @@ function chevron(x, y, direction, color) {
   return `<path d="${d}" fill="none" stroke="${color}" stroke-width="0.9" stroke-linecap="round" stroke-linejoin="round"/>`;
 }
 
-function diagram(themeName) {
+function diagram(themeName, language) {
   const t = THEMES[themeName];
   const parts = [];
   STEPS.forEach((step, index) => {
@@ -116,9 +118,10 @@ function diagram(themeName) {
     parts.push(`<g transform="translate(${x.toFixed(1)} ${(y + 4).toFixed(1)}) scale(${SCALE})">${figures[`${themeName}:${step.figure}`]}</g>`);
     const cx = x + FIG_W / 2;
     const top = y + FIG_H + 22;
-    const tag = step.who ? `<tspan dx="8" font-size="11" fill="${t.text}">${esc(step.who)}</tspan>` : "";
-    parts.push(`<text x="${cx.toFixed(1)}" y="${top.toFixed(1)}" text-anchor="middle" font-size="15" font-weight="600" fill="${t.title}">${index + 1}  ${esc(step.title)}${tag}</text>`);
-    step.lines.forEach((line, lineIndex) => {
+    const text = step[language];
+    const tag = text.who ? `<tspan dx="8" font-size="11" fill="${t.text}">${esc(text.who)}</tspan>` : "";
+    parts.push(`<text x="${cx.toFixed(1)}" y="${top.toFixed(1)}" text-anchor="middle" font-size="15" font-weight="600" fill="${t.title}">${index + 1}  ${esc(text.title)}${tag}</text>`);
+    text.lines.forEach((line, lineIndex) => {
       parts.push(`<text x="${cx.toFixed(1)}" y="${(top + 20 + lineIndex * 17).toFixed(1)}" text-anchor="middle" font-size="12.5" fill="${t.text}">${esc(line)}</text>`);
     });
   });
@@ -151,10 +154,10 @@ ${parts.join("\n")}
 }
 
 await mkdir(outDir, { recursive: true });
-for (const themeName of Object.keys(THEMES)) {
-  const svg = diagram(themeName);
-  await writeFile(join(outDir, `how-it-works-${themeName}.svg`), svg);
-  console.log(`${themeName}: ${(svg.length / 1024).toFixed(0)} KB`);
+for (const [language, suffix] of Object.entries(LANGUAGES)) for (const themeName of Object.keys(THEMES)) {
+  const svg = diagram(themeName, language);
+  await writeFile(join(outDir, `how-it-works${suffix}-${themeName}.svg`), svg);
+  console.log(`${language} ${themeName}: ${(svg.length / 1024).toFixed(0)} KB`);
 }
 
 await browser.close();

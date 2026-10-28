@@ -36,7 +36,9 @@ intake → material answers → brief rebuild → brief approval → local basel
 | `docs/architecture.md` | Module boundaries and the pinned reference sources behind them |
 | `docs/specs/unshit.md` | Accepted requirements and acceptance criteria |
 | `docs/verification.md` | Records of checks and live runs, with dates and limits |
-| `docs/images/` | The "how it works" diagram (light and dark SVG) and `how-it-works.mjs`, which generates it from Hairline figures |
+| `docs/images/` | The "how it works" diagram (Chinese and English captions, light and dark SVG each) and `how-it-works.mjs`, which generates it from Hairline figures |
+| `docs/index.html` | The GitHub Pages site (one page, English and simplified Chinese), served from `docs/` on `main`; `docs/.nojekyll` turns off Jekyll |
+| `README.en.md`, `docs/*.en.md` | English versions of README.md, `docs/architecture.md` and `docs/specs/unshit.md` |
 | `install.sh` | Production install (clean clone of `--ref`, checks, build) and `--dev` install |
 
 ## Commands
@@ -83,9 +85,10 @@ These are product guarantees. Keep them, and keep their tests.
 
 ## Docs
 
-- README.md and everything under docs/ are written in simplified Chinese; keep them in Chinese. Code, comments, test names, commit messages and PR text are in English.
+- README.md and the Markdown files under docs/ are written in simplified Chinese. README.en.md, `docs/architecture.en.md` and `docs/specs/unshit.en.md` are their English versions; `docs/verification.md` has none. When you change one language, change the other in the same commit. Code, comments, test names, commit messages and PR text are in English.
+- `docs/index.html` summarizes README in both languages. When steps, limits, commands or exit codes change, update it too.
 - When a limit, flag, message, exit code or readiness rule changes, update README.md and `docs/architecture.md` in the same change.
-- When the steps of a run change, update `STEPS` in `docs/images/how-it-works.mjs`, regenerate both SVGs (README "致谢" says how), and keep README's "工作原理" list and the step table in `docs/architecture.md` in line with them. Do not edit the SVG files by hand.
+- When the steps of a run change, update `STEPS` in `docs/images/how-it-works.mjs` (both languages), regenerate the four SVGs (README "致谢" says how), and keep the step lists in both READMEs, the step tables in both architecture files and the site in line with them. Do not edit the SVG files by hand.
 - Each paragraph in README.md and `docs/architecture.md` is one long line, so two branches that edit the same paragraph conflict. Check with `git merge-tree --write-tree main <branch>`.
 
 ## Branches, commits and pull requests
