@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
+  <img alt="unshit 标志：2×4 和 2×2 积木上面放着一坨便便" src="docs/images/logo-light.svg" width="96">
+</picture>
+
 # unshit
 
 简体中文 · [English](README.en.md) · [网站](https://0xroylee.github.io/unshit/)

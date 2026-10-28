@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
+  <img alt="unshit logo: a poop on top of a 2×2 and a 2×4 brick" src="docs/images/logo-light.svg" width="96">
+</picture>
+
 # unshit
 
 [简体中文](README.md) · English · [Website](https://0xroylee.github.io/unshit/)

@@ -102,7 +102,7 @@ Text stays at WCAG AA contrast (4.5:1) or better. Line colours are decoration, n
 
 ## Figures and diagrams
 
-- Illustrations are Hairline figures only (`@lucasmarkes/hairline`, MIT, © Lucas Marques). Do not mix in another illustration style. Do not add colour, fills, shadows or text inside a figure.
+- Illustrations are Hairline figures only (`@lucasmarkes/hairline`, MIT, © Lucas Marques). The logo is the one drawn mark, and it follows the same rules (see Logo). Do not mix in another illustration style. Do not add colour, fills, shadows or text inside a figure.
 - Labels go outside a figure, below it, as captions.
 - The pipeline diagram:
   - It is 900 units wide, in three columns of 300.
@@ -125,6 +125,28 @@ Figures used for the steps:
 | 7 Plan | `rebuild` | a dependency tree of tasks |
 | 8 Independent review | `format` | crooked lines that snap square |
 | 9 Save | `cabinet` | stored snapshots |
+
+## Logo
+
+The mark is a stack of toy bricks with a poop on top: a 2×2 brick on the left half of a 2×4 brick, and the poop on the 2×2. The bricks stand for parts that already exist and were checked. The poop stands for the invented code that unshit is meant to replace. The lit stroke is the curled tip of the poop.
+
+- **Construction** (`docs/images/logo.mjs`):
+  - Isometric at 30°.
+  - Bricks: one stud pitch is 14 units, a brick is 1.2 pitches high, and a stud has a radius of 0.3 and a height of 0.2 pitches.
+  - Poop: three soft tiers, each an ellipse whose lower half shows below the tier above, shifted left and right for the swirl. A curled tip sits on top.
+  - Opaque plates in the background colour, with `edge` for silhouettes, `mid` for inner lines and `hi` for the tip.
+  - The stroke is 1.1 units.
+- **Files.** Never edit these by hand; regenerate them with `node docs/images/logo.mjs`.
+  - `logo-light.svg` and `logo-dark.svg` hold the mark; pick between them with `<picture>`.
+  - `favicon.svg` is a single 2×2 brick with the poop, with heavier lines (2.2 units) and darker greys. It switches theme through `prefers-color-scheme` inside the SVG.
+- **Sizes:**
+  - The full mark at 48px or larger: the README shows it at 96px, the site hero at 112px.
+  - Below 48px, use the favicon drawing: the site header at 26px, and the browser tab.
+- **Don't:**
+  - Colour it, give the poop a face, fill faces with grey, add shadows, or rotate it.
+  - Put text inside it.
+  - Draw the poop without the bricks.
+- **With the name:** set "unshit" in the text font, weight 650, next to the mark with a 10px gap, as the site header does.
 
 ## Language
 
