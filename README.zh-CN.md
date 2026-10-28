@@ -35,7 +35,7 @@ unshit "为单个团队构建活动售票系统，支持售票、退款和入场
 
 1. 回答它提出的业务问题。
 2. 读一遍 brief，输入 `yes`。搜索之后，看一下它找到的参考，再输入一次 `yes`。
-3. 等十几到三十分钟，计划保存在 `.unshit/<run-id>/plan.md`，旁边的 `preview.html` 列出每一步用到的参考。
+3. 等十几到三十分钟，计划保存在 `.unshit/<run-id>/plan.md`。旁边的 `preview.html` 列出每一步用到的参考，`stack.html` 把计划的模块画成一叠积木：打开一块积木，就能看到支撑它的代码。
 
 也可以在 Claude Code 或 Codex 里说“用 unshit 规划……”，再请它按计划实施。
 

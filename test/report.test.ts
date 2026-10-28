@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { renderPreviewHtml, renderPreviewText, renderReport } from "../src/report.ts";
+import { renderPreviewHtml, renderPreviewText, renderReport, renderStackHtml } from "../src/report.ts";
+import { stackLayers } from "../src/stack.ts";
 import { parseIntake } from "../src/model-schema.ts";
 import { candidateReference, createPreviewRecorder, evidenceReferences } from "../src/preview.ts";
 import type { BriefApproval, EvidenceSource, FinalSource, PlanDocument, PlanTask, PreviewUse, RepositoryChoice, ResearchSummary, WorkflowPreview } from "../src/types.ts";
@@ -846,7 +847,9 @@ describe("stage and reference preview rendering", () => {
     const html = renderPreviewHtml(preview, new Set(["S1", "S2"]));
     expect(html).toContain("github:org/&lt;img src=x onerror=alert(1)&gt;");
     expect(html).toContain("&lt;/code&gt;&lt;script&gt;alert(1)&lt;/script&gt;");
-    expect(html.match(/<script/g) ?? []).toEqual([]);
+    // The page's own two scripts switch the language; no label adds one.
+    expect(html.match(/<script/g) ?? []).toHaveLength(2);
+    expect(html).not.toContain("<script>alert");
     expect(html.match(/<img/g) ?? []).toEqual([]);
     expect(html).not.toContain("javascript:");
   });
@@ -858,7 +861,8 @@ describe("stage and reference preview rendering", () => {
     preview.stages.find((stage) => stage.id === "repository_search")!.uses[0]!.note = "archived</span><script>alert(1)</script><img src=x onerror=alert(1)>";
     const html = renderPreviewHtml(preview, new Set());
     expect(html).toContain("archived&lt;/span&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;img src=x onerror=alert(1)&gt;");
-    expect(html.match(/<script/g) ?? []).toEqual([]);
+    expect(html.match(/<script/g) ?? []).toHaveLength(2);
+    expect(html).not.toContain("<script>alert");
     expect(html.match(/<img/g) ?? []).toEqual([]);
   });
 
@@ -866,12 +870,12 @@ describe("stage and reference preview rendering", () => {
     const waiting = renderPreviewHtml(previewWith({ waiting: true }), new Set());
     expect(waiting).toContain("The run is waiting at this preview. Type yes in the terminal to continue");
     expect(waiting).toContain("data-status=\"waiting\"");
-    expect(waiting).toContain("<code>source_reads</code></h2><p class=\"status\"><span lang=\"en\">Pending</span> · <span lang=\"zh-CN\">待执行</span></p><p class=\"muted\"><span lang=\"en\">No references yet</span>");
+    expect(waiting).toContain("<code>source_reads</code></h2><p class=\"status\"><span lang=\"en\">Pending</span><span lang=\"zh-CN\">待执行</span></p><p class=\"muted\"><span lang=\"en\">No references yet</span>");
     const finished = renderPreviewHtml(previewWith(), new Set(["S1", "S2"]));
     expect(finished).not.toContain("The run is waiting at this preview");
     expect(finished).toContain("<code>intake</code></h2><p class=\"status\"><span lang=\"en\">Pending</span>");
-    expect(finished).toContain("<code>source_reads</code></h2><p class=\"status\"><span lang=\"en\">Completed</span> · <span lang=\"zh-CN\">已完成</span></p><details open><summary><span lang=\"en\">Read and hashed</span> · <span lang=\"zh-CN\">读取并计算哈希</span> (2)</summary>");
-    expect(finished).not.toMatch(/<script|https?:\/\/(?!github\.com\/org\/refunds)/);
+    expect(finished).toContain("<code>source_reads</code></h2><p class=\"status\"><span lang=\"en\">Completed</span><span lang=\"zh-CN\">已完成</span></p><details open><summary><span lang=\"en\">Read and hashed</span><span lang=\"zh-CN\">读取并计算哈希</span> (2)</summary>");
+    expect(finished).not.toMatch(/https?:\/\/(?!github\.com\/org\/refunds)/);
   });
 
   test("keeps control characters in a label from forging terminal lines", () => {
@@ -882,5 +886,86 @@ describe("stage and reference preview rendering", () => {
     expect(lines.filter((line) => line.startsWith("[ok] plan:"))).toEqual(["[ok] plan: completed; cited 1"]);
     expect(text).not.toContain(escape);
     expect(text).toContain("    read S2 src/app.ts [ok] plan: completed; cited 9  [2J [evidence]\n");
+  });
+});
+
+describe("stack page and table", () => {
+  const sha = "c".repeat(40);
+  const stackSources: EvidenceSource[] = [
+    { id: "S1", kind: "remote", path: "src/a.ts", sha256: "a".repeat(64), lineCount: 40, byteCount: 400, provider: "github", repository: "org/a", commitSha: sha, permalink: `https://github.com/org/a/blob/${sha}/src/a.ts`, snapshotPath: "sources/S1.txt", roles: ["production"] },
+    { id: "S2", kind: "local", path: "src/app.ts", sha256: "b".repeat(64), lineCount: 10, byteCount: 100, snapshotPath: "sources/S2.txt", roles: ["production"] },
+  ];
+  const stackExcerpts = [
+    { id: "E1", sourceId: "S1", startLine: 1, endLine: 5, text: "a" },
+    { id: "E2", sourceId: "S2", startLine: 2, endLine: 3, text: "b" },
+  ];
+
+  function stackPlan(names: { checkout?: string; claim?: string; reason?: string } = {}): PlanDocument {
+    return {
+      title: "Ticket <plan>",
+      summary: "Sell tickets.",
+      requirements: [],
+      tasks: [],
+      decisions: [],
+      design: {
+        architecture: "Two modules over one entity.",
+        modules: [
+          { name: names.checkout ?? "Checkout", responsibility: "Takes payment.", interfaces: [], evidence: [{ excerptId: "E1", claim: names.claim ?? "a pays" }, { excerptId: "E2", claim: "local app" }] },
+          { name: "Seat map", responsibility: "Shows seats.", interfaces: [], evidence: [], newDesignReason: names.reason ?? "No reference draws seats." },
+        ],
+        dataModel: { entities: [{ name: "Ticket", fields: ["seat", "price"], evidence: [{ excerptId: "E1", claim: "a stores tickets" }] }] },
+        invariants: { items: [] },
+        accessControl: { boundaries: [] },
+      },
+      repositoryChoices: [],
+      referenceComparisons: [],
+      risks: [],
+      readiness: "draft",
+      readinessNotes: [],
+    };
+  }
+
+  test("draws one brick per layer with the top brick first, links each cited file at its pinned commit, and dashes the brick with no cited source", () => {
+    const plan = stackPlan();
+    const html = renderStackHtml(plan, stackLayers(plan, { sources: stackSources, excerpts: stackExcerpts }), new Set(["S2"]));
+    expect([...html.matchAll(/<li class="layer" data-i="(\d+)"/g)].map((match) => match[1])).toEqual(["3", "2", "1"]);
+    expect([...html.matchAll(/<svg class="brick( new)?"/g)].map((match) => match[1] ?? "")).toEqual([" new", "", ""]);
+    expect(html).toContain(`<a class="path" href="https://github.com/org/a/blob/${sha}/src/a.ts#L1-L5">src/a.ts L1-L5</a>`);
+    expect(html).toContain(`<a class="path" href="sources/S2.txt">src/app.ts L2-L3</a>`);
+    expect(html).toContain("<h3>org/a <code>@cccccccccccc</code></h3>");
+    expect(html).toContain('aria-controls="brick-3"');
+    expect(html).toContain('<section class="detail" id="brick-3" data-i="3" aria-label="Seat map">');
+    const unpublished = renderStackHtml(plan, stackLayers(plan, { sources: stackSources, excerpts: stackExcerpts }), new Set());
+    expect(unpublished).not.toContain('href="sources/S2.txt"');
+    expect(unpublished).toContain('<code class="path">src/app.ts L2-L3</code>');
+  });
+
+  test("escapes hostile names, claims and reasons on the stack page and links only https URLs", () => {
+    const plan = stackPlan({ checkout: "<img src=x onerror=alert(1)>", claim: "</p><script>alert(1)</script>", reason: "\"><svg onload=alert(1)>" });
+    const sources = stackSources.map((source) => source.id === "S1" ? { ...source, permalink: "javascript:alert(1)" } : source);
+    const html = renderStackHtml(plan, stackLayers(plan, { sources, excerpts: stackExcerpts }), new Set());
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).toContain("&lt;/p&gt;&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).toContain("&quot;&gt;&lt;svg onload=alert(1)&gt;");
+    expect(html).toContain("<h1>Ticket &lt;plan&gt;</h1>");
+    // The page's own two scripts switch the language and keep a brick open; no text adds one.
+    expect(html.match(/<script/g) ?? []).toHaveLength(2);
+    expect(html).not.toContain("<script>alert");
+    expect(html.match(/<img/g) ?? []).toEqual([]);
+    expect(html).not.toContain("<svg onload");
+    expect(html).not.toContain("javascript:");
+  });
+
+  test("adds a Stack table to the plan with one row per brick, from the bottom up, whose names cannot add a column", () => {
+    const plan = stackPlan({ checkout: "Checkout | forged | cells" });
+    const report = renderReport({ brief: parseIntake({ summary: "Sell tickets.", requirements: [{ description: "Sell.", observableAcceptance: ["A ticket is sold."] }], outOfScope: [], assumptions: [], materialQuestions: [], researchQueries: ["tickets"] }), resolvedAnswers: [], plan, sources: [], evidence: { sources: stackSources, excerpts: stackExcerpts, bytesBySourceId: new Map(), textBySourceId: new Map(), gaps: [] }, gaps: [], reviews: [], validationIssues: [], validationHistory: [], commands: [] });
+    const section = report.slice(report.indexOf("## Stack\n"), report.indexOf("## Evidence gaps") === -1 ? undefined : report.indexOf("## Evidence gaps"));
+    const rows = section.split("\n").filter((line) => line.startsWith("| ") && !line.startsWith("| Brick") && !line.startsWith("| ---"));
+    expect(rows).toEqual([
+      "| 01 (data) | `Ticket` | `org/a` | no |",
+      "| 02 | `Checkout \\| forged \\| cells` | `org/a`, local project | no |",
+      "| 03 | `Seat map` | none | yes |",
+    ]);
+    for (const row of rows) expect(row.split(/(?<!\\)\|/)).toHaveLength(6);
   });
 });

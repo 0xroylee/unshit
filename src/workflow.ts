@@ -121,9 +121,9 @@ export interface WorkflowOptions {
   // Asks a person to confirm the stage-and-reference preview once the search has returned. Only true continues to
   // ranking and tree checks; false, or no confirmPreview, ends the run as needs_input with previewStop.
   confirmPreview?: ConfirmPreview;
-  // Publishes one preview revision: the source snapshots it links, then its page. The run waits for it before the next
-  // stage starts.
-  onPreview?: (preview: WorkflowPreview, evidence: LoadedEvidence) => Promise<void>;
+  // Publishes one preview revision: the source snapshots it links, then its page, and once a plan exists, the stack page
+  // of that plan. The run waits for it before the next stage starts.
+  onPreview?: (preview: WorkflowPreview, evidence: LoadedEvidence, plan?: PlanDocument) => Promise<void>;
   onProgress?: (event: ProgressEvent) => void;
   onCheckpoint?: (input: WorkflowArtifactInput, stage: CheckpointStage) => Promise<string | undefined>;
   onArtifacts?: (input: WorkflowArtifactInput) => Promise<RunArtifacts | undefined>;
@@ -177,8 +177,8 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
   const progress = (event: ProgressEvent): void => options.onProgress?.(event);
   const now = options.now ?? (() => new Date());
   const preview = createPreviewRecorder();
-  const publishPreview = async (): Promise<void> => {
-    if (options.onPreview) await options.onPreview(preview.snapshot(), checkpointEvidence ?? emptyEvidence());
+  const publishPreview = async (plan?: PlanDocument): Promise<void> => {
+    if (options.onPreview) await options.onPreview(preview.snapshot(), checkpointEvidence ?? emptyEvidence(), plan);
   };
 
   const saveCheckpoint = async (stage: CheckpointStage, placeholderNotes: string[] = []): Promise<void> => {
@@ -653,7 +653,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     preview.record("plan", "supplied_to_model", evidence.excerpts.map((excerpt) => excerpt.id));
     preview.record("plan", "cited", parsedPlan ? planCitations(plan).filter((id) => preview.has(id)) : []);
     preview.setStatus("plan", parsedPlan ? "completed" : "failed");
-    await publishPreview();
+    await publishPreview(parsedPlan ? plan : undefined);
 
     if (!parsedPlan) {
       const message = "Plan generation and its bounded validation repair did not produce a usable task map.";
@@ -738,7 +738,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       preview.record("review", "supplied_to_model", evidence.excerpts.map((excerpt) => excerpt.id));
       preview.record("review", "cited", reviewCitations(reviews).filter((id) => preview.has(id)));
       preview.setStatus("review", "completed");
-      await publishPreview();
+      await publishPreview(plan);
     }
 
     // Computed from the final plan, so a repair that cites a reference test clears it. From here on it is in gaps, and
@@ -760,7 +760,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     checkpointPlan = plan;
     await saveCheckpoint("plan");
     preview.setStatus("readiness", "completed");
-    await publishPreview();
+    await publishPreview(plan);
 
     const sources = finalSources(evidence.sources, evidence.excerpts);
     let artifacts: RunArtifacts | undefined;

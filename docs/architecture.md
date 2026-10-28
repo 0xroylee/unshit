@@ -21,7 +21,7 @@ See [How it works](usage.md#how-it-works) in the README for what each step does.
 | 6 Pinned reads | File selection turn, bounded reads, hashes, line ranges, excerpts, evidence request turn | [file-ranking.ts](../src/file-ranking.ts), [evidence.ts](../src/evidence.ts), [workflow.ts](../src/workflow.ts) |
 | 7 Plan | Plan turn; the host checks IDs, citations, coverage, dependencies and named wrong implementations | [workflow.ts](../src/workflow.ts), [model-schema.ts](../src/model-schema.ts) |
 | 8 Independent review | Review in a fresh session, one bounded repair, another review, the Ready or Draft decision | [workflow.ts](../src/workflow.ts), [model-schema.ts](../src/model-schema.ts) |
-| 9 Save | Atomic writes of `plan.md`, `preview.html`, both manifests, source snapshots and the answers file, all through one queue per run | [report.ts](../src/report.ts), [storage.ts](../src/storage.ts) |
+| 9 Save | Atomic writes of `plan.md`, `preview.html`, `stack.html`, both manifests, source snapshots and the answers file, all through one queue per run | [report.ts](../src/report.ts), [storage.ts](../src/storage.ts) |
 
 [images/how-it-works.mjs](images/how-it-works.mjs) generates the diagram from Hairline line drawings. See [Credits](usage.md#diagrams-and-credits) in the README for how to generate it.
 
@@ -48,6 +48,7 @@ turn / interrupt                                  v
 | [skill-install.ts](../src/skill-install.ts) | Embeds the unshit agent skill (`src/resources/unshit-skill/SKILL.md`) and writes it to the Claude Code skills directory and the two Codex skills directories (`$CODEX_HOME/skills`, `~/.agents/skills`); writes a temporary file first, then renames it; does not overwrite a skill of the same name that unshit did not install (unless `--force`); does not follow the `unshit` folder or `SKILL.md` when it is a symlink, but follows symlinks at the skills directory itself or higher up as usual |
 | [workflow.ts](../src/workflow.ts) | Requirement gate, brief rebuild after answers, brief approval gate, candidate pre-ranking, screening and selection, reads, plan generation, the reference test gap, independent review and the one bounded repair (including surviving mutants and open decisions), timeout results and checkpoints |
 | [preview.ts](../src/preview.ts) | The steps of a run in order; the preview recorder, which registers host records (repositories, commits, files, sources, excerpts) with a fixed class and records which references each step used and how; the steps that changed between two revisions; the excerpts that a plan or a review cites |
+| [stack.ts](../src/stack.ts) | The plan's bricks from the bottom up (data model entities, then modules) with the host excerpts each cites, grouped by repository and pinned commit; the drawing of the logo's brick that the stack page uses |
 | [app-server.ts](../src/app-server.ts) | Native bidirectional RPC, active turn correlation, final text, cancellation, idle and total-duration timeouts, failure reasons and process cleanup |
 | [github.ts](../src/github.ts) | Host-built GitHub queries, Grep code search, the quality bar, the tree check at the pinned commit and the fallback to the official GitLab API |
 | [code-search.ts](../src/code-search.ts) | Grep request body, response parsing, grouping hits by repository, qualifiers for the batched GitHub metadata query |

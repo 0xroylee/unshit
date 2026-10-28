@@ -3,10 +3,11 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { editableBrief, type EditableBrief } from "./brief-approval.ts";
 import { REFERENCE_POLICY_HASH } from "./instructions.ts";
-import { renderPreviewHtml, renderReport, type ReportInput } from "./report.ts";
+import { renderPreviewHtml, renderReport, renderStackHtml, type ReportInput } from "./report.ts";
+import { stackLayers } from "./stack.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import { PREVIEW_FINALIZE_FAILED, PREVIEW_SAVE_FAILED, PREVIEW_SOURCES_FAILED, PUBLICATION_CLOSED } from "./preview.ts";
-import type { CheckpointStage, IntakeBrief, MaterialQuestion, RunArtifacts, WorkflowPreview } from "./types.ts";
+import type { CheckpointStage, IntakeBrief, MaterialQuestion, PlanDocument, RunArtifacts, WorkflowPreview } from "./types.ts";
 
 // Writes `data` to `target`. The default writes a temporary file and renames it; a test passes its own.
 export type FileWriter = (target: string, data: string | Uint8Array) => Promise<void>;
@@ -31,7 +32,9 @@ export async function writePlanArtifacts(options: {
 
   const preview = options.completePreview ? options.completePreview() : options.input.preview;
   const previewPath = preview ? path.join(evidenceDirectory, "preview.html") : undefined;
-  const artifacts: RunArtifacts = { reportPath, evidenceDirectory, manifestPath, ...(previewPath ? { previewPath } : {}) };
+  const layers = stackLayers(options.input.plan, options.input.evidence);
+  const stackPath = layers.length > 0 ? path.join(evidenceDirectory, "stack.html") : undefined;
+  const artifacts: RunArtifacts = { reportPath, evidenceDirectory, manifestPath, ...(previewPath ? { previewPath } : {}), ...(stackPath ? { stackPath } : {}) };
   const manifest = {
     schemaVersion: "1",
     runId,
@@ -63,7 +66,9 @@ export async function writePlanArtifacts(options: {
   const writeFinal = async (): Promise<void> => {
     await write(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
     await write(reportPath, renderReport({ ...options.input, artifacts, ...(preview ? { preview } : {}) }));
-    if (preview && previewPath) await write(previewPath, renderPreviewHtml(preview, new Set(snapshotRecords.map((record) => record.sourceId))));
+    const written = new Set(snapshotRecords.map((record) => record.sourceId));
+    if (preview && previewPath) await write(previewPath, renderPreviewHtml(preview, written));
+    if (stackPath) await write(stackPath, renderStackHtml(options.input.plan, layers, written));
   };
   if (!preview) {
     await writeFinal();
@@ -140,15 +145,17 @@ async function writeSourceSnapshots(evidenceDirectory: string, evidence: LoadedE
 }
 
 // Writes one preview revision: first the snapshot of each source it lists that `published` does not hold yet, from the
-// bytes the host read, then the page that links them. A listed source without bytes, or a failed snapshot write, fails
-// before the page is replaced, so the page still shows the last revision that was written. `published` grows here.
+// bytes the host read, then the page that links them, and with a plan that has modules or entities, the stack page. A
+// listed source without bytes, or a failed snapshot write, fails before the page is replaced, so the page still shows
+// the last revision that was written. `published` grows here.
 export async function writePreviewRevision(options: {
   evidenceDirectory: string;
   preview: WorkflowPreview;
   evidence: LoadedEvidence;
   published: Set<string>;
+  plan?: PlanDocument;
   writer?: FileWriter;
-}): Promise<string> {
+}): Promise<{ page: string; stack?: string }> {
   const write = options.writer ?? atomicWrite;
   const wanted = new Set(options.preview.references.filter((reference) => reference.kind === "source" && !options.published.has(reference.key)).map((reference) => reference.key));
   try {
@@ -160,12 +167,15 @@ export async function writePreviewRevision(options: {
     throw new Error(PREVIEW_SOURCES_FAILED);
   }
   const pagePath = path.join(options.evidenceDirectory, "preview.html");
+  const layers = options.plan ? stackLayers(options.plan, options.evidence) : [];
+  const stackPath = layers.length > 0 ? path.join(options.evidenceDirectory, "stack.html") : undefined;
   try {
     await write(pagePath, renderPreviewHtml(options.preview, options.published));
+    if (stackPath && options.plan) await write(stackPath, renderStackHtml(options.plan, layers, options.published));
   } catch {
     throw new Error(PREVIEW_SAVE_FAILED);
   }
-  return pagePath;
+  return { page: pagePath, ...(stackPath ? { stack: stackPath } : {}) };
 }
 
 export interface RunPublisher {

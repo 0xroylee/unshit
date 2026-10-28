@@ -3990,7 +3990,7 @@ describe("reference preview inputs", () => {
       expect(offered).toBeGreaterThan(2);
       expect(output.join("")).toContain(`[ok] file_selection: completed; selected 2; ${offered} files offered to the model\n`);
       const page = await readFile(path.join(cwd, ".unshit", "run-1", "preview.html"), "utf8");
-      expect(page).toContain(`<p class="muted"><span lang="en">${offered} files offered to the model, not listed</span> · <span lang="zh-CN">提供给模型的文件 ${offered} 个，未逐一列出</span></p>`);
+      expect(page).toContain(`<p class="muted"><span lang="en">${offered} files offered to the model, not listed</span><span lang="zh-CN">提供给模型的文件 ${offered} 个，未逐一列出</span></p>`);
       const plan = await readFile(path.join(cwd, ".unshit", "run-1", "plan.md"), "utf8");
       expect(plan).toContain(`- **File selection** (\`file_selection\`): completed; ${offered} files offered to the model, not listed.\n`);
     } finally {
@@ -4024,6 +4024,53 @@ describe("reference preview inputs", () => {
       expect(planWritten).toBe(true);
       expect(outcome).toMatchObject({ status: "error", message: "Could not finalize workflow preview artifacts." });
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("stack page", () => {
+  test("writes the stack page once the plan exists, before the review turn, and again with the final plan", async () => {
+    const cwd = await tempDirectory();
+    const output: string[] = [];
+    const requests = { reached: deferred(), release: deferred() };
+    const review = { reached: deferred(), release: deferred() };
+    try {
+      const writers = createRunWriters({ cwd, runId: "run-1", jsonl: false, write: (text) => output.push(text) });
+      const run = runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        approveBrief: async () => true,
+        modelGateway: pausingGateway(gateway({ intake: baseIntake(), fileSelection: { files: [{ fileId: "C1F1", role: "production", rationale: "Handler." }, { fileId: "C1F2", role: "test", rationale: "Tests." }] } }), {
+          requests: { reached: requests.reached, release: requests.release.promise },
+          review: { reached: review.reached, release: review.release.promise },
+        }),
+        researcher: researcher().value,
+        ...writers,
+      });
+      const stack = path.join(cwd, ".unshit", "run-1", "stack.html");
+
+      await requests.reached.promise;
+      expect(existsSync(stack)).toBe(false);
+      requests.release.resolve();
+
+      await review.reached.promise;
+      const early = await readFile(stack, "utf8");
+      expect(early).toContain("<h1>Refund request plan</h1>");
+      expect(early).toContain('aria-label="Refund requests"');
+      expect(early).toContain('aria-label="RefundRequest"');
+      expect(output.join("")).toContain(`Stack page: ${stack}\n`);
+      review.release.resolve();
+
+      const outcome = await run;
+      if (outcome.status !== "completed") throw new Error(`Workflow returned ${outcome.status}`);
+      expect(outcome.artifacts?.stackPath).toBe(stack);
+      expect(output.join("").split("Stack page: ").length - 1).toBe(1);
+      expect(await readFile(stack, "utf8")).toContain('<li class="layer" data-i="2"');
+      expect(await readFile(path.join(cwd, ".unshit", "run-1", "plan.md"), "utf8")).toContain("## Stack\n");
+    } finally {
+      requests.release.resolve();
+      review.release.resolve();
       await rm(cwd, { recursive: true, force: true });
     }
   });
