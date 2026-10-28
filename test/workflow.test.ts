@@ -1,4 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -14,7 +16,16 @@ import type { DomainMaterial } from "../src/repository-screening.ts";
 import { REFERENCE_PLAN_MODULES, REFERENCE_POLICY_INPUTS } from "../src/instructions.ts";
 import { renderReport } from "../src/report.ts";
 import { writeCheckpointArtifacts, writePlanArtifacts } from "../src/storage.ts";
-import { runWorkflow } from "../src/workflow.ts";
+import { runWorkflow as runWorkflowWithGate, type WorkflowOptions } from "../src/workflow.ts";
+import { createPreviewConfirmer, createRunWriters, exitCodeFor } from "../src/cli.ts";
+import { PREVIEW_DECLINED, PREVIEW_SAVE_FAILED, PREVIEW_SOURCES_FAILED, PREVIEW_UNAVAILABLE } from "../src/preview.ts";
+import type { WorkflowPreview } from "../src/types.ts";
+
+// Most tests here exercise the stages after the reference preview, so a person confirms it unless a test passes its
+// own confirmPreview, or undefined.
+function runWorkflow(options: WorkflowOptions) {
+  return runWorkflowWithGate({ confirmPreview: async () => true, ...options });
+}
 
 function baseIntake(questions: Array<{ question: string; whyMaterial: string }> = []) {
   return {
@@ -3250,6 +3261,768 @@ describe("surviving mutants from independent review", () => {
       expect(outcome.plan.readinessNotes).toEqual([unreviewedRepairNote, unknownRequirement, openDecisionNote]);
       expect(outcome.validationHistory).toContainEqual({ issue: unknownRequirement, resolved: false });
       expect(events.map((event) => event.message)).toContain("The repaired plan passed host validation, but its follow-up review did not complete; the report remains Draft.");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+// Lets every ready promise callback and fake I/O step run, without waiting for wall-clock time.
+async function settle(): Promise<void> {
+  for (let index = 0; index < 50; index += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+
+// Stops at the first turn of each paused kind until its release settles; `reached` resolves when it stops there.
+function pausingGateway(base: ModelGateway, pauses: Partial<Record<TurnKind, { reached: { resolve: () => void }; release: Promise<void> }>>): ModelGateway {
+  const paused = new Set<TurnKind>();
+  return {
+    createSession(): ModelSession {
+      const session = base.createSession();
+      return {
+        async turn(prompt, schema, options) {
+          const kind = turnKind(schema);
+          const pause = pauses[kind];
+          if (pause && !paused.has(kind)) {
+            paused.add(kind);
+            pause.reached.resolve();
+            await pause.release;
+          }
+          return session.turn(prompt, schema, options);
+        },
+        close: () => session.close(),
+      };
+    },
+  };
+}
+
+// Writes like the default writer, without the temporary file.
+async function plainWrite(target: string, data: string | Uint8Array): Promise<void> {
+  await mkdir(path.dirname(target), { recursive: true });
+  await writeFile(target, data);
+}
+
+function stageOf(preview: WorkflowPreview | undefined, id: string) {
+  return preview?.stages.find((stage) => stage.id === id);
+}
+
+// Each snapshot that the page links: its bytes, which must exist and hash to the SHA-256 the page shows for it.
+async function linkedSnapshots(pagePath: string): Promise<string[]> {
+  const html = await readFile(pagePath, "utf8");
+  const contents: string[] = [];
+  for (const block of html.split("<div class=\"reference\" ").slice(1)) {
+    const href = /<a href="(sources\/[^"]+)">/.exec(block)?.[1];
+    if (!href) continue;
+    const bytes = await readFile(path.join(path.dirname(pagePath), href));
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(/SHA-256<\/span><\/dt><dd><code>([0-9a-f]{64})<\/code>/.exec(block)?.[1] ?? "no hash shown");
+    contents.push(bytes.toString("utf8"));
+  }
+  return contents;
+}
+
+describe("reference preview gate", () => {
+  const requirement = "Build a refund request service.";
+  const downstreamKinds: TurnKind[] = ["ranking", "selection", "files", "requests", "plan", "review"];
+  const youngCandidate = { candidate: { ...repositorySnapshot().candidate, id: "C2", fullName: "org/young", webUrl: "https://github.com/org/young" }, reasons: ["created 2026-09-16, younger than 180 days"] };
+
+  // As in the comparator's confirmation test (google-gemini/gemini-cli, E31): the run enters a waiting state, awaits the
+  // response, and proceeds only after it.
+  test("publishes the preview after the search, starts nothing downstream while the confirmation is open, and checks trees only after yes", async () => {
+    // Both ranking branches: one candidate fits a tree budget of 8; a budget of 0 needs a ranking turn first.
+    for (const treeResolutionLimit of [8, 0]) {
+      const cwd = await tempDirectory();
+      const kinds: TurnKind[] = [];
+      const research = researcher({ treeResolutionLimit });
+      const published: WorkflowPreview[] = [];
+      const asked = deferred<WorkflowPreview>();
+      const answer = deferred<boolean>();
+      try {
+        const run = runWorkflow({
+          cwd,
+          requirement,
+          approveBrief: async () => true,
+          modelGateway: gateway({ intake: baseIntake(), onPrompt: (_prompt, schema) => kinds.push(turnKind(schema)) }),
+          researcher: research.value,
+          onPreview: async (preview) => {
+            published.push(preview);
+          },
+          confirmPreview: (preview) => {
+            asked.resolve(preview);
+            return answer.promise;
+          },
+        });
+        const shown = await asked.promise;
+        await settle();
+        expect(research.shortlistInputs).toEqual([]);
+        expect(kinds.filter((kind) => downstreamKinds.includes(kind))).toEqual([]);
+        expect(stageOf(shown, "preview_confirmation")?.status).toBe("waiting");
+        expect(stageOf(published.at(-1), "preview_confirmation")?.status).toBe("waiting");
+        expect(stageOf(published.at(-1), "repository_search")?.uses).toEqual([{ relation: "found", key: "C1" }]);
+        answer.resolve(true);
+        const outcome = await run;
+        expect(outcome.status).toBe("completed");
+        expect(research.shortlistInputs).toHaveLength(1);
+        expect(kinds.includes("ranking")).toBe(treeResolutionLimit === 0);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("asks only after the page of the search is written", async () => {
+    const cwd = await tempDirectory();
+    const entered = deferred();
+    const write = deferred();
+    let written = false;
+    let writtenWhenAsked: boolean | undefined;
+    try {
+      const run = runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake() }),
+        researcher: researcher().value,
+        onPreview: async () => {
+          entered.resolve();
+          await write.promise;
+          written = true;
+        },
+        confirmPreview: async () => {
+          writtenWhenAsked = written;
+          return false;
+        },
+      });
+      await entered.promise;
+      await settle();
+      expect(writtenWhenAsked).toBeUndefined();
+      write.resolve();
+      const outcome = await run;
+      expect(writtenWhenAsked).toBe(true);
+      expect(outcome).toMatchObject({ status: "needs_input", previewStop: "declined" });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("stops a run with no person to ask at the preview: the page is written, nothing downstream starts, and an approved brief does not count", async () => {
+    const approvedBrief = parseApprovedBrief(editableBrief(parseIntake(baseIntake())), [], [requirement]);
+    const routes: Array<Partial<WorkflowOptions>> = [
+      {},
+      { approveBrief: async () => true },
+      { approvedBrief: { brief: approvedBrief, resolvedAnswers: [], approval: { briefSha256: briefSha256(approvedBrief), via: "answers_file", approvedAt: "2026-10-28T09:00:00.000Z" } } },
+    ];
+    for (const route of routes) {
+      const cwd = await tempDirectory();
+      const kinds: TurnKind[] = [];
+      const research = researcher();
+      const published: WorkflowPreview[] = [];
+      let saved = false;
+      try {
+        const outcome = await runWorkflow({
+          cwd,
+          requirement,
+          ...route,
+          modelGateway: gateway({ intake: baseIntake(), onPrompt: (_prompt, schema) => kinds.push(turnKind(schema)) }),
+          researcher: research.value,
+          onPreview: async (preview) => {
+            published.push(preview);
+          },
+          onArtifacts: async () => {
+            saved = true;
+            return undefined;
+          },
+          confirmPreview: undefined,
+        });
+        expect(outcome).toMatchObject({ status: "needs_input", questions: [], previewStop: "unavailable", message: "Reference preview requires confirmation in an interactive terminal. No downstream work started." });
+        expect(exitCodeFor(outcome, false)).toBe(2);
+        expect(published).toHaveLength(1);
+        expect(stageOf(published[0], "preview_confirmation")?.status).toBe("stopped");
+        // A search-only preview: source reads and every other later stage are still pending.
+        expect(stageOf(published[0], "source_reads")?.status).toBe("pending");
+        expect(published[0]!.stages.slice(8).map((stage) => stage.status)).toEqual(Array(10).fill("pending"));
+        expect(research.shortlistInputs).toEqual([]);
+        expect(kinds.filter((kind) => downstreamKinds.includes(kind))).toEqual([]);
+        expect(saved).toBe(false);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("continues only on a reply that is yes once trimmed and lowercased, and otherwise stops before any tree check", async () => {
+    const replies: Array<[string, boolean]> = [["not yet", false], ["no", false], ["y", false], ["yes please", false], ["", false], ["  YES  ", true], ["Yes", true]];
+    for (const [reply, confirmed] of replies) {
+      const cwd = await tempDirectory();
+      const research = researcher();
+      try {
+        const outcome = await runWorkflow({
+          cwd,
+          requirement,
+          approveBrief: async () => true,
+          modelGateway: gateway({ intake: baseIntake() }),
+          researcher: research.value,
+          confirmPreview: createPreviewConfirmer(async () => reply),
+        });
+        if (confirmed) {
+          expect(outcome.status).toBe("completed");
+          expect(research.shortlistInputs).toHaveLength(1);
+        } else {
+          expect(outcome).toMatchObject({ status: "needs_input", questions: [], previewStop: "declined", message: "Reference preview was not confirmed. No downstream work started." });
+          expect(exitCodeFor(outcome, false)).toBe(2);
+          expect(research.shortlistInputs).toEqual([]);
+        }
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("treats a false confirmation as a stop: the page shows it stopped and no plan is written", async () => {
+    const cwd = await tempDirectory();
+    const research = researcher();
+    try {
+      const writers = createRunWriters({ cwd, runId: "run-1", jsonl: false, write: () => undefined });
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake() }),
+        researcher: research.value,
+        ...writers,
+        confirmPreview: async () => false,
+      });
+      expect(outcome).toMatchObject({ status: "needs_input", previewStop: "declined", message: PREVIEW_DECLINED });
+      expect(research.shortlistInputs).toEqual([]);
+      const page = await readFile(path.join(cwd, ".unshit", "run-1", "preview.html"), "utf8");
+      expect(page).toContain("data-status=\"stopped\"");
+      expect(existsSync(path.join(cwd, ".unshit", "run-1", "plan.md"))).toBe(false);
+      expect(existsSync(path.join(cwd, ".unshit", "run-1", "manifest.json"))).toBe(false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("asks at the preview of a search that found nothing", async () => {
+    const cwd = await tempDirectory();
+    let shown: WorkflowPreview | undefined;
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake() }),
+        researcher: researcher({ candidates: [], snapshots: [] }).value,
+        confirmPreview: async (preview) => {
+          shown = preview;
+          return false;
+        },
+      });
+      expect(stageOf(shown, "repository_search")).toEqual({ id: "repository_search", status: "completed", uses: [] });
+      expect(outcome).toMatchObject({ status: "needs_input", previewStop: "declined" });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("ends as interrupted when Ctrl+C or the end of input comes at the preview prompt", async () => {
+    for (const ending of ["reply after abort", "rejected question"] as const) {
+      const cwd = await tempDirectory();
+      const controller = new AbortController();
+      const research = researcher();
+      try {
+        const outcome = await runWorkflow({
+          cwd,
+          requirement,
+          approveBrief: async () => true,
+          signal: controller.signal,
+          modelGateway: gateway({ intake: baseIntake() }),
+          researcher: research.value,
+          confirmPreview: async () => {
+            controller.abort();
+            if (ending === "rejected question") throw new Error("The operation was aborted.");
+            return true;
+          },
+        });
+        expect(outcome.status).toBe("interrupted");
+        expect(research.shortlistInputs).toEqual([]);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("fails with a fixed message before anyone is asked when the page of the search cannot be written", async () => {
+    const cwd = await tempDirectory();
+    let asked = false;
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake() }),
+        researcher: researcher().value,
+        onPreview: async () => {
+          throw new Error("EACCES: permission denied, open '/private/run/preview.html'");
+        },
+        confirmPreview: async () => {
+          asked = true;
+          return true;
+        },
+      });
+      expect(outcome).toEqual({ status: "error", message: "Could not save workflow preview." });
+      expect(PREVIEW_SAVE_FAILED).toBe("Could not save workflow preview.");
+      expect(asked).toBe(false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("prints the page path, each stage and the references the search found before the preview prompt", async () => {
+    const cwd = await tempDirectory();
+    const output: string[] = [];
+    try {
+      const writers = createRunWriters({ cwd, runId: "run-1", jsonl: false, write: (text) => output.push(text) });
+      await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake() }),
+        researcher: researcher({ discoveryExcluded: [youngCandidate] }).value,
+        ...writers,
+        confirmPreview: createPreviewConfirmer(async (prompt) => {
+          output.push(prompt);
+          return "no";
+        }),
+      });
+      const text = output.join("");
+      const prompt = text.indexOf("Type yes to continue");
+      expect(prompt).toBeGreaterThan(0);
+      const before = text.slice(0, prompt);
+      const page = path.join(cwd, ".unshit", "run-1", "preview.html");
+      expect(before).toContain(`Reference preview page: ${page}\n`);
+      expect(before).toContain("[ok] repository_search: completed; found 2\n    found C1 github:org/refunds [discovery]\n    found C2 github:org/young [discovery]\n");
+      expect(before).toContain("[ok] metadata_screening: completed; passed 1, excluded 1\n    excluded C2 github:org/young [discovery] (created 2026-09-16, younger than 180 days)\n");
+      // The terminal gives repositories that passed the metadata bar only as a count; the page lists them.
+      expect(before).not.toContain("    passed ");
+      expect(before).toContain("[..] preview_confirmation: waiting\n");
+      expect(before).toContain("[  ] source_reads: pending\n");
+      expect(await readFile(page, "utf8")).toContain("github:org/young");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("reference preview publication", () => {
+  const requirement = "Build a refund request service.";
+  const bothFiles = { files: [{ fileId: "C1F1", role: "production", rationale: "Handler." }, { fileId: "C1F2", role: "test", rationale: "Tests." }] };
+
+  test("publishes each later stage before the next model turn returns: terminal lines, the page, and snapshots that open with the bytes the host read", async () => {
+    const cwd = await tempDirectory();
+    const output: string[] = [];
+    const secret = "export const apiKey = \"plainCredentialValue123456\";\nexport function send() { return apiKey; }\n";
+    const redacted = "export const apiKey = \"[redacted by unshit]\";\nexport function send() { return apiKey; }\n";
+    const requests = { reached: deferred(), release: deferred() };
+    const review = { reached: deferred(), release: deferred() };
+    let settled = false;
+    try {
+      await mkdir(path.join(cwd, "src"), { recursive: true });
+      await writeFile(path.join(cwd, "src", "client.ts"), secret);
+      const base = repositorySnapshot();
+      const extra: TreeFile = { id: "C1F7", path: "src/extra.ts", size: 100 };
+      const writers = createRunWriters({ cwd, runId: "run-1", jsonl: false, write: (text) => output.push(text) });
+      const run = runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: pausingGateway(gateway({
+          intake: baseIntake(),
+          fileSelection: { files: [...bothFiles.files, { fileId: "LFILE1", role: "production", rationale: "Client." }] },
+          evidenceRequests: { requests: [{ kind: "file", id: "C1F7", name: "", startLine: 0, endLine: 0, reason: "More comparator code." }] },
+        }), {
+          requests: { reached: requests.reached, release: requests.release.promise },
+          review: { reached: review.reached, release: review.release.promise },
+        }),
+        researcher: researcher({ snapshots: [{ ...base, files: [...base.files, extra] }] }).value,
+        ...writers,
+      });
+      void run.then(() => {
+        settled = true;
+      });
+      const page = path.join(cwd, ".unshit", "run-1", "preview.html");
+
+      await requests.reached.promise;
+      let text = output.join("");
+      expect(text).toContain("[ok] source_reads: completed; read ");
+      expect(text).toMatch(/\n {4}read S\d+ src\/client\.ts \[evidence\]\n/);
+      let snapshots = await linkedSnapshots(page);
+      expect(snapshots).toContain(redacted);
+      expect(snapshots).toContain("export function createRefund() { return { status: 'pending' }; }\n");
+      expect(snapshots.join("")).not.toContain("plainCredentialValue123456");
+      expect(settled).toBe(false);
+      expect(existsSync(path.join(cwd, ".unshit", "run-1", "plan.md"))).toBe(false);
+      // The file changes after the host read it; every snapshot keeps the bytes that were read.
+      await writeFile(path.join(cwd, "src", "client.ts"), "export const changed = true;\n");
+      requests.release.resolve();
+
+      await review.reached.promise;
+      text = output.join("");
+      expect(text).toMatch(/\[ok\] evidence_requests: completed; supplied_to_model \d+, added \d+\n {4}added excerpts: E\d+/);
+      expect(text).toContain("[ok] plan: completed; supplied_to_model ");
+      snapshots = await linkedSnapshots(page);
+      expect(snapshots).toContain("export const path = 'src/extra.ts';\n");
+      expect(settled).toBe(false);
+      review.release.resolve();
+
+      const outcome = await run;
+      expect(outcome.status).toBe("completed");
+      text = output.join("");
+      // As in the comparator's progress test (Azure/azure-dev, E8): the page path is printed once, not on every update.
+      expect(text.split("Reference preview page: ").length - 1).toBe(1);
+      expect(await linkedSnapshots(page)).toContain(redacted);
+    } finally {
+      requests.release.resolve();
+      review.release.resolve();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("shows no evidence for a selected file while its read is still open, and keeps the search result a discovery reference after the read", async () => {
+    const cwd = await tempDirectory();
+    const reached = deferred();
+    const release = deferred();
+    const published: WorkflowPreview[] = [];
+    try {
+      const base = researcher();
+      const value = {
+        ...base.value,
+        fetchSource: async (snapshot: RepositorySnapshot, filePath: string) => {
+          if (filePath === "src/index.ts") {
+            reached.resolve();
+            await release.promise;
+          }
+          return base.value.fetchSource(snapshot, filePath);
+        },
+      } as unknown as GitHubResearcher;
+      const run = runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles }),
+        researcher: value,
+        onPreview: async (preview) => {
+          published.push(preview);
+        },
+      });
+      await reached.promise;
+      await settle();
+      const open = published.at(-1)!;
+      expect(stageOf(open, "file_selection")?.status).toBe("completed");
+      expect(stageOf(open, "source_reads")?.status).toBe("pending");
+      expect(open.references.filter((reference) => reference.classification === "evidence")).toEqual([]);
+      expect(open.references.find((reference) => reference.key === "C1F1")?.classification).toBe("listed");
+      release.resolve();
+      expect((await run).status).toBe("completed");
+      for (const preview of published) expect(preview.references.find((reference) => reference.key === "C1")?.classification).toBe("discovery");
+      const final = published.at(-1)!;
+      expect(stageOf(final, "repository_search")?.uses).toEqual([{ relation: "found", key: "C1" }]);
+      expect(final.references.some((reference) => reference.kind === "source" && reference.path === "src/index.ts" && reference.classification === "evidence")).toBe(true);
+    } finally {
+      release.resolve();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a selected file that could not be read out of the evidence", async () => {
+    const cwd = await tempDirectory();
+    const published: WorkflowPreview[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles }),
+        researcher: researcher({ failPaths: ["src/index.ts"] }).value,
+        onPreview: async (preview) => {
+          published.push(preview);
+        },
+      });
+      // The plan fixture cites the excerpts of the file that failed, so the run itself ends in a plan validation error.
+      expect(outcome).toMatchObject({ status: "error", message: "Plan generation and its bounded validation repair did not produce a usable task map." });
+      const final = published.at(-1)!;
+      expect(stageOf(final, "source_reads")?.status).toBe("completed");
+      expect(final.references.some((reference) => reference.classification === "evidence")).toBe(true);
+      expect(final.references.filter((reference) => reference.classification === "evidence" && reference.path === "src/index.ts")).toEqual([]);
+      expect(final.references.find((reference) => reference.key === "C1F1")).toMatchObject({ kind: "file", classification: "listed" });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("leaves a file ID that the model made up out of every preview", async () => {
+    const cwd = await tempDirectory();
+    const published: WorkflowPreview[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: { files: [...bothFiles.files, { fileId: "C1F99", role: "production", rationale: "Invented." }] } }),
+        researcher: researcher().value,
+        onPreview: async (preview) => {
+          published.push(preview);
+        },
+      });
+      if (outcome.status !== "completed") throw new Error(`Workflow returned ${outcome.status}`);
+      const hostKeys = new Set([
+        "C1",
+        `C1@${"a".repeat(12)}`,
+        ...repositorySnapshot().files.map((file) => file.id),
+        ...outcome.sources.flatMap((source) => [source.id, ...source.excerpts.map((excerpt) => excerpt.id)]),
+      ]);
+      expect(published.length).toBeGreaterThan(5);
+      for (const preview of published) {
+        expect(preview.references.map((reference) => reference.key).filter((key) => !hostKeys.has(key))).toEqual([]);
+        expect(preview.stages.flatMap((stage) => stage.uses.map((use) => use.key)).filter((key) => !hostKeys.has(key))).toEqual([]);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("records every excerpt the plan turn received as supplied to the model, and only what the plan cites as cited", async () => {
+    const cwd = await tempDirectory();
+    const planPrompts: string[] = [];
+    const published: WorkflowPreview[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles, onPrompt: (prompt, schema) => { if (turnKind(schema) === "plan") planPrompts.push(prompt); } }),
+        researcher: researcher().value,
+        onPreview: async (preview) => {
+          published.push(preview);
+        },
+      });
+      expect(outcome.status).toBe("completed");
+      const supplied = [...new Set([...planPrompts[0]!.matchAll(/"excerptId":"(E\d+)"/g)].map((match) => match[1]!))];
+      expect(supplied).toContain("E3");
+      const plan = stageOf(published.at(-1), "plan")!;
+      expect(plan.uses.filter((use) => use.relation === "supplied_to_model").map((use) => use.key).sort()).toEqual([...supplied].sort());
+      expect(plan.uses.filter((use) => use.relation === "cited").map((use) => use.key).sort()).toEqual(["E1", "E2"]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("prints the plan stage again when a repair replaces one cited excerpt with another at the same count", async () => {
+    const cwd = await tempDirectory();
+    const output: string[] = [];
+    const first = validPlan("E1", "E2");
+    first.tasks[0].evidence = [{ excerptId: "E4", claim: "The license file names MIT." }];
+    const repaired = validPlan("E1", "E2");
+    repaired.tasks[0].evidence = [{ excerptId: "E3", claim: "The manifest runs bun test." }];
+    const finding = { severity: "material", description: "The task cites the license, not the manifest.", requirementIds: ["R1"], evidence: [], suggestedCorrection: "Cite the manifest." };
+    try {
+      const writers = createRunWriters({ cwd, runId: "run-1", jsonl: false, write: (text) => output.push(text) });
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles, plans: [first, repaired], reviews: [{ findings: [finding] }, { findings: [] }] }),
+        researcher: researcher().value,
+        ...writers,
+      });
+      expect(outcome.status).toBe("completed");
+      const blocks = output.join("").split("Reference preview, revision ");
+      const planBlock = blocks.find((block) => block.includes("[ok] plan: completed") && !block.includes("[ok] review:"))!;
+      expect(planBlock).toContain("[ok] plan: completed; supplied_to_model 6, cited 3\n    cited excerpts: E4, E1, E2\n");
+      const reviewBlock = blocks.find((block) => block.includes("[ok] review: completed"))!;
+      expect(reviewBlock).toContain("[ok] plan: completed; supplied_to_model 6, cited 3\n    cited excerpts: E3, E1, E2\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("stops with a fixed message and keeps the last page when a source snapshot cannot be written", async () => {
+    const cwd = await tempDirectory();
+    try {
+      const writers = createRunWriters({
+        cwd,
+        runId: "run-1",
+        jsonl: false,
+        write: () => undefined,
+        writer: async (target, data) => {
+          if (target.includes(`${path.sep}sources${path.sep}`)) throw new Error("ENOSPC: no space left on device, write '/private/run/sources/S1.txt'");
+          await plainWrite(target, data);
+        },
+      });
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles }),
+        researcher: researcher().value,
+        ...writers,
+      });
+      expect(outcome).toMatchObject({ status: "error", message: "Could not publish workflow preview sources." });
+      expect(PREVIEW_SOURCES_FAILED).toBe("Could not publish workflow preview sources.");
+      const page = await readFile(path.join(cwd, ".unshit", "run-1", "preview.html"), "utf8");
+      expect(page).toContain("<code>file_selection</code></h2><p class=\"status\"><span lang=\"en\">Completed</span>");
+      expect(page).toContain("<code>source_reads</code></h2><p class=\"status\"><span lang=\"en\">Pending</span>");
+      expect(page).not.toContain("href=\"sources/");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("ends as an error with a fixed message, and no completed result, when the final plan cannot be written", async () => {
+    const cwd = await tempDirectory();
+    try {
+      const writers = createRunWriters({
+        cwd,
+        runId: "run-1",
+        jsonl: false,
+        write: () => undefined,
+        writer: async (target, data) => {
+          if (target.endsWith("plan.md")) throw new Error("ENOSPC: no space left on device, write '/private/run/plan.md'");
+          await plainWrite(target, data);
+        },
+      });
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles }),
+        researcher: researcher().value,
+        ...writers,
+      });
+      expect(outcome).toMatchObject({ status: "error", message: "Could not finalize workflow preview artifacts." });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("reference preview inputs", () => {
+  const requirement = "Build a refund request service.";
+  const bothFiles = { files: [{ fileId: "C1F1", role: "production", rationale: "Handler." }, { fileId: "C1F2", role: "test", rationale: "Tests." }] };
+
+  test("records every candidate the ranking turn received as supplied to the model, apart from the ones it ranked", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const published: WorkflowPreview[] = [];
+    const second = { ...repositorySnapshot().candidate, id: "C2", fullName: "org/other", webUrl: "https://github.com/org/other" };
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), ranking: { ranked: ["C2"] }, fileSelection: bothFiles, onPrompt: (prompt, schema) => { if (turnKind(schema) === "ranking") prompts.push(prompt); } }),
+        researcher: researcher({ candidates: [repositorySnapshot().candidate, second], treeResolutionLimit: 1 }).value,
+        onPreview: async (preview) => {
+          published.push(preview);
+        },
+      });
+      expect(outcome.status).toBe("completed");
+      const offered = [...prompts[0]!.matchAll(/"id":"(C\d+)"/g)].map((match) => match[1]!);
+      expect(offered).toEqual(["C1", "C2"]);
+      const ranking = stageOf(published.at(-1), "candidate_ranking")!;
+      expect(ranking.uses.filter((use) => use.relation === "supplied_to_model").map((use) => use.key)).toEqual(offered);
+      expect(ranking.uses.filter((use) => use.relation === "ranked").map((use) => use.key)).toEqual(["C2"]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("records the excerpts the evidence-request turn received, also when it adds nothing", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    const published: WorkflowPreview[] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles, evidenceRequests: { requests: [] }, onPrompt: (prompt, schema) => { if (turnKind(schema) === "requests") prompts.push(prompt); } }),
+        researcher: researcher().value,
+        onPreview: async (preview) => {
+          published.push(preview);
+        },
+      });
+      expect(outcome.status).toBe("completed");
+      const received = [...new Set([...prompts[0]!.matchAll(/"excerptId":"(E\d+)"/g)].map((match) => match[1]!))];
+      expect(received.length).toBeGreaterThan(0);
+      const requests = stageOf(published.at(-1), "evidence_requests")!;
+      expect(requests.status).toBe("completed");
+      expect(requests.uses).toEqual(received.map((key) => ({ relation: "supplied_to_model", key })));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("gives the number of files offered to file selection in the terminal, the page and the plan", async () => {
+    const cwd = await tempDirectory();
+    const output: string[] = [];
+    const prompts: string[] = [];
+    try {
+      const writers = createRunWriters({ cwd, runId: "run-1", jsonl: false, write: (text) => output.push(text) });
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles, onPrompt: (prompt, schema) => { if (turnKind(schema) === "files") prompts.push(prompt); } }),
+        researcher: researcher().value,
+        ...writers,
+      });
+      expect(outcome.status).toBe("completed");
+      const offered = new Set([...prompts[0]!.matchAll(/"fileId":"([^"]+)"/g)].map((match) => match[1]!)).size;
+      expect(offered).toBeGreaterThan(2);
+      expect(output.join("")).toContain(`[ok] file_selection: completed; selected 2; ${offered} files offered to the model\n`);
+      const page = await readFile(path.join(cwd, ".unshit", "run-1", "preview.html"), "utf8");
+      expect(page).toContain(`<p class="muted"><span lang="en">${offered} files offered to the model, not listed</span> · <span lang="zh-CN">提供给模型的文件 ${offered} 个，未逐一列出</span></p>`);
+      const plan = await readFile(path.join(cwd, ".unshit", "run-1", "plan.md"), "utf8");
+      expect(plan).toContain(`- **File selection** (\`file_selection\`): completed; ${offered} files offered to the model, not listed.\n`);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("ends as an error with a fixed message, and no completed result, when the final page cannot be written", async () => {
+    const cwd = await tempDirectory();
+    let planWritten = false;
+    try {
+      const writers = createRunWriters({
+        cwd,
+        runId: "run-1",
+        jsonl: false,
+        write: () => undefined,
+        writer: async (target, data) => {
+          if (target.endsWith("preview.html") && planWritten) throw new Error("ENOSPC: no space left on device, write '/private/run/preview.html'");
+          await plainWrite(target, data);
+          if (target.endsWith("plan.md")) planWritten = true;
+        },
+      });
+      const outcome = await runWorkflow({
+        cwd,
+        requirement,
+        approveBrief: async () => true,
+        modelGateway: gateway({ intake: baseIntake(), fileSelection: bothFiles }),
+        researcher: researcher().value,
+        ...writers,
+      });
+      expect(planWritten).toBe(true);
+      expect(outcome).toMatchObject({ status: "error", message: "Could not finalize workflow preview artifacts." });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

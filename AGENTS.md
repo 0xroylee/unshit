@@ -8,7 +8,7 @@ unshit is a Bun and TypeScript CLI. It turns a plain-language software requireme
 
 The model runs in the Codex App Server (JSON-RPC over stdio, the user's Codex login). The host, which is this code, builds every search query, reads every source, issues every ID, validates every model answer and saves the results. A run goes:
 
-intake → material answers → brief rebuild → brief approval → local baseline → GitHub search and Grep code search → metadata bar → model ranking → commit-pinned tree checks → comparator selection → file selection → pinned reads and excerpts → evidence requests → plan → independent review in a fresh session → one bounded repair → readiness → atomic save to `.unshit/<run-id>/`.
+intake → material answers → brief rebuild → brief approval → local baseline → GitHub search and Grep code search → metadata bar → reference preview and its confirmation → model ranking → commit-pinned tree checks → comparator selection → file selection → pinned reads and excerpts → evidence requests → plan → independent review in a fresh session → one bounded repair → readiness → atomic save to `.unshit/<run-id>/`.
 
 ## Layout
 
@@ -16,6 +16,7 @@ intake → material answers → brief rebuild → brief approval → local basel
 | --- | --- |
 | `src/cli.ts` | Arguments, terminal questions and brief approval, answers files, progress output, JSON and JSONL results, exit codes |
 | `src/workflow.ts` | The run: gates, search, screening, selection, evidence, plan, review and repair, readiness, checkpoints |
+| `src/preview.ts` | The stage-and-reference preview: the steps of a run, the recorder of host records and of the references each step used, reference classes |
 | `src/app-server.ts` | Codex App Server client: RPC, active-turn tracking, final text, cancellation, idle and total turn timeouts, process cleanup; `ModelGateway` is the seam |
 | `src/github.ts` | GitHub queries, Grep requests, the quality bar, commit-pinned trees, GitLab fallback |
 | `src/code-search.ts` | Grep request bodies, response parsing, hits per repository |
@@ -25,8 +26,8 @@ intake → material answers → brief rebuild → brief approval → local basel
 | `src/local.ts` | Local file baseline, exclusions, credential redaction, existing scripts |
 | `src/model-schema.ts` | The JSON Schema of each turn and the strict parsing of model answers |
 | `src/brief-approval.ts` | The editable brief, its hash, origin labels, the approval prompt |
-| `src/report.ts` | The Markdown plan |
-| `src/storage.ts` | Atomic writes of plans, manifests, source snapshots and answers files |
+| `src/report.ts` | The Markdown plan, the preview page and the terminal preview |
+| `src/storage.ts` | Atomic writes of plans, preview pages, manifests, source snapshots and answers files; the one write queue of a run |
 | `src/instructions.ts` | The embedded planning rules and `REFERENCE_POLICY_HASH` |
 | `src/skill-install.ts` | `unshit --install-skill` |
 | `src/types.ts` | Shared types |

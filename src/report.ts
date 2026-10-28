@@ -1,8 +1,27 @@
 import { topologicalTasks } from "./model-schema.ts";
 import { requirementLabel } from "./brief-approval.ts";
+import { changedStages, previewStageTitle } from "./preview.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import type { ExistingCommand } from "./types.ts";
-import type { BriefApproval, FinalSource, IntakeBrief, PlanDocument, RepositoryChoice, ResearchGap, ResearchSummary, ResolvedAnswer, ReviewResult, RunArtifacts, ValidationRecord } from "./types.ts";
+import type {
+  BriefApproval,
+  FinalSource,
+  IntakeBrief,
+  PlanDocument,
+  PreviewClassification,
+  PreviewReference,
+  PreviewRelation,
+  PreviewStageStatus,
+  PreviewUse,
+  RepositoryChoice,
+  ResearchGap,
+  ResearchSummary,
+  ResolvedAnswer,
+  ReviewResult,
+  RunArtifacts,
+  ValidationRecord,
+  WorkflowPreview,
+} from "./types.ts";
 import { describeRequestFailure } from "./request-failure.ts";
 
 export interface ReportInput {
@@ -20,6 +39,7 @@ export interface ReportInput {
   validationHistory: ValidationRecord[];
   commands: ExistingCommand[];
   artifacts?: RunArtifacts;
+  preview?: WorkflowPreview;
 }
 
 // The heading of the plan.md section that lists what the plan relies on and the host did not check. The unshit agent
@@ -291,6 +311,7 @@ export function renderReport(input: ReportInput): string {
 
   lines.push("## Checks performed", "", "The host read and hashed the listed source files and recorded the line range of every excerpt it cut. It checked that each cited excerpt ID is one it created and that each reference comparison cites only its own repository at the pinned commit, checked requirement and acceptance coverage, checked that existing verification commands come from local files it read, and checked that task dependencies exist and form no cycle. It checked that each verification names at least one wrong implementation for every acceptance criterion it covers, and that each reference test cited under an adopted pattern comes from a file it read as a test from that repository at the pinned commit. It did not check that an excerpt supports the claim next to it, and it did not run target project commands or tests.", "");
   lines.push(`## ${TRUSTED_SECTION_HEADING}`, "", ...trustedLines(input), "");
+  if (input.preview) lines.push(...previewMarkdown(input.preview), "");
   lines.push("## Source registry", "");
   if (input.sources.length === 0) lines.push("No source snapshots were prepared.", "");
   for (const source of input.sources) {
@@ -391,4 +412,240 @@ function sourceLocation(sourceId: string, start: number, end: number, input: Rep
 
 function lineAnchor(provider: FinalSource["provider"], start: number, end: number): string {
   return provider === "gitlab" ? `#L${start}-${end}` : `#L${start}-L${end}`;
+}
+
+const PREVIEW_INTRO = "A search result is a discovery hint, not evidence. A listed commit or file was not read. Evidence is source the host read and hashed, or an excerpt it cut from that source.";
+const PREVIEW_INTRO_ZH = "搜索结果只是线索，不是证据。列出的提交或文件没有读取。证据是 host 读取并计算了哈希的源码，或从中截取的片段。";
+
+const STATUS_TEXT: Record<PreviewStageStatus, [string, string]> = {
+  pending: ["Pending", "待执行"],
+  waiting: ["Waiting for confirmation", "等待确认"],
+  completed: ["Completed", "已完成"],
+  skipped: ["Skipped", "已跳过"],
+  failed: ["Failed", "失败"],
+  stopped: ["Stopped", "已停止"],
+};
+
+const RELATION_TEXT: Record<PreviewRelation, [string, string]> = {
+  found: ["Found by search", "搜索找到"],
+  passed: ["Passed the metadata bar", "通过元数据门槛"],
+  excluded: ["Excluded", "被排除"],
+  ranked: ["Ranked for tree checks", "排入文件树检查"],
+  tree_checked: ["Tree checked at a commit", "检查了固定提交的文件树"],
+  selected: ["Selected", "选中"],
+  rejected: ["Rejected", "未选中"],
+  read: ["Read and hashed", "读取并计算哈希"],
+  added: ["Added on request", "按请求补充"],
+  supplied_to_model: ["Supplied to the model", "提供给模型"],
+  cited: ["Cited by the model", "模型引用"],
+};
+
+const CLASSIFICATION_TEXT: Record<PreviewClassification, [string, string]> = {
+  discovery: ["search result, not evidence", "搜索结果，不是证据"],
+  listed: ["listed, not read", "已列出，未读取"],
+  evidence: ["read by the host", "由 host 读取"],
+};
+
+const STATUS_MARKERS: Record<PreviewStageStatus, string> = {
+  pending: "[  ]",
+  waiting: "[..]",
+  completed: "[ok]",
+  skipped: "[skip]",
+  failed: "[!]",
+  stopped: "[stop]",
+};
+
+// The uses of a stage whose key the preview lists, grouped by relation in first-use order.
+function relationGroups(uses: PreviewUse[], references: Map<string, PreviewReference>): Array<{ relation: PreviewRelation; rows: Array<{ use: PreviewUse; reference: PreviewReference }> }> {
+  const groups = new Map<PreviewRelation, Array<{ use: PreviewUse; reference: PreviewReference }>>();
+  for (const use of uses) {
+    const reference = references.get(use.key);
+    if (!reference) continue;
+    groups.set(use.relation, [...(groups.get(use.relation) ?? []), { use, reference }]);
+  }
+  return [...groups].map(([relation, rows]) => ({ relation, rows }));
+}
+
+// Relations that the terminal gives only as a count on the stage line; the page and the plan list each reference.
+const COUNTED_IN_TERMINAL = new Set<PreviewRelation>(["passed", "supplied_to_model"]);
+
+// The terminal lines for the stages that changed since `previous`, or for every stage without it. Labels and notes
+// lose control and bidirectional characters, so a file name cannot move the cursor or start a forged line.
+export function renderPreviewText(preview: WorkflowPreview, previous?: WorkflowPreview): string {
+  const references = new Map(preview.references.map((reference) => [reference.key, reference]));
+  const lines = [`Reference preview, revision ${preview.revision}:`];
+  for (const stage of changedStages(preview, previous)) {
+    const groups = relationGroups(stage.uses, references);
+    const counts = groups.map(({ relation, rows }) => `${relation} ${rows.length}`).join(", ");
+    const empty = stage.status === "completed" || stage.status === "skipped" || stage.status === "failed" ? "; no references" : "";
+    const offered = stage.offeredFiles === undefined ? "" : `; ${stage.offeredFiles} files offered to the model`;
+    lines.push(`${STATUS_MARKERS[stage.status]} ${stage.id}: ${stage.status}${counts ? `; ${counts}` : empty}${offered}`);
+    for (const { relation, rows } of groups) {
+      if (COUNTED_IN_TERMINAL.has(relation)) continue;
+      const excerpts = rows.filter(({ reference }) => reference.kind === "excerpt");
+      if (excerpts.length > 0) lines.push(`    ${relation} excerpts: ${excerpts.map(({ reference }) => reference.key).join(", ")}`);
+      for (const { use, reference } of rows) {
+        if (reference.kind === "excerpt") continue;
+        lines.push(`    ${relation} ${reference.key} ${terminalText(reference.label)} [${reference.classification}]${use.note ? ` (${terminalText(use.note)})` : ""}`);
+      }
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function terminalText(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, " ");
+}
+
+// The plan.md section: every stage with its status, and each reference it used with the relation. Labels and notes are
+// untrusted text, so each is one code span; links come only from host-built https URLs.
+function previewMarkdown(preview: WorkflowPreview): string[] {
+  const references = new Map(preview.references.map((reference) => [reference.key, reference]));
+  const lines = ["## Stages and references", "", `Revision ${preview.revision} of the stage-and-reference preview; \`preview.html\` in the run folder shows the same revision. ${PREVIEW_INTRO}`, ""];
+  for (const stage of preview.stages) {
+    const groups = relationGroups(stage.uses, references);
+    const offered = stage.offeredFiles === undefined ? "" : `; ${stage.offeredFiles} files offered to the model, not listed`;
+    lines.push(`- **${previewStageTitle(stage.id).title}** (\`${stage.id}\`): ${STATUS_TEXT[stage.status][0].toLowerCase()}${groups.length === 0 ? "; no references" : ""}${offered}.`);
+    for (const { relation, rows } of groups) {
+      const label = RELATION_TEXT[relation][0];
+      const excerpts = rows.filter(({ reference }) => reference.kind === "excerpt");
+      if (excerpts.length > 0) lines.push(`  - ${label}, ${excerpts.length} excerpt(s): ${excerpts.map(({ reference }) => markdownCode(reference.key)).join(", ")}`);
+      for (const { use, reference } of rows) {
+        if (reference.kind === "excerpt") continue;
+        const url = safePreviewUrl(reference.url);
+        const shown = url ? `[${markdownCode(reference.label)}](<${url}>)` : markdownCode(reference.label);
+        lines.push(`  - ${label}: ${markdownCode(reference.key)} ${shown} (${CLASSIFICATION_TEXT[reference.classification][0]})${use.note ? `; ${markdownCode(use.note)}` : ""}`);
+      }
+    }
+  }
+  return lines;
+}
+
+// One CommonMark code span of `value` on one line: the fence is one backtick longer than the longest run inside.
+export function markdownCode(value: string): string {
+  const text = terminalText(value);
+  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = "`".repeat(longest + 1);
+  const padded = text === "" || text.startsWith("`") || text.endsWith("`") ? ` ${text} ` : text;
+  return `${fence}${padded}${fence}`;
+}
+
+// Only an absolute https URL without whitespace, quotes or angle brackets becomes a link.
+function safePreviewUrl(url: string | undefined): string | undefined {
+  return url && /^https:\/\/[^\s"'<>`\\]+$/.test(url) ? url : undefined;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character]!);
+}
+
+function bilingual(english: string, chinese: string): string {
+  return `<span lang="en">${escapeHtml(english)}</span> · <span lang="zh-CN">${escapeHtml(chinese)}</span>`;
+}
+
+function referenceAnchor(key: string): string {
+  return `ref-${key.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+}
+
+// The page of one preview revision, readable from disk with no remote asset or script. A snapshot link appears only for
+// a source whose file this run has written (`publishedSnapshots`); other links are host-built https URLs.
+export function renderPreviewHtml(preview: WorkflowPreview, publishedSnapshots: ReadonlySet<string>): string {
+  const references = new Map(preview.references.map((reference) => [reference.key, reference]));
+  const waiting = preview.stages.some((stage) => stage.id === "preview_confirmation" && stage.status === "waiting");
+  const stages = preview.stages.map((stage, index) => {
+    const { title, titleZh } = previewStageTitle(stage.id);
+    const [status, statusZh] = STATUS_TEXT[stage.status];
+    const groups = relationGroups(stage.uses, references).map(({ relation, rows }) => {
+      const [label, labelZh] = RELATION_TEXT[relation];
+      const items = rows.map(({ use, reference }) => `<li><a href="#${referenceAnchor(reference.key)}"><code>${escapeHtml(reference.key)}</code></a> ${escapeHtml(reference.label)} <span class="tag">${bilingual(...CLASSIFICATION_TEXT[reference.classification])}</span>${use.note ? ` <span class="muted">${escapeHtml(use.note)}</span>` : ""}</li>`).join("");
+      return `<details${rows.length <= 12 ? " open" : ""}><summary>${bilingual(label, labelZh)} (${rows.length})</summary><ul>${items}</ul></details>`;
+    }).join("");
+    const empty = groups ? "" : `<p class="muted">${stage.status === "pending" || stage.status === "waiting" ? bilingual("No references yet", "暂无参考") : bilingual("No references", "无参考")}</p>`;
+    const offered = stage.offeredFiles === undefined ? "" : `<p class="muted">${bilingual(`${stage.offeredFiles} files offered to the model, not listed`, `提供给模型的文件 ${stage.offeredFiles} 个，未逐一列出`)}</p>`;
+    return `<li class="stage" data-status="${stage.status}"><h2><span class="num">${String(index + 1).padStart(2, "0")}</span> ${bilingual(title, titleZh)} <code>${stage.id}</code></h2><p class="status">${bilingual(status, statusZh)}</p>${offered}${groups}${empty}</li>`;
+  }).join("\n");
+  const registry = preview.references.map((reference) => referenceDetails(reference, publishedSnapshots)).join("\n");
+  const note = waiting
+    ? `<p class="note">${bilingual("The run is waiting at this preview. Type yes in the terminal to continue; any other reply stops it.", "运行在此预览处等待。在终端输入 yes 继续；其他回答会停止运行。")}</p>`
+    : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>unshit: stages and references</title>
+<link rel="icon" href="data:,">
+<style>
+:root { color-scheme: light dark; --bg: #ffffff; --text: #232327; --muted: #6e6e78; --line: #e0e0e4; --line-strong: #c3c3c9; --hi: #232327; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --text: #f0f0f3; --muted: #a1a1aa; --line: #27272a; --line-strong: #52525b; --hi: #fafafa; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 48px 24px 72px; }
+h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.2; margin: 0 0 12px; }
+h2 { font-size: 16px; font-weight: 620; margin: 0; }
+code, .num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+code { font-size: 0.9em; overflow-wrap: anywhere; }
+.num { font-size: 12px; color: var(--muted); }
+.muted, .status, .tag, .lede { color: var(--muted); }
+.lede { font-size: 15px; max-width: 720px; }
+.status { margin: 2px 0 0; font-size: 14px; }
+li.stage p.muted { margin: 4px 0 0; font-size: 14px; }
+.tag { font-size: 13px; }
+.note { border: 0.9px solid var(--line-strong); border-radius: 10px; padding: 12px 16px; font-size: 14px; }
+ol.stages { list-style: none; margin: 32px 0 0; padding: 0; border-top: 0.9px solid var(--line); }
+li.stage { border-bottom: 0.9px solid var(--line); padding: 16px 0; }
+li.stage[data-status="waiting"] h2 { text-decoration: underline; text-decoration-thickness: 0.9px; text-underline-offset: 4px; }
+details { margin: 8px 0 0; }
+summary { cursor: pointer; font-size: 14px; }
+ul { margin: 4px 0 0; padding-left: 20px; font-size: 14px; }
+li { overflow-wrap: anywhere; }
+a { color: inherit; }
+a:focus-visible, summary:focus-visible { outline: 0.9px solid var(--hi); outline-offset: 2px; }
+section.references { margin-top: 48px; }
+.reference { border-bottom: 0.9px solid var(--line); padding: 8px 0; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 8px 0 0; font-size: 14px; }
+dt { color: var(--muted); }
+dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 820px) { main { padding: 32px 16px 56px; } dl { grid-template-columns: 1fr; } dd { margin-bottom: 6px; } }
+</style>
+</head>
+<body>
+<main>
+<h1>${bilingual("Stages and references", "步骤与参考")}</h1>
+<p class="lede">${bilingual(`Revision ${preview.revision}. ${PREVIEW_INTRO}`, `第 ${preview.revision} 版。${PREVIEW_INTRO_ZH}`)}</p>
+${note}
+<ol class="stages">
+${stages}
+</ol>
+<section class="references">
+<h2>${bilingual("References", "参考")} (${preview.references.length})</h2>
+${registry}
+</section>
+</main>
+</body>
+</html>
+`;
+}
+
+function referenceDetails(reference: PreviewReference, publishedSnapshots: ReadonlySet<string>): string {
+  const rows: string[] = [];
+  const row = (english: string, chinese: string, value: string): void => {
+    rows.push(`<dt>${bilingual(english, chinese)}</dt><dd>${value}</dd>`);
+  };
+  row("Classification", "类别", bilingual(...CLASSIFICATION_TEXT[reference.classification]));
+  if (reference.repository) row("Repository", "仓库", `${escapeHtml(reference.provider ?? "")}:${escapeHtml(reference.repository)}`);
+  if (reference.commitSha) row("Commit", "提交", `<code>${escapeHtml(reference.commitSha)}</code>`);
+  if (reference.path) row("Path", "路径", `<code>${escapeHtml(reference.path)}</code>`);
+  if (reference.startLine !== undefined && reference.endLine !== undefined) row("Lines", "行", `L${reference.startLine}-L${reference.endLine}`);
+  if (reference.sha256) row("SHA-256", "SHA-256", `<code>${escapeHtml(reference.sha256)}</code>`);
+  if (reference.sourceKey) row("Source", "来源", `<a href="#${referenceAnchor(reference.sourceKey)}"><code>${escapeHtml(reference.sourceKey)}</code></a>`);
+  const url = safePreviewUrl(reference.url);
+  if (url) row("Link", "链接", `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`);
+  if (reference.snapshotPath) {
+    const local = publishedSnapshots.has(reference.key) && /^sources\/[A-Za-z0-9_-]+\.txt$/.test(reference.snapshotPath);
+    row("Snapshot", "快照", local
+      ? `<a href="${escapeHtml(reference.snapshotPath)}">${escapeHtml(reference.snapshotPath)}</a>`
+      : `${escapeHtml(reference.snapshotPath)} (${bilingual("not written yet", "尚未写入")})`);
+  }
+  return `<div class="reference" id="${referenceAnchor(reference.key)}"><details><summary><code>${escapeHtml(reference.key)}</code> ${escapeHtml(reference.label)}</summary><dl>${rows.join("")}</dl></details></div>`;
 }

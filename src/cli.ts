@@ -6,13 +6,16 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { stdin, stderr, stdout } from "node:process";
 import { NativeModelGateway, type AppServerClientOptions } from "./app-server.ts";
 import { GitHubResearcher } from "./github.ts";
-import { materialAnswerContext, runWorkflow, type AnswerQuestion, type ApproveBrief, type WorkflowOptions } from "./workflow.ts";
-import { createRunId, writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts } from "./storage.ts";
+import { materialAnswerContext, runWorkflow, type AnswerQuestion, type ApproveBrief, type ConfirmPreview, type WorkflowOptions } from "./workflow.ts";
+import { createRunId, createRunPublisher, writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts, writePreviewRevision, type FileWriter, type RunPublisher } from "./storage.ts";
+import { changedStages } from "./preview.ts";
+import { renderPreviewText } from "./report.ts";
+import type { LoadedEvidence } from "./evidence.ts";
 import { REFERENCE_POLICY_HASH } from "./instructions.ts";
 import { parseApprovedBrief, stableMaterialQuestionId } from "./model-schema.ts";
 import { briefSha256, isBriefApproval, renderBriefForApproval } from "./brief-approval.ts";
 import { SKILL_NAME, defaultSkillTargets, installSkill, type SkillTarget } from "./skill-install.ts";
-import type { ApprovedBrief, IntakeBrief, MaterialQuestion, ProgressEvent, ResolvedAnswer, RunOutcome } from "./types.ts";
+import type { ApprovedBrief, IntakeBrief, MaterialQuestion, ProgressEvent, ResolvedAnswer, RunOutcome, WorkflowPreview } from "./types.ts";
 
 interface CliArguments {
   requirement: string;
@@ -204,8 +207,15 @@ export async function main(argv = process.argv.slice(2), run: (options: Workflow
   const researcher = new GitHubResearcher({ githubToken: process.env.GITHUB_TOKEN, gitlabToken: process.env.GITLAB_TOKEN, codeSearch: true });
   const runId = createRunId();
   let flowHeaderPrinted = false;
+  const writers = createRunWriters({
+    cwd,
+    runId,
+    ...(reportPath ? { reportPath } : {}),
+    jsonl: args.jsonl,
+    write: (text) => (args.jsonl ? stdout : stderr).write(text),
+  });
 
-  const outcome = await runWithAnswers({
+  const ran = await runWithAnswers({
     cwd,
     requirement: args.requirement,
     signal: controller.signal,
@@ -218,14 +228,12 @@ export async function main(argv = process.argv.slice(2), run: (options: Workflow
       }
       outputProgress(event, args.jsonl);
     },
-    onCheckpoint: (details, stage) => writeCheckpointArtifacts({ cwd, runId, stage, input: { ...details, commands: details.commands } }),
-    onArtifacts: (details) => writePlanArtifacts({
-      cwd,
-      runId,
-      ...(reportPath ? { reportPath } : {}),
-      input: details,
-    }),
+    onPreview: writers.onPreview,
+    onCheckpoint: writers.onCheckpoint,
+    onArtifacts: writers.onArtifacts,
   }, loaded, prompts, run);
+  const page = writers.pagePath();
+  const outcome: RunOutcome = ran.status === "needs_input" && ran.previewStop && page ? { ...ran, previewPath: page } : ran;
 
   terminal.close();
   process.off("SIGINT", onSigint);
@@ -330,17 +338,20 @@ export function approvedBriefFrom(
   return { brief, resolvedAnswers, approval: { briefSha256: briefSha256(brief), via: "answers_file", approvedAt: now.toISOString() } };
 }
 
+type TerminalPrompts = { answerQuestion?: AnswerQuestion; approveBrief?: ApproveBrief; confirmPreview?: ConfirmPreview };
+
 // The workflow options that an answers file and the terminal prompts supply.
 export function answerOptions(
   loaded: LoadedAnswers | undefined,
-  prompts: { answerQuestion?: AnswerQuestion; approveBrief?: ApproveBrief },
-): Pick<WorkflowOptions, "answers" | "priorQuestions" | "approvedBrief" | "answerQuestion" | "approveBrief"> {
+  prompts: TerminalPrompts,
+): Pick<WorkflowOptions, "answers" | "priorQuestions" | "approvedBrief" | "answerQuestion" | "approveBrief" | "confirmPreview"> {
   return {
     answers: loaded?.answers ?? {},
     ...(loaded?.questions ? { priorQuestions: loaded.questions } : {}),
     ...(loaded?.approvedBrief ? { approvedBrief: loaded.approvedBrief } : {}),
     ...(prompts.answerQuestion ? { answerQuestion: prompts.answerQuestion } : {}),
     ...(prompts.approveBrief ? { approveBrief: prompts.approveBrief } : {}),
+    ...(prompts.confirmPreview ? { confirmPreview: prompts.confirmPreview } : {}),
   };
 }
 
@@ -349,24 +360,95 @@ export function answerOptions(
 export async function runWithAnswers(
   options: Omit<WorkflowOptions, keyof ReturnType<typeof answerOptions>>,
   loaded: LoadedAnswers | undefined,
-  prompts: { answerQuestion?: AnswerQuestion; approveBrief?: ApproveBrief },
+  prompts: TerminalPrompts,
   run: (options: WorkflowOptions) => Promise<RunOutcome> = runWorkflow,
 ): Promise<RunOutcome> {
   const outcome = await run({ ...options, ...answerOptions(loaded, prompts) });
   return withAnswersFile(outcome, { cwd: options.cwd, requirement: options.requirement, answers: loaded?.answers ?? {} });
 }
 
-// The terminal prompts: each unanswered material question, and the final brief for approval. A run with --json or
-// --jsonl, or whose stdin or stderr is not a terminal, gets neither, so it never waits on stdin: missing answers return
-// needs_input and the plan stays Draft without an approval.
+// The terminal prompts: each unanswered material question, the final brief for approval, and the reference preview
+// for confirmation. A run with --json or --jsonl, or whose stdin or stderr is not a terminal, gets none, so it never
+// waits on stdin: missing answers return needs_input, and the run stops at the reference preview, before any plan.
 export function terminalPrompts(
   mode: { json: boolean; jsonl: boolean; stdinIsTTY: boolean | undefined; stderrIsTTY: boolean | undefined },
   ask: (prompt: string) => Promise<string>,
-): { answerQuestion?: AnswerQuestion; approveBrief?: ApproveBrief } {
+): TerminalPrompts {
   if (mode.json || mode.jsonl || mode.stdinIsTTY !== true || mode.stderrIsTTY !== true) return {};
   return {
     answerQuestion: (question) => ask(`\n${question.id}: ${question.question}\nWhy it matters: ${question.whyMaterial}\n> `),
     approveBrief: createBriefApprover(ask),
+    confirmPreview: createPreviewConfirmer(ask),
+  };
+}
+
+// Asks after the preview that its publication printed, and confirms only a reply that is yes once trimmed and
+// lowercased.
+export function createPreviewConfirmer(ask: (prompt: string) => Promise<string>): ConfirmPreview {
+  return async () => isPreviewConfirmation(await ask("\nType yes to continue with candidate ranking, tree checks, source reads and planning. Any other reply stops here, and no downstream work starts.\n> "));
+}
+
+export function isPreviewConfirmation(reply: string): boolean {
+  return reply.trim().toLowerCase() === "yes";
+}
+
+// The writers of one run. The preview pages, the checkpoints and the final artifacts all go through one queue, in the
+// order the workflow calls them; the final artifacts close it. `write` reports each preview revision (stderr, or stdout
+// for JSONL); `writer` replaces the atomic file write in tests.
+export function createRunWriters(options: {
+  cwd: string;
+  runId: string;
+  reportPath?: string;
+  jsonl: boolean;
+  write: (text: string) => void;
+  writer?: FileWriter;
+}): Required<Pick<WorkflowOptions, "onPreview" | "onCheckpoint" | "onArtifacts">> & { pagePath: () => string | undefined } {
+  const { cwd, runId } = options;
+  const writer = options.writer ? { writer: options.writer } : {};
+  const publisher = createRunPublisher();
+  const preview = createPreviewPublication({ evidenceDirectory: path.join(cwd, ".unshit", runId), publisher, jsonl: options.jsonl, write: options.write, ...writer });
+  return {
+    onPreview: preview.publish,
+    onCheckpoint: (details, stage) => publisher.run(() => writeCheckpointArtifacts({ cwd, runId, stage, input: { ...details, commands: details.commands }, ...writer })),
+    onArtifacts: (details) => publisher.finalize(() => writePlanArtifacts({
+      cwd,
+      runId,
+      ...(options.reportPath ? { reportPath: options.reportPath } : {}),
+      input: details,
+      ...(details.completePreview ? { completePreview: details.completePreview } : {}),
+      ...writer,
+    })),
+    pagePath: preview.pagePath,
+  };
+}
+
+// Publishes each preview revision through `publisher`: its source snapshots and page, then a report of it. A terminal
+// gets the page path once, then the stages that changed; JSONL gets one preview line per revision.
+function createPreviewPublication(options: {
+  evidenceDirectory: string;
+  publisher: RunPublisher;
+  jsonl: boolean;
+  write: (text: string) => void;
+  writer?: FileWriter;
+}): { publish: (preview: WorkflowPreview, evidence: LoadedEvidence) => Promise<void>; pagePath: () => string | undefined } {
+  const published = new Set<string>();
+  let previous: WorkflowPreview | undefined;
+  let pagePath: string | undefined;
+  return {
+    publish: (preview, evidence) => options.publisher.run(async () => {
+      const page = await writePreviewRevision({ evidenceDirectory: options.evidenceDirectory, preview, evidence, published, ...(options.writer ? { writer: options.writer } : {}) });
+      if (options.jsonl) {
+        const stages = changedStages(preview, previous);
+        const keys = new Set(stages.flatMap((stage) => stage.uses.map((use) => use.key)));
+        options.write(`${JSON.stringify({ type: "preview", revision: preview.revision, page, stages, references: preview.references.filter((reference) => keys.has(reference.key)) })}\n`);
+      } else {
+        if (!pagePath) options.write(`Reference preview page: ${page}\n`);
+        options.write(renderPreviewText(preview, previous));
+      }
+      pagePath = page;
+      previous = preview;
+    }),
+    pagePath: () => pagePath,
   };
 }
 
@@ -422,6 +504,8 @@ export async function withAnswersFile(
   outcome: RunOutcome,
   options: { cwd: string; requirement: string; answers: Record<string, string> },
 ): Promise<RunOutcome> {
+  // A stop at the reference preview is not a question: it needs an interactive rerun, not an answers file.
+  if (outcome.status === "needs_input" && outcome.previewStop) return outcome;
   if (outcome.status === "needs_input") {
     try {
       const questions = uniqueQuestions([...outcome.brief.materialQuestions, ...outcome.questions]);
@@ -447,6 +531,10 @@ export async function withAnswersFile(
 
 // What a person reads on stderr when the run stopped for input.
 export function needsInputMessage(outcome: Extract<RunOutcome, { status: "needs_input" }>): string {
+  if (outcome.previewStop) {
+    const page = outcome.previewPath ? `Reference preview page: ${outcome.previewPath}\n` : "";
+    return `${outcome.message ?? "The run stopped at the reference preview."}\n${page}To continue past the preview, run the same command in an interactive terminal and type yes when unshit asks.\n`;
+  }
   const file = outcome.answersFile ?? "the generated answers.json";
   if (outcome.approvalRequested) {
     return `The brief was not approved, so reference search did not start.\nEdit the brief in ${file} if it needs changes, set approveBrief to true, and rerun with --answers ${file}.\n`;
@@ -539,7 +627,8 @@ export function helpText(): string {
     "",
     "The default report and evidence manifest are saved under .unshit/<run-id>/.",
     "Missing material answers return needs_input with exit code 2. A model turn that times out returns 124. Ctrl+C returns 130.",
-    "In an interactive terminal run without --json or --jsonl, unshit shows the final requirements and acceptance criteria and asks for yes before reference search; another reply returns needs_input with exit code 2. Other runs stay Draft until a rerun with --answers whose approveBrief is true.",
+    "In an interactive terminal run without --json or --jsonl, unshit shows the final requirements and acceptance criteria and asks for yes before reference search; another reply returns needs_input with exit code 2 and saves the brief in an answers file, whose approveBrief a person can set to true for a rerun with --answers.",
+    "After the search, unshit writes .unshit/<run-id>/preview.html, shows each stage with the references it used, and asks for yes before ranking, tree checks, source reads and planning; another reply returns needs_input with exit code 2. A run with --json or --jsonl, or without a terminal, stops there with exit code 2; only an interactive rerun continues past the preview.",
     "",
   ].join("\n");
 }

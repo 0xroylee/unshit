@@ -40,7 +40,8 @@ describe("unshit agent skill", () => {
     for (const line of [
       "- unshit needs network access (the GitHub API, Grep by Vercel code search and the Codex service). In a sandbox without network access, request permission to run it with network access. Do not retry it inside the sandbox.",
       "   unshit \"<requirement>\" --cwd <project> --json",
-      "3. Exit codes: `0` completed, `2` needs answers, `124` a model turn timed out, `130` cancelled, `1` error.",
+      "3. Exit codes: `0` completed, `2` stopped for answers, at the brief or at the reference preview, `124` a model turn timed out, `130` cancelled, `1` error.",
+      "- The JSON result has `previewStop` (`unavailable`: no person could be asked; `declined`: the reply was not yes), `message` and `previewPath`: the page that lists each step of the run and the references it used. It has no `answersFile`.",
       "- The JSON result has `questions` (each with `id`, `question`, `whyMaterial`) and `answersFile`.",
       "- Write each answer into the `answers` object of `answersFile`, keyed by the question `id`. Keep the `request` object unchanged.",
       "- Run the same command again, with the same requirement text and `--cwd`, and add `--answers <answersFile>`.",
@@ -58,7 +59,8 @@ describe("unshit agent skill", () => {
   const onlyTheUserApproves = "- Only the user approves the brief. Never write `approveBrief: true` into `answersFile` yourself. Give the user the file path and let them set `approveBrief` to `true`, or let them run the same command without `--json` in a terminal and approve it when unshit asks.";
   const settledDecisionsPlanAgain = "- When the user settles an open decision, unshit must plan again with it, as the note says: the decision goes into the brief of the answers file and the user sets `approveBrief` to `true`, or you add it to the requirement text in their words and the user runs that command in a terminal without `--json` and approves the brief when unshit asks. You may write the decision into the brief for the user; never set `approveBrief` yourself. Implement from the new plan.";
   const approvedFileStaysApproved = "- If the plan came from an approved answers file, `approveBrief` there is already `true`, so the user approves a change by rereading the edited brief and saving it. If you wrote the decision into that brief, show the user the change and rerun only after they have read and accepted it.";
-  const readyOnlyAfterApproval = "- A plan can be Ready only after the user approves its brief. With `--json` unshit cannot ask, so it finishes the plan as Draft, and the JSON result has `answersFile` and no `briefApproval`. When unshit cannot write the answers file, the result has no `answersFile`: tell the user, and run the same command again to get one.";
+  const readyOnlyAfterApproval = "- A plan can be Ready only after the user approves its brief. In an interactive terminal, unshit shows the brief and asks for yes before the search; any other reply stops the run (exit code 2, `approvalRequested`) and saves the brief in `answersFile`. A run with `--json` does not ask and does not reach a plan: it stops at the reference preview.";
+  const onlyTheUserConfirms = "4. A run with `--json` never gets past the reference preview: after the search it stops with exit code 2 and `previewStop`. To reach a plan, the run must be interactive: start the same command without `--json` in a terminal that the user can see and type in, or give the user the command to run there. The user answers the questions, approves the brief and confirms the preview in that terminal. You may relay what the terminal shows; only the user types `yes`.";
 
   test("leaves approval of the brief to the user and labels what the user said apart from what unshit inferred", () => {
     const lines = UNSHIT_SKILL.split("\n");
@@ -75,11 +77,13 @@ describe("unshit agent skill", () => {
     expect(lines.filter((line) => line.includes("approveBrief"))).toEqual([onlyTheUserApproves, settledDecisionsPlanAgain, approvedFileStaysApproved]);
     // Nor approve the brief, or type yes at unshit's prompt, in the user's place without naming approveBrief.
     expect(lines.filter((line) => /approv|type yes|yourself/i.test(line))).toEqual([
+      onlyTheUserConfirms,
       "- Ask the user these questions. They are business decisions: do not answer them yourself and do not invent policies or roles.",
       "## When the user has not approved the brief yet",
       readyOnlyAfterApproval,
       onlyTheUserApproves,
       "- After the user has set it, run the same command again with `--answers <answersFile>`. The user may edit the brief in `answersFile` before setting it. If the user does not approve, ask what should change, add it to the requirement text in their words, and start a new run without `--answers`.",
+      "- To continue, run the same command in an interactive terminal, as in Run. A brief approved in an answers file does not confirm the preview.",
       "  - Each note in the plan that starts with \"Open decision for\". These are the user's to settle: ask them, and do not settle them yourself.",
       settledDecisionsPlanAgain,
       approvedFileStaysApproved,
@@ -130,7 +134,8 @@ describe("unshit agent skill", () => {
 
   test("names only fields that the run result and the plan carry", () => {
     const fields: string[] = [
-      ...(["answersFile", "briefApproval", "brief"] satisfies Array<keyof Extract<RunOutcome, { status: "completed" }>>),
+      ...(["answersFile", "brief"] satisfies Array<keyof Extract<RunOutcome, { status: "completed" }>>),
+      ...(["approvalRequested", "previewStop", "previewPath"] satisfies Array<keyof Extract<RunOutcome, { status: "needs_input" }>>),
       ...(["approveBrief"] satisfies Array<keyof AnswerRequestDocument>),
       ...(["origin", "userWords", "observableAcceptance"] satisfies Array<keyof Requirement>),
       ...(["rejectsMutants"] satisfies Array<keyof VerificationMethod>),

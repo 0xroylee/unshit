@@ -157,11 +157,11 @@
         <p class="section-lede" lang="zh-CN">模型回合通过本机 Codex App Server 和你已有的登录运行。host（unshit CLI）构造每一次搜索，读取每一份源码，发出每一个 ID，并校验模型的每一个回答。</p>
         <picture class="diagram" lang="en">
           <source media="(prefers-color-scheme: dark)" srcset="images/how-it-works-en-dark.svg">
-          <img src="images/how-it-works-en-light.svg" width="900" height="794" alt="The nine steps of unshit: 1 Ask, 2 Approve the brief, 3 Local project, 4 Search, 5 Screen references, 6 Pinned reads, 7 Plan, 8 Independent review, 9 Save">
+          <img src="images/how-it-works-en-light.svg" width="900" height="794" alt="The nine steps of unshit: 1 Ask, 2 Approve the brief, 3 Local project, 4 Search and preview, 5 Screen references, 6 Pinned reads, 7 Plan, 8 Independent review, 9 Save">
         </picture>
         <picture class="diagram" lang="zh-CN">
           <source media="(prefers-color-scheme: dark)" srcset="images/how-it-works-dark.svg">
-          <img src="images/how-it-works-light.svg" width="900" height="794" alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索候选，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果">
+          <img src="images/how-it-works-light.svg" width="900" height="794" alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索与预览，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果">
         </picture>
 
         <ol class="steps">
@@ -178,9 +178,9 @@
             <p lang="en">Reads a bounded set of text files, skips generated files and private keys, and redacts credential values.</p>
             <p lang="zh-CN">读取有限数量的文本文件，排除生成物和私钥文件，遮蔽凭证值。</p></li>
           <li><span class="n">04</span>
-            <h3><span lang="en">Search</span><span lang="zh-CN">搜索候选</span><span class="who">host</span></h3>
-            <p lang="en">GitHub queries built from the brief, plus Grep code search; GitLab when GitHub has no qualified candidate. Hits are leads, never evidence.</p>
-            <p lang="zh-CN">从 brief 构造 GitHub 查询，加上 Grep 代码搜索；GitHub 没有合格候选时改查 GitLab。搜索结果只是线索，不是证据。</p></li>
+            <h3><span lang="en">Search and preview</span><span lang="zh-CN">搜索与预览</span><span class="who">host + you</span></h3>
+            <p lang="en">GitHub queries built from the brief, plus Grep code search; GitLab when GitHub has no qualified candidate. Hits are leads, never evidence. You check each step's references and type yes before ranking starts.</p>
+            <p lang="zh-CN">从 brief 构造 GitHub 查询，加上 Grep 代码搜索；GitHub 没有合格候选时改查 GitLab。搜索结果只是线索，不是证据。你看过每一步的参考、输入 yes 之后才开始排序。</p></li>
           <li><span class="n">05</span>
             <h3><span lang="en">Screen references</span><span lang="zh-CN">筛选参考</span><span class="who">host + Codex</span></h3>
             <p lang="en">The metadata bar, a model ranking, then pinned-commit checks for test files and a license. The model picks at most three comparators.</p>
@@ -223,12 +223,14 @@ unshit "为单个团队构建活动售票系统，支持售票、退款和入场
             <ol lang="en">
               <li>Answer the business questions it asks.</li>
               <li>Read the brief, with each requirement marked as said by you or inferred, and type <code class="inline">yes</code>.</li>
+              <li>After the search, check each step and the references it used, in the terminal or in <code class="inline">preview.html</code>, and type <code class="inline">yes</code>.</li>
               <li>Wait while it researches, plans and reviews, usually 15 to 30 minutes.</li>
               <li>Read the plan in the terminal or in <code class="inline">.unshit/&lt;run-id&gt;/plan.md</code>.</li>
             </ol>
             <ol lang="zh-CN">
               <li>回答它提出的业务问题。</li>
               <li>阅读 brief（每条要求标出是你说的还是推断的），输入 <code class="inline">yes</code>。</li>
+              <li>搜索之后，在终端或 <code class="inline">preview.html</code> 查看每一步和它用到的参考，输入 <code class="inline">yes</code>。</li>
               <li>等它检索、规划和复核，通常要十几到三十分钟。</li>
               <li>在终端或 <code class="inline">.unshit/&lt;run-id&gt;/plan.md</code> 阅读计划。</li>
             </ol>
@@ -237,17 +239,17 @@ unshit "为单个团队构建活动售票系统，支持售票、退款和入场
             <h3><span lang="en">In a script or an agent</span><span lang="zh-CN">在脚本或 agent 里</span></h3>
             <ol lang="en">
               <li>With <code class="inline">--json</code> or <code class="inline">--jsonl</code>, open questions return <code class="inline">needs_input</code> and exit code 2. Fill in <code class="inline">answers</code> in the answers file and rerun with <code class="inline">--answers</code>.</li>
-              <li>The plan stays Draft until you approve the brief: set <code class="inline">approveBrief</code> to <code class="inline">true</code> in the answers file it writes, and rerun with <code class="inline">--answers</code>.</li>
+              <li>After the search, the run stops at the reference preview with exit code 2 and <code class="inline">previewStop</code>. Only a run in an interactive terminal continues past it, so run the same command in a terminal and type <code class="inline">yes</code> at the brief and at the preview.</li>
             </ol>
             <ol lang="zh-CN">
               <li>使用 <code class="inline">--json</code> 或 <code class="inline">--jsonl</code> 时，有待答问题会返回 <code class="inline">needs_input</code>，退出码为 2。在补答文件的 <code class="inline">answers</code> 里填写答案，加 <code class="inline">--answers</code> 重新运行。</li>
-              <li>批准 brief 之前计划保持 Draft：把它写出的补答文件里的 <code class="inline">approveBrief</code> 改为 <code class="inline">true</code>，再用 <code class="inline">--answers</code> 重新运行。</li>
+              <li>搜索之后，运行停在参考预览，退出码为 2，结果带 <code class="inline">previewStop</code>。只有交互终端里的运行能越过预览，所以请在终端里运行同一条命令，在 brief 和预览处各输入一次 <code class="inline">yes</code>。</li>
             </ol>
           </div>
         </div>
         <div class="exit">
           <span><b>0</b><span lang="en">completed</span><span lang="zh-CN">完成</span></span>
-          <span><b>2</b><span lang="en">needs answers or approval</span><span lang="zh-CN">需要回答或批准</span></span>
+          <span><b>2</b><span lang="en">needs answers, approval or preview confirmation</span><span lang="zh-CN">需要回答、批准或确认预览</span></span>
           <span><b>124</b><span lang="en">a model turn timed out</span><span lang="zh-CN">模型回合超时</span></span>
           <span><b>130</b><span lang="en">interrupted</span><span lang="zh-CN">中断</span></span>
           <span><b>1</b><span lang="en">error</span><span lang="zh-CN">错误</span></span>

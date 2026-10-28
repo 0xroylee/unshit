@@ -1,17 +1,18 @@
-import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { PassThrough } from "node:stream";
 import { describe, expect, test } from "bun:test";
-import { answerOptions, createBriefApprover, createTerminalAsk, exitCodeFor, formatJsonlResult, gatewayOptions, helpText, main, needsInputMessage, parseCliArguments, readAnswerFile, runWithAnswers, terminalPrompts, withAnswersFile, type LoadedAnswers } from "../src/cli.ts";
+import { answerOptions, createBriefApprover, createPreviewConfirmer, createRunWriters, createTerminalAsk, exitCodeFor, formatJsonlResult, gatewayOptions, helpText, main, needsInputMessage, parseCliArguments, readAnswerFile, runWithAnswers, terminalPrompts, withAnswersFile, type LoadedAnswers } from "../src/cli.ts";
 import { briefSha256, editableBrief, renderBriefForApproval } from "../src/brief-approval.ts";
 import { sourceLocation } from "../src/evidence.ts";
 import { parseIntake, stableMaterialQuestionId } from "../src/model-schema.ts";
-import { writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts } from "../src/storage.ts";
+import { createRunPublisher, writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts } from "../src/storage.ts";
+import { PREVIEW_DECLINED, PREVIEW_UNAVAILABLE, PUBLICATION_CLOSED, candidateReference, createPreviewRecorder, evidenceReferences } from "../src/preview.ts";
 import type { WorkflowOptions } from "../src/workflow.ts";
-import type { ApprovedBrief, BriefApproval, EvidenceSource, PlanDocument, ResearchSummary, RunOutcome } from "../src/types.ts";
+import type { ApprovedBrief, BriefApproval, EvidenceSource, PlanDocument, ResearchSummary, RunOutcome, WorkflowPreview } from "../src/types.ts";
 
 const brief = parseIntake({
   summary: "Build a small API.",
@@ -508,7 +509,7 @@ describe("brief approval files", () => {
         });
         process.stdout.write = write;
         expect(exitCode).toBe(0);
-        expect([typeof received?.answerQuestion, typeof received?.approveBrief]).toEqual(run.prompts ? ["function", "function"] : ["undefined", "undefined"]);
+        expect([typeof received?.answerQuestion, typeof received?.approveBrief, typeof received?.confirmPreview]).toEqual(run.prompts ? ["function", "function", "function"] : ["undefined", "undefined", "undefined"]);
         if (run.argv.includes("--jsonl")) {
           expect(printed).toHaveLength(1);
           const line = JSON.parse(printed[0]!) as Record<string, any>;
@@ -656,7 +657,7 @@ describe("brief approval files", () => {
     for (const mode of [{ ...tty, json: true }, { ...tty, jsonl: true }, { ...tty, stdinIsTTY: undefined }, { ...tty, stdinIsTTY: false }, { ...tty, stderrIsTTY: undefined }, { ...tty, stderrIsTTY: false }]) {
       expect(terminalPrompts(mode, ask)).toEqual({});
     }
-    expect(helpText()).toContain("In an interactive terminal run without --json or --jsonl, unshit shows the final requirements and acceptance criteria and asks for yes before reference search; another reply returns needs_input with exit code 2. Other runs stay Draft until a rerun with --answers whose approveBrief is true.\n");
+    expect(helpText()).toContain("In an interactive terminal run without --json or --jsonl, unshit shows the final requirements and acceptance criteria and asks for yes before reference search; another reply returns needs_input with exit code 2 and saves the brief in an answers file, whose approveBrief a person can set to true for a rerun with --answers.\n");
   });
 
   test("shows the final brief with its summary, labelled requirements, out of scope and assumptions, and approves only yes", async () => {
@@ -758,3 +759,422 @@ describe("brief approval files", () => {
     expect(terminal.state.interrupts).toBe(0);
   });
 });
+
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+// Lets every ready promise callback and file write run, without waiting for wall-clock time.
+async function settle(): Promise<void> {
+  for (let index = 0; index < 50; index += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+
+// Files kept in memory, so every write is a promise step and settle() reaches quiescence.
+function memoryFiles(): { files: Map<string, string>; write: (target: string, data: string | Uint8Array) => Promise<void> } {
+  const files = new Map<string, string>();
+  return {
+    files,
+    write: async (target, data) => {
+      files.set(target, typeof data === "string" ? data : new TextDecoder().decode(data));
+    },
+  };
+}
+
+describe("reference preview files and output", () => {
+  const sha = "c".repeat(40);
+  const bytes = new TextEncoder().encode("export const version = 1;\n");
+  const source: EvidenceSource = {
+    id: "S1",
+    kind: "remote",
+    path: "src/app.ts",
+    sha256: "d".repeat(64),
+    lineCount: 1,
+    byteCount: bytes.byteLength,
+    provider: "github",
+    repository: "org/app",
+    commitSha: sha,
+    permalink: `https://github.com/org/app/blob/${sha}/src/app.ts`,
+    snapshotPath: "sources/S1.txt",
+    roles: ["production"],
+  };
+  const evidence = { sources: [source], excerpts: [{ id: "E1", sourceId: "S1", startLine: 1, endLine: 1, text: "export const version = 1;" }], bytesBySourceId: new Map([["S1", bytes]]), textBySourceId: new Map([["S1", "export const version = 1;\n"]]), gaps: [] };
+  const emptyEvidence = { sources: [], excerpts: [], bytesBySourceId: new Map<string, Uint8Array>(), textBySourceId: new Map<string, string>(), gaps: [] };
+  const plan: PlanDocument = {
+    title: "App plan",
+    summary: "Create records.",
+    requirements: brief.requirements,
+    tasks: [],
+    decisions: [],
+    design: {
+      architecture: "Not designed.",
+      modules: [],
+      dataModel: { entities: [], notApplicableReason: "Not designed." },
+      invariants: { items: [], notApplicableReason: "Not designed." },
+      accessControl: { boundaries: [], notApplicableReason: "Not designed." },
+    },
+    repositoryChoices: [],
+    referenceComparisons: [],
+    risks: [],
+    readiness: "draft",
+    readinessNotes: [],
+  };
+  const candidate = { id: "C1", provider: "github" as const, fullName: "org/app", description: "", defaultBranch: "main", webUrl: "https://github.com/org/app" };
+
+  // A post-search revision, then the run through the plan, then the final revision with the save completed.
+  function previews(labels: Record<string, string> = {}): { search: WorkflowPreview; later: WorkflowPreview; complete: () => WorkflowPreview } {
+    const recorder = createPreviewRecorder();
+    recorder.register([candidateReference(candidate), ...evidenceReferences(evidence)].map((reference) => labels[reference.key] ? { ...reference, label: labels[reference.key]! } : reference));
+    recorder.record("repository_search", "found", ["C1"]);
+    recorder.setStatus("repository_search", "completed");
+    recorder.record("metadata_screening", "excluded", ["C1"], new Map([["C1", labels.note ?? "archived"]]));
+    recorder.setStatus("preview_confirmation", "waiting");
+    const search = recorder.snapshot();
+    recorder.setStatus("preview_confirmation", "completed");
+    recorder.record("source_reads", "read", ["S1"]);
+    recorder.setStatus("source_reads", "completed");
+    recorder.record("plan", "cited", ["E1"]);
+    recorder.setStatus("plan", "completed");
+    const later = recorder.snapshot();
+    return {
+      search,
+      later,
+      complete: () => {
+        recorder.setStatus("save", "completed");
+        return recorder.snapshot();
+      },
+    };
+  }
+
+  function artifactInput(preview: WorkflowPreview) {
+    return {
+      brief,
+      resolvedAnswers: [],
+      plan,
+      sources: [{ id: "S1", kind: "remote" as const, path: "src/app.ts", location: source.permalink!, snapshotPath: "sources/S1.txt", sha256: source.sha256, lineCount: 1, byteCount: bytes.byteLength, roles: ["production" as const], excerpts: [{ id: "E1", startLine: 1, endLine: 1 }] }],
+      evidence,
+      gaps: [],
+      reviews: [],
+      validationIssues: [],
+      validationHistory: [],
+      commands: [],
+      preview,
+    };
+  }
+
+  test("runs queued jobs one at a time in order, rejects only the failed job, and closes the queue at finalize", async () => {
+    const publisher = createRunPublisher();
+    const order: string[] = [];
+    const hold = deferred();
+    const first = publisher.run(async () => {
+      order.push("first started");
+      await hold.promise;
+      order.push("first done");
+    });
+    const failed = publisher.run(async () => {
+      order.push("second");
+      throw new Error("second failed");
+    });
+    const final = publisher.finalize(async () => {
+      order.push("final");
+      return "artifacts";
+    });
+    await expect(publisher.run(async () => "late")).rejects.toThrow("Workflow preview publication is closed.");
+    await settle();
+    expect(order).toEqual(["first started"]);
+    hold.resolve();
+    await first;
+    await expect(failed).rejects.toThrow("second failed");
+    expect(await final).toBe("artifacts");
+    expect(order).toEqual(["first started", "first done", "second", "final"]);
+    expect(PUBLICATION_CLOSED).toBe("Workflow preview publication is closed.");
+    await expect(publisher.finalize(async () => "again")).rejects.toThrow(PUBLICATION_CLOSED);
+  });
+
+  test("lets an earlier page write finish before the final artifacts start, so no older page replaces the final one", async () => {
+    const cwd = path.join(os.tmpdir(), "unshit-preview-order");
+    const hold = deferred();
+    const written: string[] = [];
+    const memory = memoryFiles();
+    let active = 0;
+    let heldOnce = false;
+    try {
+      const writers = createRunWriters({
+        cwd,
+        runId: "run-1",
+        jsonl: false,
+        write: () => undefined,
+        writer: async (target, data) => {
+          active += 1;
+          try {
+            if (target.endsWith("preview.html") && !heldOnce) {
+              heldOnce = true;
+              await hold.promise;
+            }
+            await memory.write(target, data);
+            written.push(path.basename(target));
+          } finally {
+            active -= 1;
+          }
+        },
+      });
+      const { search, complete } = previews();
+      const older = writers.onPreview(search, emptyEvidence);
+      let completed = false;
+      const final = writers.onArtifacts({ ...artifactInput(search), completePreview: complete }).then((artifacts) => {
+        completed = true;
+        return artifacts;
+      });
+      await settle();
+      expect(written).toEqual([]);
+      expect(completed).toBe(false);
+      hold.resolve();
+      const [, artifacts] = await Promise.all([older, final]);
+      expect(active).toBe(0);
+      expect(written).toEqual(["preview.html", "S1.txt", "manifest.json", "plan.md", "preview.html"]);
+      const finalRevision = search.revision + 2;
+      expect(memory.files.get(path.join(cwd, ".unshit", "run-1", "preview.html"))).toContain(`Revision ${finalRevision}.`);
+      expect(memory.files.get(artifacts!.reportPath)).toContain(`Revision ${finalRevision} of the stage-and-reference preview`);
+      expect((JSON.parse(memory.files.get(artifacts!.manifestPath)!) as Record<string, any>).preview.revision).toBe(finalRevision);
+      await expect(writers.onPreview(search, emptyEvidence)).rejects.toThrow("Workflow preview publication is closed.");
+    } finally {
+      hold.resolve();
+    }
+  });
+
+  test("lets an earlier checkpoint finish before the final artifacts start, so no checkpoint manifest replaces the final one", async () => {
+    const cwd = path.join(os.tmpdir(), "unshit-preview-order");
+    const hold = deferred();
+    const written: string[] = [];
+    const memory = memoryFiles();
+    let heldOnce = false;
+    try {
+      const writers = createRunWriters({
+        cwd,
+        runId: "run-1",
+        jsonl: false,
+        write: () => undefined,
+        writer: async (target, data) => {
+          if (target.endsWith("manifest.json") && !heldOnce) {
+            heldOnce = true;
+            await hold.promise;
+          }
+          await memory.write(target, data);
+          written.push(path.basename(target));
+        },
+      });
+      const { later, complete } = previews();
+      const checkpoint = writers.onCheckpoint(artifactInput(later), "plan");
+      let completed = false;
+      const final = writers.onArtifacts({ ...artifactInput(later), completePreview: complete }).then((artifacts) => {
+        completed = true;
+        return artifacts;
+      });
+      await settle();
+      expect(written).toEqual(["S1.txt"]);
+      expect(completed).toBe(false);
+      hold.resolve();
+      const [, artifacts] = await Promise.all([checkpoint, final]);
+      expect(written).toEqual(["S1.txt", "manifest.json", "S1.txt", "manifest.json", "plan.md", "preview.html"]);
+      const manifest = JSON.parse(memory.files.get(artifacts!.manifestPath)!) as Record<string, any>;
+      expect(manifest.checkpointStage).toBeUndefined();
+      expect(manifest.preview.revision).toBe(later.revision + 1);
+      expect(manifest.preview.stages.find((stage: { id: string }) => stage.id === "save").status).toBe("completed");
+    } finally {
+      hold.resolve();
+    }
+  });
+
+  test("writes the final revision, with the save completed, to the plan, the manifest and the page, also with --out", async () => {
+    for (const out of [undefined, "custom-plan.md"]) {
+      const cwd = await mkdtemp(path.join(os.tmpdir(), "unshit-preview-final-"));
+      try {
+        const { search, complete } = previews();
+        const writers = createRunWriters({ cwd, runId: "run-1", jsonl: false, write: () => undefined, ...(out ? { reportPath: path.join(cwd, out) } : {}) });
+        await writers.onPreview(search, emptyEvidence);
+        let finalPreview: WorkflowPreview | undefined;
+        const artifacts = await writers.onArtifacts({ ...artifactInput(search), completePreview: () => (finalPreview = complete()) });
+        expect(artifacts?.reportPath).toBe(out ? path.join(cwd, out) : path.join(cwd, ".unshit", "run-1", "plan.md"));
+        expect(artifacts?.previewPath).toBe(path.join(cwd, ".unshit", "run-1", "preview.html"));
+        const report = await readFile(artifacts!.reportPath, "utf8");
+        const manifest = JSON.parse(await readFile(artifacts!.manifestPath, "utf8")) as Record<string, any>;
+        const page = await readFile(artifacts!.previewPath!, "utf8");
+        expect(manifest.preview).toEqual(finalPreview);
+        expect(report).toContain(`## Stages and references\n\nRevision ${finalPreview!.revision} of the stage-and-reference preview;`);
+        expect(report).toContain("- **Source reads** (`source_reads`): completed.\n  - Read and hashed: `S1` [`github:org/app@cccccccccccc src/app.ts`](<https://github.com/org/app/blob/cccccccccccccccccccccccccccccccccccccccc/src/app.ts>) (read by the host)\n");
+        expect(report).toContain("- **Plan and repair** (`plan`): completed.\n  - Cited by the model, 1 excerpt(s): `E1`\n");
+        expect(report).toContain("- **Save** (`save`): completed; no references.\n");
+        expect(page).toContain(`Revision ${finalPreview!.revision}.`);
+        expect(page).toContain("<code>save</code></h2><p class=\"status\"><span lang=\"en\">Completed</span>");
+        expect(page).toContain("<a href=\"sources/S1.txt\">sources/S1.txt</a>");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("keeps hostile labels and notes literal in the written plan: no extra heading, row, link or HTML", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "unshit-preview-markdown-"));
+    const labels = {
+      C1: "github:org/app\n## Forged heading\n- found `C9` [evil](https://evil.example/one)",
+      S1: "src/app.ts](https://evil.example/two) <img src=x onerror=alert(1)> | col | ``tick`` ![x](https://evil.example/three)",
+      note: "archived\n\n[click](https://evil.example/four)\n<script>alert(1)</script>",
+    };
+    try {
+      const { search, complete } = previews(labels);
+      const artifacts = await writePlanArtifacts({ cwd, runId: "run-1", input: artifactInput(search), completePreview: complete });
+      const report = await readFile(artifacts.reportPath, "utf8");
+      const section = report.slice(report.indexOf("## Stages and references"), report.indexOf("## Source registry"));
+      const lines = section.split("\n").slice(4).filter((line) => line !== "");
+      // One line per stage, one per reference use and one per excerpt group; nothing else.
+      expect(lines.filter((line) => line.startsWith("- **"))).toHaveLength(18);
+      expect(lines.filter((line) => line.startsWith("  - "))).toHaveLength(4);
+      expect(lines.filter((line) => !line.startsWith("- **") && !line.startsWith("  - "))).toEqual([]);
+      // Outside code spans, written out here rather than with the helper under test, no label text remains.
+      const outsideCode = withoutCodeSpans(section);
+      for (const forged of ["evil.example", "<img", "<script", "Forged heading", "[evil]", "[click]", "![x]"]) expect(outsideCode).not.toContain(forged);
+      expect([...section.matchAll(/\]\(<([^>]*)>\)/g)].map((match) => match[1])).toEqual([
+        "https://github.com/org/app",
+        "https://github.com/org/app",
+        `https://github.com/org/app/blob/${sha}/src/app.ts`,
+      ]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("names the preview page and stops with exit code 2 when a scripted run reaches the preview, and writes no answers file", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "unshit-preview-json-"));
+    const printed: string[] = [];
+    const notices: string[] = [];
+    const write = { stdout: process.stdout.write, stderr: process.stderr.write };
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      printed.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      notices.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const { search } = previews();
+      const exitCode = await main(["Build a small API.", "--cwd", cwd, "--json"], async (options) => {
+        expect(options.confirmPreview).toBeUndefined();
+        await options.onPreview!(search, emptyEvidence);
+        return { status: "needs_input", questions: [], brief, resolvedAnswers: [], previewStop: "unavailable", message: PREVIEW_UNAVAILABLE };
+      });
+      process.stdout.write = write.stdout;
+      process.stderr.write = write.stderr;
+      expect(exitCode).toBe(2);
+      expect(printed).toHaveLength(1);
+      const result = JSON.parse(printed[0]!) as Record<string, any>;
+      expect(result).toMatchObject({ status: "needs_input", previewStop: "unavailable", message: PREVIEW_UNAVAILABLE });
+      expect(result.answersFile).toBeUndefined();
+      expect(path.basename(result.previewPath)).toBe("preview.html");
+      expect(existsSync(result.previewPath)).toBe(true);
+      expect(notices.join("")).toContain(`Reference preview page: ${result.previewPath}\n`);
+      expect(notices.join("")).toContain("    found C1 github:org/app [discovery]\n");
+      expect(needsInputMessage(result as Extract<RunOutcome, { status: "needs_input" }>)).toBe(`${PREVIEW_UNAVAILABLE}\nReference preview page: ${result.previewPath}\nTo continue past the preview, run the same command in an interactive terminal and type yes when unshit asks.\n`);
+      expect(await withAnswersFile(result as RunOutcome, { cwd, requirement: "Build a small API.", answers: {} })).toBe(result as RunOutcome);
+    } finally {
+      process.stdout.write = write.stdout;
+      process.stderr.write = write.stderr;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("emits one JSONL preview line per revision with the stages that changed, before the result line", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "unshit-preview-jsonl-"));
+    const printed: string[] = [];
+    const write = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      printed.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      const { search, later } = previews();
+      const exitCode = await main(["Build a small API.", "--cwd", cwd, "--jsonl"], async (options) => {
+        await options.onPreview!(search, emptyEvidence);
+        await options.onPreview!(later, evidence);
+        return { status: "needs_input", questions: [], brief, resolvedAnswers: [], previewStop: "declined", message: PREVIEW_DECLINED };
+      });
+      process.stdout.write = write;
+      expect(exitCode).toBe(2);
+      const lines = printed.join("").trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+      expect(lines.map((line) => line.type)).toEqual(["preview", "preview", "result"]);
+      expect(lines[0]!.stages).toHaveLength(18);
+      expect(lines[1]!.stages.map((stage: { id: string }) => stage.id)).toEqual(["preview_confirmation", "source_reads", "plan"]);
+      expect(lines[1]!.references.map((reference: { key: string }) => reference.key)).toEqual(["S1", "E1"]);
+      expect(lines[1]!.page).toBe(lines[2]!.result.previewPath);
+    } finally {
+      process.stdout.write = write;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("confirms the preview only on a reply that is yes once trimmed and lowercased", async () => {
+    const cases: Array<[string, boolean]> = [
+      ["yes", true],
+      ["  YES  ", true],
+      ["Yes", true],
+      ["not yet", false],
+      ["later", false],
+      ["anything", false],
+      ["y", false],
+      ["yes please", false],
+      ["yes\nno", false],
+      ["no", false],
+      ["", false],
+      ["   ", false],
+    ];
+    for (const [reply, expected] of cases) {
+      const prompts: string[] = [];
+      const confirm = createPreviewConfirmer(async (prompt) => {
+        prompts.push(prompt);
+        return reply;
+      });
+      expect(await confirm({ revision: 1, stages: [], references: [] })).toBe(expected);
+      expect(prompts).toEqual(["\nType yes to continue with candidate ranking, tree checks, source reads and planning. Any other reply stops here, and no downstream work starts.\n> "]);
+    }
+  });
+});
+
+// The section with every CommonMark code span removed: a run of n backticks opens a span that the next run of exactly n
+// backticks closes.
+function withoutCodeSpans(text: string): string {
+  let result = "";
+  let index = 0;
+  while (index < text.length) {
+    if (text[index] !== "`") {
+      result += text[index];
+      index += 1;
+      continue;
+    }
+    let length = 0;
+    while (text[index + length] === "`") length += 1;
+    const fence = "`".repeat(length);
+    let search = index + length;
+    let close = -1;
+    while (search < text.length) {
+      const found = text.indexOf(fence, search);
+      if (found === -1) break;
+      let end = found + length;
+      if (text[found - 1] !== "`" && text[end] !== "`") {
+        close = found;
+        break;
+      }
+      while (text[end] === "`") end += 1;
+      search = end;
+    }
+    if (close === -1) {
+      result += fence;
+      index += length;
+    } else {
+      index = close + length;
+    }
+  }
+  return result;
+}

@@ -119,7 +119,7 @@ Figures used for the steps:
 | 1 Ask | `query` | a question mark |
 | 2 Approve the brief | `padlock` | a lock that opens |
 | 3 Local project | `drawer` | the project's files |
-| 4 Search | `loupe` | a magnifier over a sheet |
+| 4 Search and preview | `loupe` | a magnifier over a sheet |
 | 5 Screen references | `sieve` | filtering |
 | 6 Pinned reads | `branches` | a commit graph |
 | 7 Plan | `rebuild` | a dependency tree of tasks |
