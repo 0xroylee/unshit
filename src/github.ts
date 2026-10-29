@@ -588,6 +588,8 @@ export class GitHubResearcher {
 
   private async githubCommit(candidate: RepositoryCandidate, signal?: AbortSignal, requestAllowance?: () => boolean): Promise<{ sha: string; date?: string; attempts: number }> {
     const url = new URL(`https://api.github.com/repos/${candidate.fullName}/commits/${encodeURIComponent(candidate.defaultBranch)}`);
+    // The commit response lists the changed files with their patches, per_page of them.
+    url.searchParams.set("per_page", "1");
     const response = await this.apiJson(url, { provider: "github", endpoint: "commit" }, signal, 1_000_000, requestAllowance);
     if (!isRecord(response.value)) return { sha: "", attempts: response.attempts };
     const commit = isRecord(response.value.commit) ? response.value.commit : {};

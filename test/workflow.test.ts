@@ -715,6 +715,40 @@ describe("reference test citations", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  test("tells the planner to cite an adopted pattern's excerpts in the evidence of each module or entity that follows it", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    try {
+      await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), plans: [validPlan()], reviews: [{ findings: [] }], onPrompt: (prompt) => prompts.push(prompt) }),
+        researcher: researcher().value,
+      });
+      // The stack page shows the excerpts that each module and entity cites.
+      expect(prompts.find((prompt) => prompt.startsWith("Produce a detailed implementation plan"))).toContain("When a module or entity follows an adopted pattern, its evidence cites that pattern's excerpts as well as the local code it keeps or changes.");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("tells the review repair that a new test case run by a supplied command is an existing verification with that commandId", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    try {
+      await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), plans: [validPlan(), validPlan()], reviews: [{ findings: [testFinding] }, { findings: [] }], onPrompt: (prompt) => prompts.push(prompt) }),
+        researcher: researcher().value,
+      });
+      // parsePlan rejects a to_create verification with a commandId, and a review repair that fails it is not retried.
+      expect(prompts.find((prompt) => prompt.startsWith("Repair the current plan"))).toContain("For a verification that runs a supplied command, including a new test case that the command runs, use kind existing with that commandId. Use kind to_create with plannedCommand only for a command the target project does not have yet; to_create never takes a commandId.");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("reference test roles and checkpoints", () => {

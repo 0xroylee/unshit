@@ -827,6 +827,29 @@ describe("GitHub and GitLab repository research", () => {
     expect(urls.filter((url) => url.pathname.includes("/commits/") || url.pathname.includes("/git/trees/")).length).toBeLessThanOrEqual(16);
   });
 
+  test("asks GitHub for one changed file with the pinned commit, so a commit whose diff is over 1 MB still resolves", async () => {
+    const trees = treeFetch();
+    const researcher = new GitHubResearcher({
+      fetch: async (input) => {
+        const url = requestUrl(input);
+        // GitHub lists the commit's changed files with their patches, per_page of them (30 by default).
+        if (url.pathname.endsWith("/commits/main") && url.searchParams.get("per_page") !== "1") {
+          const files = Array.from({ length: 30 }, (_, index) => ({ filename: `dist/${index}.js`, patch: "+".repeat(40_000) }));
+          return json({ sha: COMMIT, commit: { committer: { date: "2026-06-01T00:00:00Z" } }, files });
+        }
+        return trees.fetch(input);
+      },
+      now: () => NOW,
+      shortlistSize: 1,
+      maxTreeResolutions: 1,
+    });
+
+    const result = await researcher.resolveShortlist([candidate("x", { fullName: "org/repo-x" })]);
+
+    expect(result.excluded).toEqual([]);
+    expect(result.snapshots.map((snapshot) => snapshot.commitSha)).toEqual([COMMIT]);
+  });
+
   test("counts every retried commit-pinned core attempt and excludes candidates at the core budget", async () => {
     const candidates = Array.from({ length: 8 }, (_, index) => candidate(String(index + 1), {
       fullName: `org/repo-${index + 1}`,

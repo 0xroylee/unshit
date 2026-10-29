@@ -345,6 +345,22 @@ unshit agent skill 增加了需求摘要批准、“Trusted, not checked”、�
 
 这次没有用 `--json` 真实运行新版本；脚本运行停在预览的行为由测试覆盖。
 
+## 猫骑自行车重跑：积木页面、GitHub 提交请求与复核修正（2026-10-29）
+
+第一次运行：2026-10-29 用安装版 unshit（`./install.sh`，main `dd849e7`），需求 `a cat riding a bicycle`，使用 `.unshit/2026-10-28T03-12-54-104Z-846a5159/answers.json` 里已批准的 brief，运行目录 `.unshit/2026-10-29T01-21-11-258Z-66dec787`。搜索匹配 49 个仓库，48 个通过元数据门槛，`GoogleCloudPlatform/knowledge-catalog` 因建立不到 180 天被排除；运行在预览处停下，终端输入 `yes` 后继续，09:39 结束。结果为 Draft：复核指出 T3 的 500 圈检查只看排程和经过时间，不看后面的姿势是否还在变化，30 秒后冻结的采样器也能通过；复核后的修正没有通过 host 校验（`T3 new verification must name a command to create, not an existing command ID.`）。选中 `juliangarnier/anime` 和 `konvajs/konva`。积木页面显示“5 bricks, 0 reference repositories”：五个模块都只引用本地代码；参考仓库只出现在任务 T2、设计决策 D3 和 D5，以及参考比较里。`greensock/GSAP` 没有读到文件树：GitHub 提交响应超过 1 MB 上限（用 curl 不带 token 测得：这个提交的响应为 1,196,396 字节；加上 `per_page=1` 后为 12,202 字节，仍有 SHA 和提交时间）。在这之前的一次运行（`.unshit/2026-10-28T16-06-35-301Z-ead81ff3`）在预览处等了九个小时，用 Ctrl-C 取消：终端显示 `The run was interrupted. The active Codex turn and source requests were cancelled.`，没有留下 unshit 启动的 App Server 进程。
+
+修改：提交 `75325ac`（`fix: request the pinned github commit with one changed file`）在 GitHub 提交请求里加上 `per_page=1`；提交 `8799c4c`（`fix: ask each module to cite the adopted patterns it follows`）在计划回合的提示里要求：模块或实体采用某个参考模式时，它的证据同时引用该模式的摘录和它保留或修改的本地代码；提交 `5ec5fab`（`fix: tell the review repair how to mark a new test of an existing command`）在复核修正的提示里写明：由已有命令运行的新测试用 existing 和那个 commandId，to_create 只用于目标项目还没有的命令，这个提示原来没有验证类型的规则。这两句都属于 host 文本，`REFERENCE_POLICY_HASH` 不变（`9880143d…`，与第一次运行的 manifest 相同），旧的补答文件仍可使用。
+
+| 检查 | 结果 |
+| --- | --- |
+| `bun run check` | 484 项通过，0 失败（原有 481 项，新增 3 项） |
+| 具名错误实现 | 在仓库之外的临时副本里逐个应用：去掉 `per_page=1`，新测试失败，排除原因为 `GitHub commit request failed: response exceeded the 1 MB commit limit`；去掉计划提示里的那句，新测试失败，提示中找不到这句；去掉复核修正提示里的验证类型规则，新测试失败，提示中找不到这句。三个都被杀死 |
+| 积木页面 | 三次运行的 `stack.html` 都在本机 Chrome 检查：静止、悬停展开、离开后保持、换一块、Escape、Tab、深色、390px 中文、没有脚本时的悬停，没有横向溢出、桌面页面滚动或控制台错误 |
+
+第二次运行：2026-10-29 在这个工作区用源码运行（`bun run dev`，即 `bun src/cli.ts`，提交 `8799c4c`，工作区没有未提交的改动），需求和补答文件与第一次相同，运行目录 `.unshit/2026-10-29T02-41-57-593Z-77baa91e`，10:41 开始，11:05 结束（含等待输入 `yes` 的时间）。搜索结果与第一次相同。GSAP 读到了文件树，再被质量门槛排除：固定提交 `13e2b79` 没有测试文件，GitHub 没有报告许可证，根目录也没有许可证文件。选中的仍是 anime 和 konva。积木页面显示“5 bricks, 2 reference repositories”：Scene renderer 引用 konva 的 `src/Node.ts` 和 `test/unit/Node-test.ts`，Cycle pose sampler 引用 anime 的 `src/timer/timer.js`、`src/core/render.js` 和 `tests/suites/timings.test.js`，Playback controller 引用 anime 的 `src/engine/engine.js`、`src/timer/timer.js` 和 `tests/suites/engine.test.js`，另外两个模块只引用本地代码。结果仍为 Draft，原因与第一次相同：复核指出 500 圈检查不看后面的姿势（100 圈后冻结的采样器也能通过），复核后的修正再次因同一条 host 规则没有通过校验。2026-10-28 的预览运行的复核修正也是因为这条规则没有通过校验（`T1 new verification must name a command to create, not an existing command ID.`）。
+
+第三次运行：2026-10-29 在这个工作区用源码运行（`bun run dev`，提交 `bfd22d9`，工作区没有未提交的改动；这个提交之后只改了提交说明，成为 `5ec5fab`，代码相同），需求和补答文件相同，运行目录 `.unshit/2026-10-29T03-10-46-982Z-5efef115`，11:10 开始，11:34 结束（含等待输入 `yes` 的时间）。GitHub 的 bicycle 查询这次返回 3 个结果（前两次为 5 个），搜索匹配 47 个仓库，46 个通过元数据门槛，少了 `gobicycle/bicycle` 和 `FASTSHIFT/X-TRACK`；搜索查询的代码没有改动。选中 `juliangarnier/anime` 和 `ayangweb/BongoCat`。第一次复核有一个重大问题：CMD2 和 CMD3 用 Bun 运行，但检查过的说明和前置条件里没有 Bun。复核修正通过了 host 校验，修正后的复核没有问题，结果为 Ready。这次复核的问题是命令的前置条件，与前两次不同，所以这次运行不能说明 `5ec5fab` 的规则是否起作用；它由提示测试覆盖。积木页面显示“5 bricks, 2 reference repositories”：Pose sampling 引用 BongoCat 的 `crates/bongocat-live2d/src/lib.rs`、`crates/bongocat-live2d/src/tests/model.rs` 和 anime 的 `src/core/render.js`，SVG scene 引用 BongoCat 的这两个文件，Playback and visibility 引用 anime 的 `src/engine/engine.js`、`src/timer/timer.js` 和 `tests/suites/engine.test.js`，另外两个模块只引用本地代码。这次计划的 T2 包含后段姿势的检查（`Preserve coordinated cycling and verify late pose progression`）。第二次复核报告一个存活错误实现：在 mountAnimation 的采样回调里把 elapsedMs 限制在 60000，一分钟后画面冻结，计划的检查仍会通过；存活错误实现不影响就绪判定。
+
 ## 未执行的环境
 
 Linux 原生运行尚未验证。读取上游源码和测试文件不代表执行了上游测试，也不代表已验证目标业务系统。
