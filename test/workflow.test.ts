@@ -713,6 +713,23 @@ describe("reference test citations", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  test("tells the planner to cite an adopted pattern's excerpts in the evidence of each module or entity that follows it", async () => {
+    const cwd = await tempDirectory();
+    const prompts: string[] = [];
+    try {
+      await runWorkflow({
+        cwd,
+        requirement: "Build a refund request service.",
+        modelGateway: gateway({ intake: baseIntake(), plans: [validPlan()], reviews: [{ findings: [] }], onPrompt: (prompt) => prompts.push(prompt) }),
+        researcher: researcher().value,
+      });
+      // The stack page shows the excerpts that each module and entity cites.
+      expect(prompts.find((prompt) => prompt.startsWith("Produce a detailed implementation plan"))).toContain("When a module or entity follows an adopted pattern, its evidence cites that pattern's excerpts as well as the local code it keeps or changes.");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("reference test roles and checkpoints", () => {
