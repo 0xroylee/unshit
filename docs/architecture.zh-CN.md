@@ -4,7 +4,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/how-it-works-dark.svg">
-  <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索与预览，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="images/how-it-works-light.svg" width="900">
+  <img alt="unshit 的 2.5D 电路板：host 是一颗芯片，引脚是九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索与预览，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果。你和你的 agent、Codex 的规划与复核 session、GitHub、GitLab 和 Grep、本地项目和运行目录，都接到它们参与的步骤。" src="images/how-it-works-light.svg" width="900">
 </picture>
 
 ## 处理步骤与模块
@@ -23,7 +23,7 @@
 | 8 独立复核 | 新会话复核、一次修正、再复核、Ready 或 Draft 的判断 | [workflow.ts](../src/workflow.ts)、[model-schema.ts](../src/model-schema.ts) |
 | 9 保存结果 | `plan.md`、`preview.html`、`stack.html`、两种 manifest、源码快照、补答文件的原子写入，每次运行的写入都经过同一个队列 | [report.ts](../src/report.ts)、[storage.ts](../src/storage.ts) |
 
-流程图由 [images/how-it-works.mjs](images/how-it-works.mjs) 从 Hairline 的线条图生成，生成方法见 README 的[致谢](usage.zh-CN.md#流程图与致谢)。
+电路图由 [images/how-it-works.mjs](images/how-it-works.mjs) 绘制成 2.5D 电路板，不需要任何依赖，生成方法见 README 的[致谢](usage.zh-CN.md#流程图与致谢)。
 
 ## 数据流
 

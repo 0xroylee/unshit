@@ -11,7 +11,7 @@ unshit 把一句开发需求变成建立在真实、有测试的代码上的实�
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
-  <img alt="unshit 的九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索与预览，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果" src="docs/images/how-it-works-light.svg" width="900">
+  <img alt="unshit 的 2.5D 电路板：host 是一颗芯片，引脚是九个步骤：1 提问，2 批准 brief，3 本地项目，4 搜索与预览，5 筛选参考，6 固定读取，7 生成计划，8 独立复核，9 保存结果。你和你的 agent、Codex 的规划与复核 session、GitHub、GitLab 和 Grep、本地项目和运行目录，都接到它们参与的步骤。" src="docs/images/how-it-works-light.svg" width="900">
 </picture>
 
 ## 安装
@@ -60,4 +60,4 @@ bun run build   # 编译 dist/unshit
 
 ## 致谢
 
-流程图和标志使用 [Hairline](https://hairline.lucasmarkes.com/figures) 的线条图（MIT，© Lucas Marques）。代码搜索使用 [Grep by Vercel](https://grep.app)。
+电路图和标志按 [Hairline](https://hairline.lucasmarkes.com/figures) 线条图的风格绘制（MIT，© Lucas Marques）。代码搜索使用 [Grep by Vercel](https://grep.app)。
