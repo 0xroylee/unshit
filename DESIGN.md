@@ -23,25 +23,25 @@ Site tokens are CSS custom properties in `docs/index.html`. Dark mode follows `p
 | `--line-strong` | `#c3c3c9` | `#52525b` | Buttons, the install box, code blocks, notes |
 | `--hi` | `#232327` | `#fafafa` | The emphasis stroke: primary button border, selected language |
 
-Diagram tokens are in `THEMES` in `docs/images/how-it-works.mjs`. They map to Hairline's `--hairline-*` properties.
+Diagram tokens are in `THEMES` in `docs/images/how-it-works.mjs`. They keep the names of Hairline's `--hairline-*` properties.
 
 | Token | Light | Dark | Use |
 | --- | --- | --- | --- |
-| plate | `#ffffff` | `#0d1117` | Fill of Hairline plates; must equal the background |
-| hi | `#232327` | `#fafafa` | The lit stroke of a figure |
-| edge | `#a4a4ac` | `#a1a1aa` | Silhouettes |
-| mid | `#c3c3c9` | `#52525b` | Every other figure stroke |
-| lo | `#e0e0e4` | `#27272a` | What recedes: guides |
-| title | `#232327` | `#f0f0f3` | Step titles |
-| text | `#6e6e78` | `#a1a1aa` | Captions and actor tags |
-| line | `#a4a4ac` | `#71717a` | Connectors between steps |
+| plate | `#ffffff` | `#0d1117` | Fill of the board and the parts; must equal the background |
+| hi | `#232327` | `#fafafa` | The lit strokes: the "you" tile and the blades of S1 and S2 |
+| edge | `#a4a4ac` | `#a1a1aa` | Silhouettes: the board, the sides of parts, legs, the ribbon and the host's top face |
+| mid | `#c3c3c9` | `#52525b` | Other top faces, leaders, the Codex shield and bottom-layer traces |
+| lo | `#e0e0e4` | `#27272a` | What recedes: the board's grid |
+| title | `#232327` | `#f0f0f3` | Step names, part names and callout titles |
+| text | `#6e6e78` | `#a1a1aa` | Captions |
+| line | `#a4a4ac` | `#71717a` | Traces, cables and joints |
 
 Text stays at WCAG AA contrast (4.5:1) or better. Line colours are decoration, never the only way to tell two things apart.
 
 ## Lines and shapes
 
 - Every border, divider and connector is 0.9px, the same as Hairline's `--hairline-stroke`.
-- Diagram connectors are dashed (`2 3`), 0.9px, and end in a small open chevron (about 5px). There are no filled arrowheads.
+- Diagram traces and cables are solid, 0.9px, with no arrowheads. Dashed lines mark only the search-hit trace (`2 3`), the Codex shield (`4 3`) and traces on the board's bottom layer (`1 2`). A small filled dot marks a joint where three or more trace ends meet.
 - Radius:
   - `999px`: pills, such as buttons and the language switch.
   - `12px`: cards.
@@ -65,9 +65,10 @@ Text stays at WCAG AA contrast (4.5:1) or better. Line colours are decoration, n
 | Small text, notes, lists in cards | 14 to 15px | 400 | normal |
 | Labels, buttons, switch | 13 to 15px | 400 | normal |
 | Step numbers | 12px code font, `--muted` | 400 | normal |
-| Diagram step title | 15px | 600 | normal |
-| Diagram caption | 12.5px | 400 | normal |
-| Diagram actor tag | 11px | 400 | normal |
+| Diagram step names, printed on the host | 11.5px | 400 | normal |
+| Diagram part names, printed on parts | 11px; S1, S2 and AND 10px code font | 400; 600 for you, your agent and the host | normal |
+| Diagram callout titles | 13px; Ready 15px; the run directory 12px code font | 600; 400 for the run directory | normal |
+| Diagram captions | 11px | 400 | normal |
 
 ## Layout
 
@@ -102,29 +103,14 @@ Text stays at WCAG AA contrast (4.5:1) or better. Line colours are decoration, n
 
 ## Figures and diagrams
 
-- Illustrations are Hairline figures only (`@lucasmarkes/hairline`, MIT, © Lucas Marques). The logo is the one drawn mark, and it follows the same rules (see Logo); the bricks of the stack page are drawn the same way as the logo's bricks (see Stack page). Do not mix in another illustration style. Do not add colour, fills, shadows or text inside a figure.
-- Labels go outside a figure, below it, as captions.
-- The pipeline diagram:
-  - It is 900 units wide, in three columns of 300.
-  - Figures are scaled to 0.55, which is 220 by 176.
-  - Steps run in snake order: row 1 left to right, row 2 right to left, row 3 left to right. Each title is numbered.
-  - An actor tag follows each title.
-  - Dashed connectors with chevrons join the steps.
-- Never edit the SVG files by hand. Generate them with `docs/images/how-it-works.mjs`: four variants (Chinese and English captions, each in light and dark), shown with `<picture>` and `prefers-color-scheme`.
-
-Figures used for the steps:
-
-| Step | Figure | Why |
-| --- | --- | --- |
-| 1 Ask | `query` | a question mark |
-| 2 Approve the brief | `padlock` | a lock that opens |
-| 3 Local project | `drawer` | the project's files |
-| 4 Search and preview | `loupe` | a magnifier over a sheet |
-| 5 Screen references | `sieve` | filtering |
-| 6 Pinned reads | `branches` | a commit graph |
-| 7 Plan | `rebuild` | a dependency tree of tasks |
-| 8 Independent review | `format` | crooked lines that snap square |
-| 9 Save | `cabinet` | stored snapshots |
+- Drawings follow Hairline's rules (`@lucasmarkes/hairline`, MIT, © Lucas Marques): isometric at 30°, opaque plates in the background colour, grey strokes and few lit strokes. The logo (see Logo), the bricks of the stack page (see Stack page) and the circuit diagram are drawn this way. Do not mix in another illustration style. Do not add colour, shadows or gradients.
+- The circuit diagram (`docs/images/how-it-works.mjs`):
+  - It is 900 by 580. One board unit is 10.2; x runs right and down, y left and down, z up, as in the logo.
+  - The board is a plate 0.5 units thick with a grid of dots every 2 units. The host is a chip in the middle with one pin per step, in run order; the step names are printed on its top face.
+  - `WIRING` says which steps each party is wired to: you and your agent sit off the board's left end and reach it through the terminal and `--agent` headers; the Codex planning and review sessions sit under a dashed shield; GitHub, GitLab and Grep share one connector; the local project and the run directory sit at the front edge; an AND chip with one input per readiness condition drives the Ready LED.
+  - S1 and S2 are knife switches with the blade up. Traces run along the board's axes; a trace that crosses another without joining it passes on the bottom layer between two vias.
+  - Text on a part is printed on its top face. Every other label is flat and sits off the board, next to its part or joined to it by a leader. The script warns when a label overlaps another label, the board or a part.
+- Never edit the SVG files by hand. Generate them with `node docs/images/how-it-works.mjs`: four variants (Chinese and English labels, each in light and dark), shown with `<picture>` and `prefers-color-scheme`.
 
 ## Stack page
 
@@ -176,7 +162,7 @@ The mark is a stack of toy bricks with a poop on top: a 2×2 brick on the left h
 
 ## Accessibility
 
-- Each diagram `<img>` has alt text in the page language that lists the nine steps. Each SVG has a `<title>` and a `<desc>`.
+- Each diagram `<img>` has alt text in the page language that lists the nine steps. Each SVG has a `<title>` and a `<desc>` in the language of its labels.
 - Controls are real `<button>` and `<a>` elements. The language switch has an `aria-label`.
 - Colour and line weight are never the only signal; there is always text.
 
@@ -184,4 +170,4 @@ The mark is a stack of toy bricks with a poop on top: a 2×2 brick on the left h
 
 1. Serve `docs/` at `/unshit/` (as GitHub Pages does) and render the page in Chrome in four setups: English desktop, Chinese at 390px, the dark scheme, and Chinese from the browser locale.
 2. In each setup, check that there is no horizontal overflow, no console error or failed request, and that the expected language and diagram variant loaded.
-3. Regenerate the diagrams. When no caption changed, the existing SVGs must come out byte-identical.
+3. Regenerate the diagrams. When no label changed, the existing SVGs must come out byte-identical, and the script prints no overlap warning.

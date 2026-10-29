@@ -229,5 +229,5 @@ Planning prefers to reuse what the project and the platform already have. A new 
 
 ## Diagrams and credits
 
-- The flow diagram is drawn from [Hairline](https://hairline.lucasmarkes.com/figures) line figures (`@lucasmarkes/hairline` 0.5.1, MIT license, © Lucas Marques). Hairline draws SVG with a script in the browser; [`docs/images/how-it-works.mjs`](images/how-it-works.mjs) draws these figures in headless Chrome and writes the computed styles as attributes, which gives static SVGs that need no script. When the steps change, edit `STEPS` in the script and regenerate: run `npm install @lucasmarkes/hairline playwright-core` in any directory, then run `node docs/images/how-it-works.mjs <that directory>` (Google Chrome must be installed).
+- The circuit diagram is drawn in the style of [Hairline](https://hairline.lucasmarkes.com/figures) line figures (MIT license, © Lucas Marques): isometric at 30°, opaque plates and thin grey strokes. [`docs/images/how-it-works.mjs`](images/how-it-works.mjs) draws it with no dependencies and writes four static SVGs. When the steps or their wiring change, edit `STEPS` and `WIRING` in the script and run `node docs/images/how-it-works.mjs`; it warns when a label overlaps another label, the board or a part.
 - Code search uses [Grep by Vercel](https://grep.app).

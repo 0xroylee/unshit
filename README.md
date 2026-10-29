@@ -11,7 +11,7 @@ unshit turns a plain-language requirement into an implementation plan built on r
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-en-dark.svg">
-  <img alt="The nine steps of unshit: 1 Ask, 2 Approve the brief, 3 Local project, 4 Search and preview, 5 Screen references, 6 Pinned reads, 7 Plan, 8 Independent review, 9 Save" src="docs/images/how-it-works-en-light.svg" width="900">
+  <img alt="unshit as a 2.5D circuit board: the host is a chip whose pins are the nine steps, 1 Ask, 2 Approve the brief, 3 Local project, 4 Search and preview, 5 Screen references, 6 Pinned reads, 7 Plan, 8 Independent review, 9 Save. You and your agent, the Codex planning and review sessions, GitHub, GitLab and Grep, the local project and the run directory are wired to the steps they take part in." src="docs/images/how-it-works-en-light.svg" width="900">
 </picture>
 
 ## Install
@@ -60,4 +60,4 @@ bun run build   # compiles dist/unshit
 
 ## Credits
 
-The diagram and the logo use [Hairline](https://hairline.lucasmarkes.com/figures) line figures (MIT, © Lucas Marques). Code search uses [Grep by Vercel](https://grep.app).
+The diagram and the logo are drawn in the style of [Hairline](https://hairline.lucasmarkes.com/figures) line figures (MIT, © Lucas Marques). Code search uses [Grep by Vercel](https://grep.app).

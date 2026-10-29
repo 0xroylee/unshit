@@ -4,7 +4,7 @@ English · [简体中文](architecture.zh-CN.md)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/how-it-works-en-dark.svg">
-  <img alt="The nine steps of unshit: 1 Ask, 2 Approve the brief, 3 Local project, 4 Search and preview, 5 Screen references, 6 Pinned reads, 7 Plan, 8 Independent review, 9 Save" src="images/how-it-works-en-light.svg" width="900">
+  <img alt="unshit as a 2.5D circuit board: the host is a chip whose pins are the nine steps, 1 Ask, 2 Approve the brief, 3 Local project, 4 Search and preview, 5 Screen references, 6 Pinned reads, 7 Plan, 8 Independent review, 9 Save. You and your agent, the Codex planning and review sessions, GitHub, GitLab and Grep, the local project and the run directory are wired to the steps they take part in." src="images/how-it-works-en-light.svg" width="900">
 </picture>
 
 ## Steps and modules
@@ -23,7 +23,7 @@ See [How it works](usage.md#how-it-works) in the README for what each step does.
 | 8 Independent review | Review in a fresh session, one bounded repair, another review, the Ready or Draft decision | [workflow.ts](../src/workflow.ts), [model-schema.ts](../src/model-schema.ts) |
 | 9 Save | Atomic writes of `plan.md`, `preview.html`, `stack.html`, both manifests, source snapshots and the answers file, all through one queue per run | [report.ts](../src/report.ts), [storage.ts](../src/storage.ts) |
 
-[images/how-it-works.mjs](images/how-it-works.mjs) generates the diagram from Hairline line drawings. See [Credits](usage.md#diagrams-and-credits) in the README for how to generate it.
+[images/how-it-works.mjs](images/how-it-works.mjs) draws the diagram, a 2.5D circuit board, with no dependencies. See [Credits](usage.md#diagrams-and-credits) in the README for how to generate it.
 
 ## Data flow
 

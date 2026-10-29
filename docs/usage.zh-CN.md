@@ -229,5 +229,5 @@ CLI 内嵌[入口与模块](../src/resources/reference-plan/SKILL.md)。原生 t
 
 ## 流程图与致谢
 
-- 流程图用 [Hairline](https://hairline.lucasmarkes.com/figures) 的线条图绘制（`@lucasmarkes/hairline` 0.5.1，MIT 许可，© Lucas Marques）。Hairline 在浏览器中用脚本绘制 SVG；[`docs/images/how-it-works.mjs`](images/how-it-works.mjs) 在无界面的 Chrome 中绘制这些图，把计算后的样式写成属性，得到不需要脚本的静态 SVG。步骤改变时，修改脚本里的 `STEPS` 后重新生成：在任意目录执行 `npm install @lucasmarkes/hairline playwright-core`，再运行 `node docs/images/how-it-works.mjs <该目录>`（需要安装 Google Chrome）。
+- 电路图按 [Hairline](https://hairline.lucasmarkes.com/figures) 线条图的风格绘制（MIT 许可，© Lucas Marques）：30° 等轴测、不透明的面和细灰线。[`docs/images/how-it-works.mjs`](images/how-it-works.mjs) 不需要任何依赖，直接写出四个静态 SVG。步骤或接线改变时，修改脚本里的 `STEPS` 和 `WIRING`，再运行 `node docs/images/how-it-works.mjs`；有标签和其他标签、电路板或零件重叠时，脚本会发出警告。
 - 代码搜索使用 [Grep by Vercel](https://grep.app)。
