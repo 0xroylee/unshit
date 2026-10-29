@@ -1214,6 +1214,7 @@ function reviewRepairPrompt(
   return [
     "Repair the current plan for the independent review findings. Preserve complete requirement, acceptance, and verification coverage. Use only the current evidence IDs and supplied command IDs; never claim a check ran.",
     "When a repair changes a verification, update its rejectsMutants so each covered acceptance ID keeps at least one wrong implementation and the failure the changed check reports on it.",
+    "For a verification that runs a supplied command, including a new test case that the command runs, use kind existing with that commandId. Use kind to_create with plannedCommand only for a command the target project does not have yet; to_create never takes a commandId.",
     "Each adopted pattern keeps either testEvidence that cites a test excerpt of its comparator exercising the pattern, or a concrete untestedReason. When the current plan's readinessNotes say that no adopted pattern cites a reference test, cite such a test excerpt where one is supplied; never cite a test that does not exercise the pattern to clear the note.",
     briefApprovalStatus(approval),
     "FINDINGS:",
