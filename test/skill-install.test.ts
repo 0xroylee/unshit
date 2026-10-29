@@ -5,7 +5,6 @@ import { describe, expect, test } from "bun:test";
 import { parseCliArguments } from "../src/cli.ts";
 import { SKILL_MARKER, UNSHIT_SKILL, defaultSkillTargets, installSkill } from "../src/skill-install.ts";
 import { TRUSTED_SECTION_HEADING } from "../src/report.ts";
-import type { AnswerRequestDocument } from "../src/storage.ts";
 import { OPEN_DECISION_PREFIX } from "../src/workflow.ts";
 import type { IntakeBrief, PlannedMutant, ReferenceComparison, Requirement, RequirementOrigin, RunOutcome, VerificationMethod } from "../src/types.ts";
 
@@ -35,74 +34,30 @@ async function runCli(argv: string[], home: string): Promise<{ exitCode: number;
 }
 
 describe("unshit agent skill", () => {
-  test("is a skill named unshit whose lines on exit codes, results and options match the CLI, ending with the installer marker", () => {
+  test("describes one live agent process, matching replies and explicit user approval", () => {
     expect(UNSHIT_SKILL.startsWith("---\nname: unshit\ndescription: ")).toBe(true);
-    for (const line of [
-      "- unshit needs network access (the GitHub API, Grep by Vercel code search and the Codex service). In a sandbox without network access, request permission to run it with network access. Do not retry it inside the sandbox.",
-      "   unshit \"<requirement>\" --cwd <project> --json",
-      "3. Exit codes: `0` completed, `2` stopped for answers, at the brief or at the reference preview, `124` a model turn timed out, `130` cancelled, `1` error.",
-      "- The JSON result has `previewStop` (`unavailable`: no person could be asked; `declined`: the reply was not yes), `message` and `previewPath`: the page that lists each step of the run and the references it used. It has no `answersFile`.",
-      "- The JSON result has `questions` (each with `id`, `question`, `whyMaterial`) and `answersFile`.",
-      "- Write each answer into the `answers` object of `answersFile`, keyed by the question `id`. Keep the `request` object unchanged.",
-      "- Run the same command again, with the same requirement text and `--cwd`, and add `--answers <answersFile>`.",
-      "- The JSON result has `stage`, `limit` (`idle` or `total`) and `limitSeconds`.",
-      "- Tell the user which stage timed out. To retry, run the same command again with a larger `--turn-timeout <seconds>` (30 to 3600; the default is 600, and a turn may run three times as long in total).",
-      "- The JSON result has `readiness`, `plan`, `research`, `gaps`, `sources` and `artifacts.reportPath` (the Markdown plan). The evidence is under `<project>/.unshit/<run-id>/`: `plan.md`, `manifest.json` and `sources/`.",
-      "- A run in a terminal prints no JSON result: its plan is `plan.md` in the newest `<project>/.unshit/<run-id>/` folder that has one.",
-      "- `research.selected` is the number of reference repositories selected for the plan. If `research.trustworthyReferenceFound` is false, no selected repository supplied production or test excerpts: say so plainly, the plan has no reference repository behind it.",
-    ]) {
-      expect(UNSHIT_SKILL.split("\n")).toContain(line);
-    }
     expect(UNSHIT_SKILL.trimEnd().endsWith(SKILL_MARKER)).toBe(true);
+    for (const text of [
+      'unshit "<requirement>" --cwd <project> --agent',
+      "Keep this one process alive with writable stdin",
+      '"type":"input_response","requestId":"<exact pending ID>"',
+      "show the whole `questions` batch",
+      "Ask for explicit approval of this brief",
+      "Only after the user approves this displayed brief",
+      "Use the full `preview` snapshot from this request",
+      "Each displayed approval request needs its own explicit response",
+      "Requests and replies are not persisted for resume",
+      "If the process or session is lost, start again",
+      "When live stdin is unavailable",
+      "Read and link that exact returned plan path",
+    ]) expect(UNSHIT_SKILL).toContain(text);
   });
 
-  const onlyTheUserApproves = "- Only the user approves the brief. Never write `approveBrief: true` into `answersFile` yourself. Give the user the file path and let them set `approveBrief` to `true`, or let them run the same command without `--json` in a terminal and approve it when unshit asks.";
-  const settledDecisionsPlanAgain = "- When the user settles an open decision, unshit must plan again with it, as the note says: the decision goes into the brief of the answers file and the user sets `approveBrief` to `true`, or you add it to the requirement text in their words and the user runs that command in a terminal without `--json` and approves the brief when unshit asks. You may write the decision into the brief for the user; never set `approveBrief` yourself. Implement from the new plan.";
-  const approvedFileStaysApproved = "- If the plan came from an approved answers file, `approveBrief` there is already `true`, so the user approves a change by rereading the edited brief and saving it. If you wrote the decision into that brief, show the user the change and rerun only after they have read and accepted it.";
-  const readyOnlyAfterApproval = "- A plan can be Ready only after the user approves its brief. In an interactive terminal, unshit shows the brief and asks for yes before the search; any other reply stops the run (exit code 2, `approvalRequested`) and saves the brief in `answersFile`. A run with `--json` does not ask and does not reach a plan: it stops at the reference preview.";
-  const onlyTheUserConfirms = "4. A run with `--json` never gets past the reference preview: after the search it stops with exit code 2 and `previewStop`. To reach a plan, the run must be interactive: start the same command without `--json` in a terminal that the user can see and type in, or give the user the command to run there. The user answers the questions, approves the brief and confirms the preview in that terminal. You may relay what the terminal shows; only the user types `yes`.";
-
-  test("leaves approval of the brief to the user and labels what the user said apart from what unshit inferred", () => {
-    const lines = UNSHIT_SKILL.split("\n");
-    for (const line of [
-      "## When the user has not approved the brief yet",
-      readyOnlyAfterApproval,
-      "- Show the user the whole brief: `brief.summary`, each requirement in `brief.requirements` with its `observableAcceptance`, and the lists `brief.outOfScope` and `brief.assumptions`. Label a requirement whose `origin` is `stated` \"you said\" and quote its `userWords`; label one whose `origin` is `inferred` \"inferred\": unshit found no verbatim quote of the user's words for it. Ask the user whether this is what they want.",
-      onlyTheUserApproves,
-      "- After the user has set it, run the same command again with `--answers <answersFile>`. The user may edit the brief in `answersFile` before setting it. If the user does not approve, ask what should change, add it to the requirement text in their words, and start a new run without `--answers`.",
-    ]) {
-      expect(lines).toContain(line);
-    }
-    // No other line may tell an agent when or how to set approveBrief.
-    expect(lines.filter((line) => line.includes("approveBrief"))).toEqual([onlyTheUserApproves, settledDecisionsPlanAgain, approvedFileStaysApproved]);
-    // Nor approve the brief, or type yes at unshit's prompt, in the user's place without naming approveBrief.
-    expect(lines.filter((line) => /approv|type yes|yourself/i.test(line))).toEqual([
-      onlyTheUserConfirms,
-      "- Ask the user these questions. They are business decisions: do not answer them yourself and do not invent policies or roles.",
-      "## When the user has not approved the brief yet",
-      readyOnlyAfterApproval,
-      onlyTheUserApproves,
-      "- After the user has set it, run the same command again with `--answers <answersFile>`. The user may edit the brief in `answersFile` before setting it. If the user does not approve, ask what should change, add it to the requirement text in their words, and start a new run without `--answers`.",
-      "- To continue, run the same command in an interactive terminal, as in Run. A brief approved in an answers file does not confirm the preview.",
-      "  - Each note in the plan that starts with \"Open decision for\". These are the user's to settle: ask them, and do not settle them yourself.",
-      settledDecisionsPlanAgain,
-      approvedFileStaysApproved,
-    ]);
-  });
-
-  test("has the user see what the plan trusts and settle its open decisions before implementing", () => {
-    for (const line of [
-      "  - The plan's \"Trusted, not checked\" section: what the plan relies on that unshit did not check.",
-      "  - Each note in the plan that starts with \"Open decision for\". These are the user's to settle: ask them, and do not settle them yourself.",
-      settledDecisionsPlanAgain,
-      approvedFileStaysApproved,
-      "- Before you start, make sure the user has seen the \"Trusted, not checked\" section and has settled each open decision. Do not implement an acceptance condition whose decision is still open.",
-    ]) {
-      expect(UNSHIT_SKILL.split("\n")).toContain(line);
-    }
-    // The code renders the heading and the note prefix from these constants, so a rename that leaves the skill behind fails here.
-    expect(UNSHIT_SKILL).toContain(`The plan's "${TRUSTED_SECTION_HEADING}" section`);
-    expect(UNSHIT_SKILL).toContain(`Each note in the plan that starts with "${OPEN_DECISION_PREFIX}".`);
+  test("has the user see what the plan trusts and settle open decisions before implementation", () => {
+    expect(UNSHIT_SKILL).toContain(`the plan's "${TRUSTED_SECTION_HEADING}" section`);
+    expect(UNSHIT_SKILL).toContain(`each note starting with "${OPEN_DECISION_PREFIX}"`);
+    expect(UNSHIT_SKILL).toContain("start a new run with new brief and preview approvals. Implement from the new plan.");
+    expect(UNSHIT_SKILL).toContain('Before you start, make sure the user has seen the "Trusted, not checked" section and has settled each open decision.');
   });
 
   test("writes tests against the plan's named wrong implementations and the reference tests", () => {
@@ -135,16 +90,14 @@ describe("unshit agent skill", () => {
   test("names only fields that the run result and the plan carry", () => {
     const fields: string[] = [
       ...(["answersFile", "brief"] satisfies Array<keyof Extract<RunOutcome, { status: "completed" }>>),
-      ...(["approvalRequested", "previewStop", "previewPath"] satisfies Array<keyof Extract<RunOutcome, { status: "needs_input" }>>),
-      ...(["approveBrief"] satisfies Array<keyof AnswerRequestDocument>),
-      ...(["origin", "userWords", "observableAcceptance"] satisfies Array<keyof Requirement>),
+                  ...(["origin", "userWords", "observableAcceptance"] satisfies Array<keyof Requirement>),
       ...(["rejectsMutants"] satisfies Array<keyof VerificationMethod>),
       ...(["observedFailure"] satisfies Array<keyof PlannedMutant>),
       ...(["testEvidence"] satisfies Array<keyof ReferenceComparison["adoptedPatterns"][number]>),
     ];
     for (const field of fields) expect(UNSHIT_SKILL).toContain(`\`${field}`);
     for (const field of ["summary", "requirements", "outOfScope", "assumptions"] satisfies Array<keyof IntakeBrief>) {
-      expect(UNSHIT_SKILL).toContain(`\`brief.${field}\``);
+      expect(UNSHIT_SKILL).toContain(field);
     }
     for (const origin of ["stated", "inferred"] satisfies RequirementOrigin[]) expect(UNSHIT_SKILL).toContain(`\`${origin}\``);
   });

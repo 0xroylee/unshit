@@ -336,6 +336,8 @@ function briefApprovalText(approval: BriefApproval | undefined): string {
   if (!approval) return "No person approved this brief before reference research, so the plan is Draft.";
   const source = approval.via === "tty"
     ? "Approved by a yes typed at the interactive terminal prompt; the host cannot tell who typed it"
+    : approval.via === "agent"
+      ? "The host received approved true through the agent protocol; it cannot verify who approved this brief"
     : "The answers file approved this brief (approveBrief was true); the host cannot tell who set it";
   return `${source}. Recorded ${approval.approvedAt}; brief SHA-256 \`${approval.briefSha256}\`.`;
 }
@@ -362,6 +364,8 @@ function trustedLines(input: ReportInput): string[] {
   if (referenceTests > 0) lines.push(`- The plan cites ${referenceTests} distinct reference test excerpt(s) under adopted patterns. The host recognises a test file by its path name only; it read these at the pinned commit and ran none of them, and that each one exercises its pattern rests on the planner and the independent review.`);
   if (input.briefApproval) lines.push(input.briefApproval.via === "answers_file"
     ? "- The brief approval came from an answers file whose approveBrief was true; the host cannot tell who set it."
+    : input.briefApproval.via === "agent"
+      ? "- The host received brief approval through the agent protocol; it cannot verify who approved it."
     : "- The brief approval is a yes typed at an interactive terminal prompt; the host takes it as the user's and cannot tell who typed it.");
   return lines;
 }

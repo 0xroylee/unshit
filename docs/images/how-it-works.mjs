@@ -17,10 +17,10 @@ const outDir = dirname(fileURLToPath(import.meta.url));
 const { chromium } = createRequire(join(pkgDir, "package.json"))("playwright-core");
 
 const STEPS = [
-  { figure: "query", zh: { title: "提问", who: "Codex", lines: ["从需求提取要求与验收", "缺业务决定时先问你"] }, en: { title: "Ask", who: "Codex", lines: ["Extracts requirements and acceptance", "Asks when a business decision is missing"] } },
-  { figure: "padlock", zh: { title: "批准 brief", who: "你", lines: ["你确认整份 brief", "终端输入 yes 或补答文件"] }, en: { title: "Approve the brief", who: "you", lines: ["You confirm the whole brief", "yes in the terminal, or the answers file"] } },
+  { figure: "query", zh: { title: "提问", who: "Codex", lines: ["从需求提取要求与验收", "缺业务决定时在终端或聊天提问"] }, en: { title: "Ask", who: "Codex", lines: ["Extracts requirements and acceptance", "Questions at the terminal or in chat"] } },
+  { figure: "padlock", zh: { title: "批准 brief", who: "你", lines: ["你确认整份 brief", "终端、补答文件或 agent 转达"] }, en: { title: "Approve the brief", who: "you", lines: ["You confirm the whole brief", "Terminal, answers file, or agent relay"] } },
   { figure: "drawer", zh: { title: "本地项目", who: "", lines: ["读取目标项目的文件与脚本", "凭证先遮蔽"] }, en: { title: "Local project", who: "", lines: ["Reads the target project's files and scripts", "Credentials are redacted first"] } },
-  { figure: "loupe", zh: { title: "搜索与预览", who: "你", lines: ["host 构造的查询加 Grep 搜索", "你看过参考后输入 yes"] }, en: { title: "Search and preview", who: "you", lines: ["Host-built queries plus Grep search", "You check the references, then yes"] } },
+  { figure: "loupe", zh: { title: "搜索与预览", who: "你", lines: ["host 构造的查询加 Grep 搜索", "你在终端或聊天里确认参考"] }, en: { title: "Search and preview", who: "you", lines: ["Host-built queries plus Grep search", "You confirm in the terminal or chat"] } },
   { figure: "sieve", zh: { title: "筛选参考", who: "Codex", lines: ["元数据门槛、模型排序", "固定提交的测试与许可证检查"] }, en: { title: "Screen references", who: "Codex", lines: ["Metadata bar and model ranking", "Pinned checks for tests and a license"] } },
   { figure: "branches", zh: { title: "固定读取", who: "", lines: ["按提交读取源码", "记录 SHA-256 与行号"] }, en: { title: "Pinned reads", who: "", lines: ["Reads source at a pinned commit", "Records SHA-256 and line ranges"] } },
   { figure: "rebuild", zh: { title: "生成计划", who: "Codex", lines: ["按依赖排序的任务", "验收与具名错误实现"] }, en: { title: "Plan", who: "Codex", lines: ["Tasks in dependency order", "Acceptance, named wrong implementations"] } },

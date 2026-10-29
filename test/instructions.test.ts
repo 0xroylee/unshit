@@ -106,8 +106,8 @@ describe("modular reference-plan guidance", () => {
     expect(intake.text).toContain("Label every requirement with the user's own words that state it, copied exactly from the request or a confirmed answer, or mark it inferred when the user did not state it. Never present an inferred requirement as something the user said.");
   });
 
-  test("leaves brief approval to the host in the developer instructions, which ask only in an interactive terminal run", () => {
-    expect(DEVELOPER_INSTRUCTIONS.split("\n")).toContain("- The host handles brief approval. When a run starts from an answers file in which the user approved the brief, the host uses that brief as approved. Otherwise, only in an interactive terminal run does the host show the final requirements and acceptance criteria to the user and record whether they approved them; in other runs the host asks nothing, keeps the plan Draft, and saves the brief in an answers file where the user can approve it for a rerun. Do not ask for the host's brief approval as a material question.");
+  test("leaves terminal and agent brief approval to the host in developer instructions", () => {
+    expect(DEVELOPER_INSTRUCTIONS.split("\n")).toContain("- The host handles brief approval. When a run starts from an answers file in which the user approved the brief, the host uses that brief as approved. Otherwise, the host requests approval of the final requirements and acceptance criteria at an interactive terminal or through the opt-in agent protocol; the host cannot verify who approved them. In other runs the host asks nothing and keeps the plan Draft without approval. Do not ask for the host's brief approval as a material question.");
     // Every model session starts with these instructions, so none of their sentences may leave approval to the model.
     for (const sentence of DEVELOPER_INSTRUCTIONS.split(/(?<=\.)\s+|\n/)) {
       if (/approv/i.test(sentence)) expect(sentence).toContain("host");

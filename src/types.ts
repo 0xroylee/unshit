@@ -68,7 +68,7 @@ export interface ResolvedAnswer {
 // an answers file whose approveBrief was true.
 export interface BriefApproval {
   briefSha256: string;
-  via: "tty" | "answers_file";
+  via: "tty" | "answers_file" | "agent";
   approvedAt: string;
 }
 
@@ -536,4 +536,4 @@ export type RunOutcome =
   | { status: "completed"; readiness: Readiness; brief: IntakeBrief; initialBrief?: IntakeBrief; research?: ResearchSummary; resolvedAnswers: ResolvedAnswer[]; briefApproval?: BriefApproval; answersFile?: string; plan: PlanDocument; sources: FinalSource[]; gaps: ResearchGap[]; reviews: ReviewResult[]; artifacts?: RunArtifacts; validationIssues: string[]; validationHistory: ValidationRecord[] }
   | { status: "interrupted"; message: string; checkpointPath?: string }
   | { status: "timed_out"; message: string; stage: string; limit: "idle" | "total"; limitSeconds: number; checkpointPath?: string }
-  | { status: "error"; message: string; checkpointPath?: string };
+  | { status: "error"; message: string; checkpointPath?: string; code?: "agent_protocol_error" };

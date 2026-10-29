@@ -171,16 +171,16 @@
             <p lang="zh-CN">从需求中提取要求和验收。只有业务决定会影响范围、权限或验收时才提问。</p></li>
           <li><span class="n">02</span>
             <h3><span lang="en">Approve the brief</span><span lang="zh-CN">批准 brief</span><span class="who"><span lang="en">you</span><span lang="zh-CN">你</span></span></h3>
-            <p lang="en">In a terminal, research starts only after you type <code class="inline">yes</code>. A plan without approval stays Draft.</p>
-            <p lang="zh-CN">在终端里，你输入 <code class="inline">yes</code> 后才开始检索。没有人批准的计划保持 Draft。</p></li>
+            <p lang="en">Research starts after terminal <code class="inline">yes</code> or your explicit approval relayed through <code class="inline">--agent</code>. A plan without approval stays Draft.</p>
+            <p lang="zh-CN">在终端输入 <code class="inline">yes</code>，或通过 <code class="inline">--agent</code> 转达你的明确批准后才开始检索。没有批准的计划保持 Draft。</p></li>
           <li><span class="n">03</span>
             <h3><span lang="en">Local project</span><span lang="zh-CN">本地项目</span><span class="who">host</span></h3>
             <p lang="en">Reads a bounded set of text files, skips generated files and private keys, and redacts credential values.</p>
             <p lang="zh-CN">读取有限数量的文本文件，排除生成物和私钥文件，遮蔽凭证值。</p></li>
           <li><span class="n">04</span>
             <h3><span lang="en">Search and preview</span><span lang="zh-CN">搜索与预览</span><span class="who">host + you</span></h3>
-            <p lang="en">GitHub queries built from the brief, plus Grep code search; GitLab when GitHub has no qualified candidate. Hits are leads, never evidence. You check each step's references and type yes before ranking starts.</p>
-            <p lang="zh-CN">从 brief 构造 GitHub 查询，加上 Grep 代码搜索；GitHub 没有合格候选时改查 GitLab。搜索结果只是线索，不是证据。你看过每一步的参考、输入 yes 之后才开始排序。</p></li>
+            <p lang="en">GitHub queries built from the brief, plus Grep code search; GitLab when GitHub has no qualified candidate. Hits are leads, never evidence. You check each step's references and confirm at the terminal or in chat before ranking starts.</p>
+            <p lang="zh-CN">从 brief 构造 GitHub 查询，加上 Grep 代码搜索；GitHub 没有合格候选时改查 GitLab。搜索结果只是线索，不是证据。你看过每一步的参考，在终端或聊天里确认之后才开始排序。</p></li>
           <li><span class="n">05</span>
             <h3><span lang="en">Screen references</span><span lang="zh-CN">筛选参考</span><span class="who">host + Codex</span></h3>
             <p lang="en">The metadata bar, a model ranking, then pinned-commit checks for test files and a license. The model picks at most three comparators.</p>
@@ -238,12 +238,16 @@ unshit "为单个团队构建活动售票系统，支持售票、退款和入场
           <div class="card">
             <h3><span lang="en">In a script or an agent</span><span lang="zh-CN">在脚本或 agent 里</span></h3>
             <ol lang="en">
-              <li>With <code class="inline">--json</code> or <code class="inline">--jsonl</code>, open questions return <code class="inline">needs_input</code> and exit code 2. Fill in <code class="inline">answers</code> in the answers file and rerun with <code class="inline">--answers</code>.</li>
-              <li>After the search, the run stops at the reference preview with exit code 2 and <code class="inline">previewStop</code>. Only a run in an interactive terminal continues past it, so run the same command in a terminal and type <code class="inline">yes</code> at the brief and at the preview.</li>
+              <li>For a live agent, use <code class="inline">--agent</code>. Keep one process and stdin open. It emits JSONL requests for a question batch, the complete brief, and the complete reference preview with its page path and revision.</li>
+              <li>The agent shows each request in chat and relays your answers or explicit approval using its exact <code class="inline">requestId</code>. Brief approval and preview confirmation are separate. Read the exact returned <code class="inline">artifacts.reportPath</code>.</li>
+              <li>There is no reply timeout. Cancel, Ctrl+C or EOF returns 130; invalid protocol input fails with 1. Restart for edits or process loss. Use a visible terminal when live stdin is unavailable. <a href="usage.md#agent-protocol">Protocol details</a>.</li>
+              <li>Plain <code class="inline">--json</code> and <code class="inline">--jsonl</code> still return missing questions with exit 2 and an answers file, or stop at the reference preview. They require a terminal rerun or a fresh <code class="inline">--agent</code> run to continue.</li>
             </ol>
             <ol lang="zh-CN">
-              <li>使用 <code class="inline">--json</code> 或 <code class="inline">--jsonl</code> 时，有待答问题会返回 <code class="inline">needs_input</code>，退出码为 2。在补答文件的 <code class="inline">answers</code> 里填写答案，加 <code class="inline">--answers</code> 重新运行。</li>
-              <li>搜索之后，运行停在参考预览，退出码为 2，结果带 <code class="inline">previewStop</code>。只有交互终端里的运行能越过预览，所以请在终端里运行同一条命令，在 brief 和预览处各输入一次 <code class="inline">yes</code>。</li>
+              <li>实时 agent 使用 <code class="inline">--agent</code>，保持同一个进程和 stdin 打开。JSONL 请求包含整批问题、完整 brief，以及带页面路径和版本的完整参考预览。</li>
+              <li>agent 在聊天里展示请求，用准确的 <code class="inline">requestId</code> 转达你的答案或明确批准。brief 批准和预览确认分开进行，读取返回的准确 <code class="inline">artifacts.reportPath</code>。</li>
+              <li>等待回复没有超时。cancel、Ctrl+C 或 EOF 返回 130；无效协议输入以 1 失败。编辑或进程丢失时重新运行；无法实时写 stdin 时使用可见终端。<a href="usage.zh-CN.md#agent-协议">协议详情</a>。</li>
+              <li>普通 <code class="inline">--json</code> 和 <code class="inline">--jsonl</code> 仍以退出码 2 返回待答问题和补答文件，或停在参考预览。继续需要在终端重跑，或重新开始 <code class="inline">--agent</code> 运行。</li>
             </ol>
           </div>
         </div>

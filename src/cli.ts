@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
 import { stdin, stderr, stdout } from "node:process";
+import type { Readable } from "node:stream";
+import { createAgentProtocol } from "./agent-protocol.ts";
 import { NativeModelGateway, type AppServerClientOptions } from "./app-server.ts";
 import { GitHubResearcher } from "./github.ts";
-import { materialAnswerContext, runWorkflow, type AnswerQuestion, type ApproveBrief, type ConfirmPreview, type WorkflowOptions } from "./workflow.ts";
+import { materialAnswerContext, runWorkflow, type AnswerQuestion, type AnswerQuestions, type ApproveBrief, type ConfirmPreview, type WorkflowOptions } from "./workflow.ts";
 import { createRunId, createRunPublisher, writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts, writePreviewRevision, type FileWriter, type RunPublisher } from "./storage.ts";
 import { changedStages } from "./preview.ts";
 import { renderPreviewText } from "./report.ts";
@@ -27,6 +29,7 @@ interface CliArguments {
   turnTimeoutSeconds?: number;
   json: boolean;
   jsonl: boolean;
+  agent: boolean;
   help: boolean;
   installSkill: boolean;
   skillDir?: string;
@@ -49,6 +52,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
   let turnTimeoutSeconds: number | undefined;
   let json = false;
   let jsonl = false;
+  let agent = false;
   let help = false;
   let installSkillFlag = false;
   let skillDir: string | undefined;
@@ -63,6 +67,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
     }
     if (token === "--json") { json = true; continue; }
     if (token === "--jsonl") { jsonl = true; continue; }
+    if (token === "--agent") { agent = true; continue; }
     if (token === "--install-skill") { installSkillFlag = true; continue; }
     if (token === "--force") { force = true; continue; }
     const [name, inlineValue] = token.startsWith("--") && token.includes("=") ? [token.slice(0, token.indexOf("=")), token.slice(token.indexOf("=") + 1)] : [token, undefined];
@@ -82,13 +87,16 @@ export function parseCliArguments(argv: string[]): CliArguments {
     positional.push(token);
   }
 
+  if (agent && json) throw new CliError("--agent uses JSONL and cannot be combined with --json.");
+  if (agent && installSkillFlag) throw new CliError("--agent cannot be combined with --install-skill.");
+  if (agent) jsonl = true;
   if (json && jsonl) throw new CliError("Use either --json or --jsonl, not both.");
   if (installSkillFlag) {
     if (positional.length > 0 || cwd || out || answers || model || effort || turnTimeoutSeconds !== undefined) {
       throw new CliError("--install-skill runs on its own; it does not take a requirement or planning options.");
     }
     if (jsonl) throw new CliError("Use --json with --install-skill.");
-    return { requirement: "", json, jsonl, help, installSkill: true, ...(skillDir ? { skillDir } : {}), force };
+    return { requirement: "", json, jsonl, agent, help, installSkill: true, ...(skillDir ? { skillDir } : {}), force };
   }
   if (skillDir || force) throw new CliError("--skill-dir and --force work only with --install-skill.");
   if (effort && !["minimal", "low", "medium", "high", "xhigh"].includes(effort)) {
@@ -98,7 +106,7 @@ export function parseCliArguments(argv: string[]): CliArguments {
   if (["resume", "refs", "export"].includes(positional[0]?.toLowerCase() ?? "")) {
     throw new CliError("This CLI accepts one software requirement and produces a plan. Start with a quoted requirement.");
   }
-  return { requirement: positional.join(" "), cwd, out, answers, model, effort, turnTimeoutSeconds, json, jsonl, help, installSkill: false, force: false };
+  return { requirement: positional.join(" "), cwd, out, answers, model, effort, turnTimeoutSeconds, json, jsonl, agent, help, installSkill: false, force: false };
 }
 
 function parseTurnTimeout(value: string): number {
@@ -147,12 +155,12 @@ async function runInstallSkill(args: CliArguments): Promise<number> {
 }
 
 // `run` is the workflow; a test passes its own to check main's handling of options, files and output.
-export async function main(argv = process.argv.slice(2), run: (options: WorkflowOptions) => Promise<RunOutcome> = runWorkflow): Promise<number> {
+export async function main(argv = process.argv.slice(2), run: (options: WorkflowOptions) => Promise<RunOutcome> = runWorkflow, agentInput: Readable = stdin): Promise<number> {
   let args: CliArguments;
   try {
     args = parseCliArguments(argv);
   } catch (error) {
-    return writeCliError(error instanceof Error ? error.message : "Invalid command line.", argv.includes("--json"), argv.includes("--jsonl"));
+    return writeCliError(error instanceof Error ? error.message : "Invalid command line.", argv.includes("--json") && !argv.includes("--agent"), argv.includes("--jsonl") || argv.includes("--agent"));
   }
   if (args.help) {
     stdout.write(helpText());
@@ -214,51 +222,76 @@ export async function main(argv = process.argv.slice(2), run: (options: Workflow
     jsonl: args.jsonl,
     write: (text) => (args.jsonl ? stdout : stderr).write(text),
   });
-
-  const ran = await runWithAnswers({
-    cwd,
-    requirement: args.requirement,
-    signal: controller.signal,
-    modelGateway: gateway,
-    researcher,
-    onProgress: (event) => {
-      if (!args.jsonl && !flowHeaderPrinted) {
-        stderr.write("Flow: scope -> sources -> evidence -> plan -> review -> saved\n");
-        flowHeaderPrinted = true;
-      }
-      outputProgress(event, args.jsonl);
+  const agent = args.agent ? createAgentProtocol({ input: agentInput, write: (text) => stdout.write(text), controller }) : undefined;
+  const inputPrompts: TerminalPrompts = agent ? {
+    answerQuestions: agent.answerQuestions,
+    approveBrief: agent.approveBrief,
+    approvalVia: "agent",
+    confirmPreview: (preview) => {
+      const page = writers.pagePath();
+      if (!page) throw new Error("Could not save workflow preview.");
+      return agent.confirmPreview(preview, page);
     },
-    onPreview: writers.onPreview,
-    onCheckpoint: writers.onCheckpoint,
-    onArtifacts: writers.onArtifacts,
-  }, loaded, prompts, run);
-  const page = writers.pagePath();
-  const outcome: RunOutcome = ran.status === "needs_input" && ran.previewStop && page ? { ...ran, previewPath: page } : ran;
+  } : prompts;
 
-  terminal.close();
-  process.off("SIGINT", onSigint);
-  if (outcome.status === "completed" && !args.json && !args.jsonl && outcome.artifacts) {
-    const report = await readFile(outcome.artifacts.reportPath, "utf8");
-    stdout.write(`${report}\n`);
-    if (outcome.answersFile) stderr.write(`No person approved the brief, so the plan is Draft. Read the brief in ${outcome.answersFile}; to approve it, set approveBrief to true and rerun with --answers ${outcome.answersFile}.\n`);
-  } else if (args.json) {
-    stdout.write(`${JSON.stringify(outcome)}\n`);
-  } else if (outcome.status === "needs_input") {
-    stderr.write(needsInputMessage(outcome));
-  } else if (outcome.status === "interrupted") {
-    stderr.write(`${outcome.message}\n`);
-    if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
-  } else if (outcome.status === "timed_out") {
-    stderr.write(`${outcome.message}\n`);
-    if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
-    stderr.write("Use --turn-timeout <seconds> to allow longer model turns.\n");
-  } else if (outcome.status === "error") {
-    stderr.write(`${outcome.message}\n`);
-    if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
+  try {
+    let ran: RunOutcome;
+    try {
+      ran = await runWithAnswers({
+        cwd,
+        requirement: args.requirement,
+        signal: controller.signal,
+        modelGateway: gateway,
+        researcher,
+        onProgress: (event) => {
+          if (!args.jsonl && !flowHeaderPrinted) {
+            stderr.write("Flow: scope -> sources -> evidence -> plan -> review -> saved\n");
+            flowHeaderPrinted = true;
+          }
+          outputProgress(event, args.jsonl);
+        },
+        onPreview: writers.onPreview,
+        onCheckpoint: writers.onCheckpoint,
+        onArtifacts: writers.onArtifacts,
+      }, loaded, inputPrompts, run);
+    } catch (error) {
+      if (!agent) throw error;
+      ran = { status: "error", message: "The workflow failed." };
+    }
+    agent?.finish();
+    const protocolFailure = agent?.failure();
+    if (protocolFailure) ran = { status: "error", code: protocolFailure.code, message: protocolFailure.message };
+    else if (args.agent && controller.signal.aborted) ran = { status: "interrupted", message: "The agent run was interrupted.", ...("checkpointPath" in ran && ran.checkpointPath ? { checkpointPath: ran.checkpointPath } : {}) };
+    const page = writers.pagePath();
+    const outcome: RunOutcome = ran.status === "needs_input" && ran.previewStop && page ? { ...ran, previewPath: page } : ran;
+
+    if (outcome.status === "completed" && !args.json && !args.jsonl && outcome.artifacts) {
+      const report = await readFile(outcome.artifacts.reportPath, "utf8");
+      stdout.write(`${report}\n`);
+      if (outcome.answersFile) stderr.write(`No person approved the brief, so the plan is Draft. Read the brief in ${outcome.answersFile}; to approve it, set approveBrief to true and rerun with --answers ${outcome.answersFile}.\n`);
+    } else if (args.json) {
+      stdout.write(`${JSON.stringify(outcome)}\n`);
+    } else if (outcome.status === "needs_input") {
+      stderr.write(needsInputMessage(outcome));
+    } else if (outcome.status === "interrupted") {
+      stderr.write(`${outcome.message}\n`);
+      if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
+    } else if (outcome.status === "timed_out") {
+      stderr.write(`${outcome.message}\n`);
+      if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
+      stderr.write("Use --turn-timeout <seconds> to allow longer model turns.\n");
+    } else if (outcome.status === "error") {
+      stderr.write(`${outcome.message}\n`);
+      if (outcome.checkpointPath) stderr.write(`Saved evidence checkpoint: ${outcome.checkpointPath}\n`);
+    }
+
+    if (args.jsonl) stdout.write(`${formatJsonlResult(outcome)}\n`);
+    return protocolFailure ? 1 : exitCodeFor(outcome, controller.signal.aborted);
+  } finally {
+    agent?.close();
+    terminal.close();
+    process.off("SIGINT", onSigint);
   }
-
-  if (args.jsonl) stdout.write(`${formatJsonlResult(outcome)}\n`);
-  return exitCodeFor(outcome, controller.signal.aborted);
 }
 
 export interface LoadedAnswers {
@@ -338,19 +371,21 @@ export function approvedBriefFrom(
   return { brief, resolvedAnswers, approval: { briefSha256: briefSha256(brief), via: "answers_file", approvedAt: now.toISOString() } };
 }
 
-type TerminalPrompts = { answerQuestion?: AnswerQuestion; approveBrief?: ApproveBrief; confirmPreview?: ConfirmPreview };
+type TerminalPrompts = { answerQuestion?: AnswerQuestion; answerQuestions?: AnswerQuestions; approveBrief?: ApproveBrief; approvalVia?: "tty" | "agent"; confirmPreview?: ConfirmPreview };
 
 // The workflow options that an answers file and the terminal prompts supply.
 export function answerOptions(
   loaded: LoadedAnswers | undefined,
   prompts: TerminalPrompts,
-): Pick<WorkflowOptions, "answers" | "priorQuestions" | "approvedBrief" | "answerQuestion" | "approveBrief" | "confirmPreview"> {
+): Pick<WorkflowOptions, "answers" | "priorQuestions" | "approvedBrief" | "answerQuestion" | "answerQuestions" | "approveBrief" | "approvalVia" | "confirmPreview"> {
   return {
     answers: loaded?.answers ?? {},
     ...(loaded?.questions ? { priorQuestions: loaded.questions } : {}),
     ...(loaded?.approvedBrief ? { approvedBrief: loaded.approvedBrief } : {}),
     ...(prompts.answerQuestion ? { answerQuestion: prompts.answerQuestion } : {}),
+    ...(prompts.answerQuestions ? { answerQuestions: prompts.answerQuestions } : {}),
     ...(prompts.approveBrief ? { approveBrief: prompts.approveBrief } : {}),
+    ...(prompts.approvalVia ? { approvalVia: prompts.approvalVia } : {}),
     ...(prompts.confirmPreview ? { confirmPreview: prompts.confirmPreview } : {}),
   };
 }
@@ -619,6 +654,7 @@ export function helpText(): string {
     "  --turn-timeout <seconds>  End a model turn after this many seconds without Codex activity (30-3600, default 600); a turn may run three times as long in total",
     "  --json                Emit one JSON result object",
     "  --jsonl               Emit progress and result as JSON Lines",
+    "  --agent               Exchange JSONL input requests and replies over stdout/stdin in one live run",
     "  --help                Show this help",
     "",
     "unshit --install-skill [--skill-dir <dir>] [--force] [--json]",
@@ -633,7 +669,8 @@ export function helpText(): string {
     "The default report and evidence manifest are saved under .unshit/<run-id>/.",
     "Missing material answers return needs_input with exit code 2. A model turn that times out returns 124. Ctrl+C returns 130.",
     "In an interactive terminal run without --json or --jsonl, unshit shows the final requirements and acceptance criteria and asks for yes before reference search; another reply returns needs_input with exit code 2 and saves the brief in an answers file, whose approveBrief a person can set to true for a rerun with --answers.",
-    "After the search, unshit writes .unshit/<run-id>/preview.html, shows each stage with the references it used, and asks for yes before ranking, tree checks, source reads and planning; another reply returns needs_input with exit code 2. A run with --json or --jsonl, or without a terminal, stops there with exit code 2; only an interactive rerun continues past the preview.",
+    "After the search, unshit writes .unshit/<run-id>/preview.html, shows each stage with the references it used, and asks for yes before ranking, tree checks, source reads and planning; another reply returns needs_input with exit code 2. A run with --json or --jsonl, or without a terminal, stops there with exit code 2 unless --agent is set.",
+    "--agent implies --jsonl and waits for input_response records matching each input_request requestId: answers for material_answers, or approved for brief_approval and preview_confirmation. It has no reply timeout. A cancel record, Ctrl+C or EOF interrupts with exit 130; invalid protocol input fails with exit 1. --agent cannot be combined with --json or --install-skill.",
     "",
   ].join("\n");
 }
