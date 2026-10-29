@@ -24,6 +24,117 @@ const brief = parseIntake({
 });
 
 describe("answers and script output", () => {
+  test("--agent implies JSONL, permits redundant --jsonl, and rejects incompatible modes", () => {
+    for (const flags of [["--agent"], ["--agent", "--jsonl"]]) expect(parseCliArguments(["plan records", ...flags])).toMatchObject({ agent: true, jsonl: true, json: false });
+    expect(() => parseCliArguments(["plan records", "--agent", "--json"])).toThrow("--agent uses JSONL");
+    expect(() => parseCliArguments(["--agent", "--install-skill"])).toThrow("--agent cannot be combined with --install-skill");
+    expect(parseCliArguments(["plan records", "--jsonl"])).toMatchObject({ agent: false, jsonl: true });
+  });
+
+  test("main relays live agent gates with the exact published preview and emits one final result", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "unshit-agent-"));
+    const input = new PassThrough();
+    const records: Record<string, any>[] = [];
+    const write = process.stdout.write;
+    const preview = createPreviewRecorder().snapshot();
+    const questions = parseIntake({ summary: "Save records.", requirements: [{ description: "Save records.", observableAcceptance: ["A record is saved."] }], outOfScope: [], assumptions: [], materialQuestions: [{ question: "Who saves?", whyMaterial: "Sets permissions." }], researchQueries: ["record service"] }).materialQuestions;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      const record = JSON.parse(String(chunk));
+      records.push(record);
+      if (record.type === "input_request") input.write(`${JSON.stringify({ type: "input_response", requestId: record.requestId, ...(record.kind === "material_answers" ? { answers: { [questions[0]!.id]: "Managers" } } : { approved: record.kind === "brief_approval" }) })}\n`);
+      return true;
+    }) as typeof process.stdout.write;
+    const signals = process.listenerCount("SIGINT");
+    try {
+      const code = await main(["Save records.", "--cwd", cwd, "--agent"], async (options) => {
+        expect(options.approvalVia).toBe("agent");
+        expect(await options.answerQuestions!(questions)).toEqual({ [questions[0]!.id]: "Managers" });
+        expect(await options.approveBrief!(brief)).toBe(true);
+        await options.onPreview!(preview, { sources: [], excerpts: [], bytesBySourceId: new Map(), textBySourceId: new Map(), gaps: [] });
+        expect(await options.confirmPreview!(preview)).toBe(false);
+        return { status: "needs_input", questions: [], brief, previewStop: "declined" };
+      }, input);
+      expect(code).toBe(2);
+      const requests = records.filter((record) => record.type === "input_request");
+      expect(requests.map((record) => record.kind)).toEqual(["material_answers", "brief_approval", "preview_confirmation"]);
+      const published = records.find((record) => record.type === "preview")!;
+      expect(requests[2]).toMatchObject({ pagePath: published.page, revision: published.revision, preview });
+      expect(existsSync(published.page)).toBe(true);
+      expect(records.filter((record) => record.type === "result")).toHaveLength(1);
+      expect(input.listenerCount("data")).toBe(0);
+      expect(process.listenerCount("SIGINT")).toBe(signals);
+    } finally { process.stdout.write = write; input.destroy(); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  test("main emits one fixed protocol failure and starts no work after a duplicate approval", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "unshit-agent-"));
+    const input = new PassThrough();
+    const printed: string[] = [];
+    const write = { stdout: process.stdout.write, stderr: process.stderr.write };
+    let downstream = false;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      printed.push(String(chunk));
+      const record = JSON.parse(String(chunk));
+      if (record.type === "input_request") {
+        const line = JSON.stringify({ type: "input_response", requestId: record.requestId, approved: true });
+        input.write(`${line}\n${line}\nsecret raw stdin\n`);
+      }
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = (() => true) as typeof process.stderr.write;
+    try {
+      const code = await main(["Save records.", "--cwd", cwd, "--agent"], async (options) => {
+        await options.approveBrief!(brief);
+        options.signal!.throwIfAborted();
+        downstream = true;
+        return { status: "error", message: "Unreachable." };
+      }, input);
+      expect(code).toBe(1);
+      expect(downstream).toBe(false);
+      const results = printed.map((line) => JSON.parse(line)).filter((record) => record.type === "result");
+      expect(results).toEqual([{ type: "result", result: { status: "error", code: "agent_protocol_error", message: "Invalid agent protocol input. No downstream work started after the failure." } }]);
+      expect(printed.join("")).not.toContain("secret raw stdin");
+      expect(input.listenerCount("data")).toBe(0);
+    } finally { process.stdout.write = write.stdout; process.stderr.write = write.stderr; input.destroy(); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  test("main maps agent cancel, EOF and SIGINT at a waiting gate to one interrupted result and cleans up after a thrown workflow", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "unshit-agent-"));
+    const write = { stdout: process.stdout.write, stderr: process.stderr.write };
+    const signals = process.listenerCount("SIGINT");
+    try {
+      for (const action of ["cancel", "EOF", "SIGINT", "throw", "stream error"]) {
+        const input = new PassThrough();
+        const records: Record<string, any>[] = [];
+        process.stdout.write = ((chunk: string | Uint8Array) => {
+          const record = JSON.parse(String(chunk));
+          records.push(record);
+          if (record.type === "input_request") {
+            if (action === "cancel") input.write('{"type":"cancel"}\n');
+            if (action === "EOF") input.end();
+            if (action === "SIGINT") process.emit("SIGINT");
+            if (action === "stream error") input.destroy(new Error("SECRET_RAW_STREAM_ERROR"));
+          }
+          return true;
+        }) as typeof process.stdout.write;
+        process.stderr.write = (() => true) as typeof process.stderr.write;
+        const code = await main(["Save records.", "--cwd", cwd, "--agent"], async (options) => {
+          if (action === "throw") throw new Error("fixture failure");
+          await options.approveBrief!(brief);
+          throw new Error("The aborted prompt should reject.");
+        }, input);
+        expect(code, action).toBe(action === "throw" || action === "stream error" ? 1 : 130);
+        const results = records.filter((record) => record.type === "result");
+        expect(results, action).toHaveLength(1);
+        expect(results[0]!.result.status, action).toBe(action === "throw" || action === "stream error" ? "error" : "interrupted");
+        if (action === "stream error") expect(results[0]!.result.code).toBe("agent_protocol_error");
+        expect(JSON.stringify(records)).not.toContain("SECRET_RAW_STREAM_ERROR");
+        expect(input.listenerCount("data"), action).toBe(0);
+        expect(process.listenerCount("SIGINT"), action).toBe(signals);
+        input.destroy();
+      }
+    } finally { process.stdout.write = write.stdout; process.stderr.write = write.stderr; await rm(cwd, { recursive: true, force: true }); }
+  });
   test("writes an exact question request and validates its prompt, cwd, policy, and IDs", async () => {
     const cwd = await mkdtemp(path.join(os.tmpdir(), "unshit-answers-"));
     const requirement = "Build a refund service for the current team.";

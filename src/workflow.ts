@@ -76,6 +76,7 @@ import type {
 } from "./types.ts";
 
 export type AnswerQuestion = (question: MaterialQuestion) => Promise<string>;
+export type AnswerQuestions = (questions: MaterialQuestion[]) => Promise<Record<string, string>>;
 export type ApproveBrief = (brief: IntakeBrief) => Promise<boolean>;
 export type ConfirmPreview = (preview: WorkflowPreview) => Promise<boolean>;
 
@@ -107,9 +108,11 @@ export interface WorkflowOptions {
   answers?: Record<string, string>;
   priorQuestions?: MaterialQuestion[];
   answerQuestion?: AnswerQuestion;
+  answerQuestions?: AnswerQuestions;
   // Asks a person to approve the final brief before the local scan and reference search. false ends the run as
   // needs_input with approvalRequested.
   approveBrief?: ApproveBrief;
+  approvalVia?: "tty" | "agent";
   // A brief that a person approved in an answers file. The run uses it and its answers as they are, without intake,
   // answer or rebuild turns; answers, priorQuestions and answerQuestion are not used.
   approvedBrief?: ApprovedBrief;
@@ -178,10 +181,13 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
   const now = options.now ?? (() => new Date());
   const preview = createPreviewRecorder();
   const publishPreview = async (plan?: PlanDocument): Promise<void> => {
+    throwIfAborted(options.signal);
     if (options.onPreview) await options.onPreview(preview.snapshot(), checkpointEvidence ?? emptyEvidence(), plan);
+    throwIfAborted(options.signal);
   };
 
-  const saveCheckpoint = async (stage: CheckpointStage, placeholderNotes: string[] = []): Promise<void> => {
+  const saveCheckpoint = async (stage: CheckpointStage, placeholderNotes: string[] = [], preserveAfterAbort = false): Promise<void> => {
+    if (!preserveAfterAbort) throwIfAborted(options.signal);
     // A timeout leaves a checkpoint even before intake or the source reads finished.
     const checkpointBrief = brief ?? (stage === "timed_out" ? emptyBrief(options.requirement) : undefined);
     const savedEvidence = checkpointEvidence ?? (stage === "timed_out" ? emptyEvidence() : undefined);
@@ -207,6 +213,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     } catch {
       savedCheckpointPath = undefined;
     }
+    if (!preserveAfterAbort) throwIfAborted(options.signal);
   };
 
   const preserveKnownState = async (stage: CheckpointStage, message: string): Promise<void> => {
@@ -218,7 +225,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       checkpointPlan.readiness = "draft";
       checkpointPlan.readinessNotes = [...new Set([...checkpointPlan.readinessNotes, message])];
     }
-    await saveCheckpoint(stage, [message]);
+    await saveCheckpoint(stage, [message], true);
   };
 
   try {
@@ -257,7 +264,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       preview.setStatus("intake", "completed");
       progress({ stage: "intake", state: "completed", message: `Captured ${brief.requirements.length} requirements and ${brief.materialQuestions.length} material questions.` });
 
-      const answers = await resolveAnswers(brief, options.answers ?? {}, options.answerQuestion, options.signal);
+      const answers = await resolveAnswers(brief, options.answers ?? {}, options.answerQuestion, options.signal, options.answerQuestions);
       if (answers.unanswered.length > 0) {
         progress({ stage: "answer_gate", state: "warning", message: "Waiting for material answers. No reference search has started." });
         return { status: "needs_input", questions: answers.unanswered, brief };
@@ -295,16 +302,16 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     gaps.push(...inferredRequirementGaps(brief));
 
     if (!briefApproval && options.approveBrief) {
-      progress({ stage: "brief_approval", state: "started", message: "Asking a person to approve the requirements and acceptance criteria. No reference search has started." });
+      progress({ stage: "brief_approval", state: "started", message: options.approvalVia === "agent" ? "Requesting brief approval through the agent protocol. No reference search has started." : "Asking a person to approve the requirements and acceptance criteria. No reference search has started." });
       const approved = await options.approveBrief(brief);
       throwIfAborted(options.signal);
       if (!approved) {
         progress({ stage: "brief_approval", state: "warning", message: "The brief was not approved. No reference search has started." });
         return { status: "needs_input", questions: [], brief, approvalRequested: true, resolvedAnswers: resolvedAnswerContext };
       }
-      briefApproval = { briefSha256: briefSha256(brief), via: "tty", approvedAt: now().toISOString() };
+      briefApproval = { briefSha256: briefSha256(brief), via: options.approvalVia ?? "tty", approvedAt: now().toISOString() };
       preview.setStatus("brief_approval", "completed");
-      progress({ stage: "brief_approval", state: "completed", message: "The brief was approved: yes was typed at the terminal prompt." });
+      progress({ stage: "brief_approval", state: "completed", message: options.approvalVia === "agent" ? "The host recorded brief approval through the agent protocol; it cannot verify who approved it." : "The brief was approved: yes was typed at the terminal prompt." });
     } else if (!briefApproval) {
       preview.setStatus("brief_approval", "skipped");
     }
@@ -363,7 +370,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
       return { status: "needs_input", questions: [], brief, resolvedAnswers: resolvedAnswerContext, previewStop: "declined", message: PREVIEW_DECLINED };
     }
     preview.setStatus("preview_confirmation", "completed");
-    progress({ stage: "preview_confirmation", state: "completed", message: "The reference preview was confirmed: yes was typed at the terminal prompt." });
+    progress({ stage: "preview_confirmation", state: "completed", message: options.approvalVia === "agent" ? "The reference preview was confirmed through the agent protocol." : "The reference preview was confirmed: yes was typed at the terminal prompt." });
 
     let treeCandidates = discovery.candidates;
     const treeChecks = options.researcher.treeResolutionLimit;
@@ -766,6 +773,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     let artifacts: RunArtifacts | undefined;
     if (options.onArtifacts) {
       progress({ stage: "save", state: "started", message: "Saving the report, evidence manifest, and source snapshots atomically." });
+      throwIfAborted(options.signal);
       artifacts = await options.onArtifacts({
         brief,
         ...(initialBrief ? { initialBrief } : {}),
@@ -786,8 +794,10 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
           return preview.snapshot();
         },
       });
+      throwIfAborted(options.signal);
       progress({ stage: "save", state: "completed", message: artifacts ? `Saved ${artifacts.reportPath}.` : "No artifact writer was configured." });
     }
+    throwIfAborted(options.signal);
     return {
       status: "completed",
       readiness: plan.readiness,
@@ -837,6 +847,7 @@ async function resolveAnswers(
   supplied: Record<string, string>,
   ask: AnswerQuestion | undefined,
   signal?: AbortSignal,
+  askBatch?: AnswerQuestions,
 ): Promise<{ resolved: Record<string, string>; unanswered: MaterialQuestion[] }> {
   const allowed = new Set(brief.materialQuestions.map((question) => question.id));
   for (const id of Object.keys(supplied)) if (!allowed.has(id)) throw new Error(`Answer key ${id} does not match a current material question.`);
@@ -845,7 +856,18 @@ async function resolveAnswers(
     const value = supplied[question.id]?.trim();
     if (value) resolved[question.id] = value;
   }
-  if (ask) {
+  const missing = brief.materialQuestions.filter((question) => !resolved[question.id]);
+  if (askBatch && missing.length > 0) {
+    throwIfAborted(signal);
+    const answers = await askBatch(missing);
+    throwIfAborted(signal);
+    const ids = new Set(missing.map((question) => question.id));
+    if (Object.keys(answers).some((id) => !ids.has(id))) throw new Error("Batch answers contain an unknown or already answered material question.");
+    for (const question of missing) {
+      const answer = answers[question.id]?.trim();
+      if (answer) resolved[question.id] = answer;
+    }
+  } else if (ask) {
     for (const question of brief.materialQuestions) {
       if (signal?.aborted) throw new InterruptedWorkflowError();
       if (resolved[question.id]) continue;
@@ -1238,6 +1260,8 @@ function briefApprovalStatus(approval: BriefApproval | undefined): string {
     ? "no person has approved this brief yet, and the host keeps the plan Draft for that itself"
     : approval.via === "tty"
       ? "the host recorded the brief as approved by a yes typed at the interactive terminal prompt"
+      : approval.via === "agent"
+        ? "the host recorded approved true through the agent protocol and cannot verify who approved the brief"
       : "the host recorded the brief as approved by approveBrief true in the answers file";
   return `Brief approval: ${status}; the host handles this, so do not set shouldDraft or report a finding about brief approval.`;
 }
@@ -1269,6 +1293,8 @@ function openDecisionStep(approval: BriefApproval | undefined): string {
     ? "write the decision into the brief of the answers file this run saved, set approveBrief to true and rerun with --answers; if the run saved no answers file, run the same command again to get one"
     : approval.via === "tty"
       ? "rerun unshit and reply anything but yes when it asks you to approve the brief; it saves the brief in an answers file, where you write the decision, set approveBrief to true and rerun with --answers"
+      : approval.via === "agent"
+        ? "add the decision to the requirement in your words and start a new --agent run, then approve its rebuilt brief and confirm its reference preview"
       : "write the decision into the brief of the answers file this run read and pass that file to --answers again; approveBrief is already true in that file, so rereading and saving the edited brief is your approval of it";
   return `The planner did not make this choice. To settle it, ${step}.`;
 }

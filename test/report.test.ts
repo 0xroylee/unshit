@@ -403,6 +403,15 @@ describe("trusted, not checked", () => {
     expect(trustedSection(render([], [], {}, { ...approval, via: "tty" }))).not.toContain("approveBrief");
   });
 
+  test("describes agent approval as a received decision without claiming a terminal or verified human", () => {
+    const approval: BriefApproval = { briefSha256: "d".repeat(64), via: "agent", approvedAt: "2026-10-29T09:30:00.000Z" };
+    const report = render([], [], {}, approval);
+    expect(report).toContain("The host received approved true through the agent protocol; it cannot verify who approved this brief.");
+    expect(trustedSection(report)).toContain("- The host received brief approval through the agent protocol; it cannot verify who approved it.");
+    expect(trustedSection(report)).not.toContain("terminal prompt");
+    expect(trustedSection(report)).not.toContain("answers file");
+  });
+
   test("says that a terminal approval is a yes typed at the prompt and does not show who typed it", () => {
     const approval: BriefApproval = { briefSha256: "d".repeat(64), via: "tty", approvedAt: "2026-10-25T09:30:00.000Z" };
 

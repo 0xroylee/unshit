@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { describe, expect, test } from "bun:test";
 import type { JsonRecord, ModelGateway, ModelSession, ModelTurnResult } from "../src/app-server.ts";
 import { GitHubResearcher } from "../src/github.ts";
@@ -18,6 +19,7 @@ import { renderReport } from "../src/report.ts";
 import { writeCheckpointArtifacts, writePlanArtifacts } from "../src/storage.ts";
 import { runWorkflow as runWorkflowWithGate, type WorkflowOptions } from "../src/workflow.ts";
 import { createPreviewConfirmer, createRunWriters, exitCodeFor } from "../src/cli.ts";
+import { createAgentProtocol } from "../src/agent-protocol.ts";
 import { PREVIEW_DECLINED, PREVIEW_SAVE_FAILED, PREVIEW_SOURCES_FAILED, PREVIEW_UNAVAILABLE } from "../src/preview.ts";
 import type { WorkflowPreview } from "../src/types.ts";
 
@@ -2662,6 +2664,112 @@ describe("brief approval", () => {
     requirements: [{ description: "Sell tickets and verify event admission.", userWords: null, observableAcceptance: ["A ticket can be sold and scanned."] }],
   };
   const completeFiles = { files: [{ fileId: "C1F1", role: "production", rationale: "Handler." }, { fileId: "C1F2", role: "test", rationale: "Tests." }] };
+
+  test("a protocol failure at the readiness preview or final save boundary prevents final artifact publication", async () => {
+    for (const boundary of ["readiness preview", "final plan checkpoint", "save started"]) {
+      const cwd = await tempDirectory();
+      const input = new PassThrough();
+      const controller = new AbortController();
+      const protocol = createAgentProtocol({ input, controller, write: () => undefined });
+      let published = false;
+      let checkpoints = 0;
+      let aborted = false;
+      const abort = () => { aborted = true; input.write("malformed agent input\n"); };
+      try {
+        const outcome = await runWorkflow({
+          cwd, requirement: "Build a refund request service.", signal: controller.signal,
+          modelGateway: gateway({ intake: baseIntake(), fileSelection: completeFiles }), researcher: researcher().value,
+          approveBrief: async () => true, approvalVia: "agent",
+          onCheckpoint: async (_value, stage) => {
+            if (stage === "plan") checkpoints += 1;
+            if (boundary === "final plan checkpoint" && checkpoints === 2 && !aborted) abort();
+            return undefined;
+          },
+          onPreview: async (preview) => {
+            if (boundary === "readiness preview" && preview.stages.find((stage) => stage.id === "readiness")?.status === "completed") abort();
+          },
+          onProgress: (event) => { if (boundary === "save started" && event.stage === "save" && event.state === "started") abort(); },
+          onArtifacts: async () => { published = true; return undefined; },
+        });
+        expect(aborted, boundary).toBe(true);
+        expect(outcome.status, boundary).toBe("interrupted");
+        expect(protocol.failure()?.code, boundary).toBe("agent_protocol_error");
+        expect(published, boundary).toBe(false);
+      } finally { protocol.close(); input.destroy(); await rm(cwd, { recursive: true, force: true }); }
+    }
+  });
+
+  test("agent gate failures abort before brief research or preview tree checks and close the model session", async () => {
+    for (const gate of ["material_answers", "brief_approval", "preview_confirmation"]) {
+      const cwd = await tempDirectory();
+      const input = new PassThrough();
+      const controller = new AbortController();
+      const refs = researcher();
+      const base = gateway({ intake: baseIntake(gate === "material_answers" ? [question] : []) });
+      let closed = 0;
+      const modelGateway: ModelGateway = { createSession: () => {
+        const session = base.createSession();
+        return { ...session, close: async () => { closed += 1; await session.close(); } };
+      } };
+      const protocol = createAgentProtocol({ input, controller, write: (line) => {
+        const request = JSON.parse(line);
+        input.write(`${JSON.stringify({ type: "input_response", requestId: request.kind === gate ? "stale-host-id" : request.requestId, approved: true })}\n`);
+      } });
+      try {
+        const outcome = await runWorkflow({
+          cwd, requirement: "Build a refund request service.", signal: controller.signal, modelGateway, researcher: refs.value,
+          answerQuestions: protocol.answerQuestions, approveBrief: protocol.approveBrief, approvalVia: "agent",
+          confirmPreview: (preview) => protocol.confirmPreview(preview, "/published/preview.html"),
+        });
+        expect(outcome.status, gate).toBe("interrupted");
+        expect(protocol.failure()?.code, gate).toBe("agent_protocol_error");
+        expect(refs.searches, gate).toBe(gate === "preview_confirmation" ? 1 : 0);
+        expect(refs.shortlistInputs, gate).toEqual([]);
+        expect(closed, gate).toBe(1);
+      } finally { protocol.close(); input.destroy(); await rm(cwd, { recursive: true, force: true }); }
+    }
+  });
+
+  test("batches only missing answers in question order before rebuilding and records agent approval with the host hash and clock", async () => {
+    const cwd = await tempDirectory();
+    const questions = [question, { question: "Who issues refunds?", whyMaterial: "This sets the permission boundary." }, { question: "Which currency is accepted?", whyMaterial: "This sets amount validation." }];
+    const parsed = parseIntake(baseIntake(questions));
+    const refs = researcher();
+    const prompts: string[] = [];
+    let batches = 0;
+    const requestedIds: string[][] = [];
+    try {
+      const outcome = await runWorkflow({
+        cwd,
+        requirement: "Build an event ticketing system.",
+        answers: { [parsed.materialQuestions[1]!.id]: " Managers " },
+        answerQuestion: async () => { throw new Error("The single-question callback must not be used."); },
+        answerQuestions: async (missing) => {
+          batches += 1;
+          requestedIds.push(missing.map((question) => question.id));
+          expect(refs.searches).toBe(0);
+          return { [parsed.materialQuestions[2]!.id]: " USD ", [parsed.materialQuestions[0]!.id]: " One event " };
+        },
+        approvalVia: "agent",
+        approveBrief: async (brief) => {
+          expect(batches).toBe(1);
+          expect(brief.summary).toBe(refined.summary);
+          expect(refs.searches).toBe(0);
+          return true;
+        },
+        now: () => new Date("2026-10-29T09:30:00.000Z"),
+        modelGateway: gateway({ intake: baseIntake(questions), refined, fileSelection: completeFiles, onPrompt: (prompt) => prompts.push(prompt) }),
+        researcher: refs.value,
+      });
+      if (outcome.status !== "completed") throw new Error(`Workflow returned ${outcome.status}`);
+      expect(batches).toBe(1);
+      expect(requestedIds).toEqual([[parsed.materialQuestions[0]!.id, parsed.materialQuestions[2]!.id]]);
+      expect(outcome.resolvedAnswers.map((answer) => answer.answer)).toEqual(["One event", "Managers", "USD"]);
+      expect(outcome.readiness).toBe("ready");
+      expect(outcome.briefApproval).toEqual({ via: "agent", approvedAt: "2026-10-29T09:30:00.000Z", briefSha256: briefSha256(outcome.brief) });
+      expect(prompts.some((prompt) => prompt.includes("the host recorded approved true through the agent protocol and cannot verify who approved the brief"))).toBe(true);
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
 
   test("keeps a complete plan Draft with the unapproved-brief note when no person approved the brief", async () => {
     const cwd = await tempDirectory();

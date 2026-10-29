@@ -14,60 +14,54 @@ description: Plan a software feature or new application with the unshit CLI befo
 - unshit needs network access (the GitHub API, Grep by Vercel code search and the Codex service). In a sandbox without network access, request permission to run it with network access. Do not retry it inside the sandbox.
 - `GITHUB_TOKEN` is optional and raises GitHub API limits. Never print its value.
 
-## Run
+## Run in one live process
 
-1. Pass the user's requirement in their words, plus facts they already stated. Point `--cwd` at the project that the plan is for (an empty folder for a new application):
+1. Pass the user's requirement in their words, plus facts they already stated. Point `--cwd` at the target project, or an empty directory for a new application:
 
    ```sh
-   unshit "<requirement>" --cwd <project> --json
+   unshit "<requirement>" --cwd <project> --agent
    ```
 
-2. A run takes several minutes and several model turns. Run it in the background or with a long timeout. Do not start a second run for the same project at the same time.
-3. Exit codes: `0` completed, `2` stopped for answers, at the brief or at the reference preview, `124` a model turn timed out, `130` cancelled, `1` error.
-4. A run with `--json` never gets past the reference preview: after the search it stops with exit code 2 and `previewStop`. To reach a plan, the run must be interactive: start the same command without `--json` in a terminal that the user can see and type in, or give the user the command to run there. The user answers the questions, approves the brief and confirms the preview in that terminal. You may relay what the terminal shows; only the user types `yes`.
+2. Keep this one process alive with writable stdin while you talk to the user. A run takes several minutes and several model turns. Read stdout as JSONL, keep stdin open between replies, and do not start another run for the same project at the same time. `--agent` already enables JSONL; it cannot be combined with `--json` or `--install-skill`.
+3. Progress and preview records describe the work. An `input_request` pauses at one gate with a host-issued `requestId` and `kind`. Respond only to that pending request, using its exact ID. One final `result` record ends the run.
+4. Exit codes are `0` completed, `2` declined brief or preview, `124` model turn timeout, `130` cancelled or stdin ended, and `1` error. There is no timeout while waiting for the user's reply. A malformed, early, stale, duplicate or wrong-kind reply fails the run. To cancel, write `{"type":"cancel"}` on one line or send Ctrl+C.
 
-## When it needs answers (exit code 2)
+## Reply to input requests
 
-- The JSON result has `questions` (each with `id`, `question`, `whyMaterial`) and `answersFile`.
-- Ask the user these questions. They are business decisions: do not answer them yourself and do not invent policies or roles.
-- Write each answer into the `answers` object of `answersFile`, keyed by the question `id`. Keep the `request` object unchanged.
-- Run the same command again, with the same requirement text and `--cwd`, and add `--answers <answersFile>`.
+- `material_answers`: show the whole `questions` batch in chat, including each `id`, `question` and `whyMaterial`. Ask the user for the missing business decisions. Preserve their answers and send one line after every question has an answer:
 
-## When the user has not approved the brief yet
+  ```json
+  {"type":"input_response","requestId":"<exact pending ID>","answers":{"<question ID>":"<user's answer>"}}
+  ```
 
-- A plan can be Ready only after the user approves its brief. In an interactive terminal, unshit shows the brief and asks for yes before the search; any other reply stops the run (exit code 2, `approvalRequested`) and saves the brief in `answersFile`. A run with `--json` does not ask and does not reach a plan: it stops at the reference preview.
-- Show the user the whole brief: `brief.summary`, each requirement in `brief.requirements` with its `observableAcceptance`, and the lists `brief.outOfScope` and `brief.assumptions`. Label a requirement whose `origin` is `stated` "you said" and quote its `userWords`; label one whose `origin` is `inferred` "inferred": unshit found no verbatim quote of the user's words for it. Ask the user whether this is what they want.
-- Only the user approves the brief. Never write `approveBrief: true` into `answersFile` yourself. Give the user the file path and let them set `approveBrief` to `true`, or let them run the same command without `--json` in a terminal and approve it when unshit asks.
-- After the user has set it, run the same command again with `--answers <answersFile>`. The user may edit the brief in `answersFile` before setting it. If the user does not approve, ask what should change, add it to the requirement text in their words, and start a new run without `--answers`.
+  Include exactly the requested question IDs, each with a nonempty string. Use facts the user already stated where they answer a question; ask them about the rest. Do not invent policies, roles or decisions.
 
-## When the run stops at the reference preview (exit code 2 with `previewStop`)
+- `brief_approval`: show the complete returned `brief` in chat. Include `brief.summary`, every item in `brief.requirements` with all its `observableAcceptance`, `outOfScope` and `assumptions`. Label each requirement with `origin`: for `stated`, quote `userWords` and say "you said"; for `inferred`, say "inferred". Ask for explicit approval of this brief. Only after the user approves this displayed brief, relay one line:
 
-- The JSON result has `previewStop` (`unavailable`: no person could be asked; `declined`: the reply was not yes), `message` and `previewPath`: the page that lists each step of the run and the references it used. It has no `answersFile`.
-- Tell the user what the search found: read `previewPath` or the preview the terminal printed, and list the repositories found and what the metadata bar excluded, with its reasons. Search results are leads, not evidence.
-- Only the user confirms the preview. Never type `yes` at the preview prompt for them, even when they ask you to go on; point them to the terminal where it waits.
-- To continue, run the same command in an interactive terminal, as in Run. A brief approved in an answers file does not confirm the preview.
+  ```json
+  {"type":"input_response","requestId":"<exact pending ID>","approved":true}
+  ```
 
-## When a model turn times out (exit code 124)
+- `preview_confirmation`: show the returned preview's stages, the repositories found, and the metadata exclusions with their reasons. Give the exact `pagePath` and revision. Use the full `preview` snapshot from this request, since ordinary preview updates contain only changes. Explain that search results are leads, not evidence. Ask for explicit confirmation to continue to ranking, tree checks, source reads and planning. Only after that confirmation, relay `approved: true` with this pending `requestId`.
+- Approval of a brief does not confirm a later preview. Each displayed approval request needs its own explicit response from the user. The host records `via: "agent"`, the brief hash and receipt time; it cannot verify who approved it. You relay the user's decision.
+- If the user declines a brief or preview, send `approved: false` with its pending ID. If they request edits, cancel this run, add their changes to the requirement in their words, and start a fresh run. Requests and replies are not persisted for resume. If the process or session is lost, start again and show the new requests for approval.
 
-- The JSON result has `stage`, `limit` (`idle` or `total`) and `limitSeconds`.
-- Tell the user which stage timed out. To retry, run the same command again with a larger `--turn-timeout <seconds>` (30 to 3600; the default is 600, and a turn may run three times as long in total).
+## When live stdin is unavailable
+
+Run the same requirement in a visible interactive terminal without `--agent`, `--json` or `--jsonl`, or give the user that command. They answer, approve the brief and confirm the preview there. Relay the terminal output as needed; the user types `yes` at its prompts. Plain `--json` and `--jsonl` remain non-interactive: they return missing questions and an `answersFile`, or stop at the reference preview with exit 2. They do not provide a live approval channel. For an answers-file rerun, preserve its request context and use its exact path; the user controls `approveBrief`.
+
+## When a model turn times out
+
+The final result has `stage`, `limit` (`idle` or `total`) and `limitSeconds`. Tell the user which stage timed out. To retry, start a fresh run with a larger `--turn-timeout <seconds>` (30 to 3600; the default is 600, and a turn may run three times as long in total).
 
 ## Read the result
 
-- The JSON result has `readiness`, `plan`, `research`, `gaps`, `sources` and `artifacts.reportPath` (the Markdown plan). The evidence is under `<project>/.unshit/<run-id>/`: `plan.md`, `manifest.json` and `sources/`.
-- A run in a terminal prints no JSON result: its plan is `plan.md` in the newest `<project>/.unshit/<run-id>/` folder that has one.
-- Tell the user:
-  - Ready or Draft, and why.
-  - The selected reference repositories and why they were chosen.
-  - What the quality bar excluded.
-  - The material gaps and the task list.
-  - The plan's "Trusted, not checked" section: what the plan relies on that unshit did not check.
-  - Each note in the plan that starts with "Open decision for". These are the user's to settle: ask them, and do not settle them yourself.
-- When the user settles an open decision, unshit must plan again with it, as the note says: the decision goes into the brief of the answers file and the user sets `approveBrief` to `true`, or you add it to the requirement text in their words and the user runs that command in a terminal without `--json` and approves the brief when unshit asks. You may write the decision into the brief for the user; never set `approveBrief` yourself. Implement from the new plan.
-- If the plan came from an approved answers file, `approveBrief` there is already `true`, so the user approves a change by rereading the edited brief and saving it. If you wrote the decision into that brief, show the user the change and rerun only after they have read and accepted it.
-- The plan's "Stages and references" section and the page `artifacts.previewPath` list each step of the run with the references it used, and say whether each reference is a search result, a listed but unread file, or source the host read. When the user asks what a step relied on, answer from there.
-- The page `artifacts.stackPath` draws the plan's modules and data model as a stack of bricks; opening a brick shows the repositories and the cited code behind it. Point the user to it when they ask which code supports a part of the plan.
-- `research.selected` is the number of reference repositories selected for the plan. If `research.trustworthyReferenceFound` is false, no selected repository supplied production or test excerpts: say so plainly, the plan has no reference repository behind it.
+- Read the final `result` record. A completed result has `readiness`, `plan`, `research`, `gaps`, `sources` and `artifacts.reportPath`. Read and link that exact returned plan path; do not guess the newest run directory. The evidence is beside it in the returned `artifacts.evidenceDirectory`.
+- Tell the user whether it is Ready or Draft and why, the selected reference repositories and why they were chosen, what the quality bar excluded, the material gaps and the task list.
+- Give the user the plan's "Trusted, not checked" section and ask each note starting with "Open decision for". Do not settle these decisions yourself. Once the user settles one, add it to the requirement in their words and start a new run with new brief and preview approvals. Implement from the new plan.
+- The plan's "Stages and references" section and `artifacts.previewPath` show each stage and its references, distinguishing search results, listed but unread files and source the host read. Answer questions about what a stage relied on from there.
+- `artifacts.stackPath` draws modules and data entities as bricks and shows the repositories and cited code behind each brick.
+- `research.selected` counts selected reference repositories. If `research.trustworthyReferenceFound` is false, no selected repository supplied production or test excerpts. Say plainly that the plan has no reference repository behind it.
 
 ## Implement from the plan
 
