@@ -361,6 +361,21 @@ unshit agent skill 增加了需求摘要批准、“Trusted, not checked”、�
 
 第三次运行：2026-10-29 在这个工作区用源码运行（`bun run dev`，提交 `bfd22d9`，工作区没有未提交的改动；这个提交之后只改了提交说明，成为 `5ec5fab`，代码相同），需求和补答文件相同，运行目录 `.unshit/2026-10-29T03-10-46-982Z-5efef115`，11:10 开始，11:34 结束（含等待输入 `yes` 的时间）。GitHub 的 bicycle 查询这次返回 3 个结果（前两次为 5 个），搜索匹配 47 个仓库，46 个通过元数据门槛，少了 `gobicycle/bicycle` 和 `FASTSHIFT/X-TRACK`；搜索查询的代码没有改动。选中 `juliangarnier/anime` 和 `ayangweb/BongoCat`。第一次复核有一个重大问题：CMD2 和 CMD3 用 Bun 运行，但检查过的说明和前置条件里没有 Bun。复核修正通过了 host 校验，修正后的复核没有问题，结果为 Ready。这次复核的问题是命令的前置条件，与前两次不同，所以这次运行不能说明 `5ec5fab` 的规则是否起作用；它由提示测试覆盖。积木页面显示“5 bricks, 2 reference repositories”：Pose sampling 引用 BongoCat 的 `crates/bongocat-live2d/src/lib.rs`、`crates/bongocat-live2d/src/tests/model.rs` 和 anime 的 `src/core/render.js`，SVG scene 引用 BongoCat 的这两个文件，Playback and visibility 引用 anime 的 `src/engine/engine.js`、`src/timer/timer.js` 和 `tests/suites/engine.test.js`，另外两个模块只引用本地代码。这次计划的 T2 包含后段姿势的检查（`Preserve coordinated cycling and verify late pose progression`）。第二次复核报告一个存活错误实现：在 mountAnimation 的采样回调里把 elapsedMs 限制在 60000，一分钟后画面冻结，计划的检查仍会通过；存活错误实现不影响就绪判定。
 
+## agent 实时运行与证据覆盖（2026-10-31）
+
+提交 `8f13904`（`fix: keep agent-driven unshit runs from waiting on each other`，PR #26，合并为 `9d677c5`）只改 agent 技能：agent 为每次运行新建目录，用 `tail -f` 把追加写入的 `in.jsonl` 作为 stdin，把 stdout、stderr、退出码和运行 unshit 的进程号写入文件，在后台等待下一行 `input_request` 或 `result`、退出码或进程消失，而不只等进程退出；回复不在终端里输入。提交 `5ed9ac6`（`feat: show evidence coverage in plans, results and manifests`，PR #27，合并为 `e210142`）在 `plan.md` 的范围之前加入“Evidence coverage”一节，并在结果和 manifest 中加入 `evidenceCoverage`。
+
+| 检查 | 结果 |
+| --- | --- |
+| `bun run check` | PR #26：497 项通过；PR #27：505 项通过；都没有失败 |
+| 终端输入行长度 | macOS 伪终端中，999 个字符的一行能读到，1099 个字符的一行一直读不完 |
+| 技能中的等待做法 | 从 SKILL.md 抄出三段命令，只替换占位符，驱动一个使用真实 `createAgentProtocol` 的替身直到结束：等待器在每个请求处结束，退出码 0，没有留下 `tail`。1500 字节的中文回复完整送达；`{"type":"cancel"}` 以 130 结束；harness 停掉后台命令后 `exit.code` 为空、进程不在，等待器随即结束。假的 `codex` 立即退出时，真实 CLI 写出结果后退出，`tail` 仍占着 stdin 也不影响 |
+| 具名错误实现（PR #27） | 11 个，在仓库之外的临时副本中逐个应用，都被指定的测试杀死 |
+
+真实运行：2026-10-31 用安装版 unshit（`./install.sh`，main `e210142`），由 Claude Code 按安装的技能以 `--agent` 运行，需求 `a cat riding a bicycle`，使用 `.unshit/2026-10-28T03-12-54-104Z-846a5159/answers.json` 里已批准的 brief，`GITHUB_TOKEN` 取自 `gh auth token`。命令在 Paseo 终端中运行，stdin 来自 `.unshit/agent-pEE6B9/in.jsonl`，stdout 写入同一目录的 `out.jsonl`；另一个终端用 jq 逐行显示进度。运行目录 `.unshit/2026-10-31T08-33-38-647Z-af43ba87`，16:33 开始，17:02 结束（含等待预览确认的时间），退出码 0。搜索匹配 49 个仓库，48 个通过元数据门槛，`GoogleCloudPlatform/knowledge-catalog` 因建立不到 180 天被排除。运行在预览处发出 `preview_confirmation` 请求；用户在聊天中确认后，agent 把回复追加到 `in.jsonl`，运行继续。后台等待器在 `result` 行出现时结束，管道自己写入退出码并结束 `tail`，终端回到提示符。通过文件树检查的有 5 个（anime、BongoCat、motion-canvas、mojs、konva），选中的只有 `juliangarnier/anime`（`01b81be`）；其余多数候选没有做文件树检查，原因写的是 `the core request budget of 16 attempts was exhausted`。GSAP 在固定提交 `13e2b79` 没有测试文件，也没有许可证。计划的 Evidence coverage：17 个设计元素中，8 个（47%）引用参考仓库在固定提交的源码，9 个（53%）只引用本地项目，0 个没有引用来源；3 个采用模式中 2 个（67%）引用参考测试。结果为 Draft，唯一原因是第二次复核留下两个重大问题：对实际入口 `src/main.js` 的检查只覆盖约 12 秒，一分钟后关闭动画的入口也能通过；一分钟后的检查只量踏板和车轮的标记，猫在一分钟后消失也能通过。
+
+这次的补答文件已批准 brief，所以真实运行中 agent 协议只走了预览确认一个请求，`material_answers` 和 `brief_approval` 两种请求没有在真实运行中走过。
+
 ## 未执行的环境
 
 Linux 原生运行尚未验证。读取上游源码和测试文件不代表执行了上游测试，也不代表已验证目标业务系统。
