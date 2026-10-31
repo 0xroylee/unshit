@@ -5,6 +5,7 @@ import { scanLocalTree, extractExistingCommands } from "./local.ts";
 import { domainMaterialFromBrief, identifiedLicenseId } from "./repository-screening.ts";
 import { domainTermsFor, isTestPath, isTextSourcePath, pathRoleHint, rankTreeFiles } from "./file-ranking.ts";
 import { mergeCodeSearchSummaries } from "./code-search.ts";
+import { evidenceCoverage } from "./coverage.ts";
 import {
   CANDIDATE_RANKING_SCHEMA,
   EVIDENCE_REQUEST_SCHEMA,
@@ -801,6 +802,7 @@ export async function runWorkflow(options: WorkflowOptions): Promise<RunOutcome>
     return {
       status: "completed",
       readiness: plan.readiness,
+      evidenceCoverage: evidenceCoverage(plan, evidence),
       brief,
       ...(initialBrief ? { initialBrief } : {}),
       ...(research ? { research } : {}),

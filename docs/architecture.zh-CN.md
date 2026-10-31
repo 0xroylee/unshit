@@ -50,6 +50,7 @@ turn / interrupt                                  v
 | [workflow.ts](../src/workflow.ts) | 需求门槛、答复后的 brief 重建、brief 批准门槛、候选预排序、筛选与选择、读取、计划生成、参考测试缺口、独立复核与有界修正（含存活错误实现和待决事项）、超时结果与检查点 |
 | [preview.ts](../src/preview.ts) | 运行步骤的顺序；预览记录器：登记 host 的记录（仓库、提交、文件、源码、摘录）并固定其类别，记录每一步用了哪些参考、怎么用；两版之间有变化的步骤；计划或复核引用的摘录 |
 | [stack.ts](../src/stack.ts) | 计划从下往上的积木（先是数据模型的实体，再是模块），以及每块积木引用的 host 摘录，按仓库和固定提交分组；积木页面所用的 logo 积木画法 |
+| [coverage.ts](../src/coverage.ts) | 证据覆盖：把计划的设计元素（决策、模块、数据实体、不变式、访问边界）分为引用了远程摘录、只引用本地摘录、没有引用三类计数，并计算引用了参考测试的采用模式；plan.md、结果和 manifest 使用它 |
 | [app-server.ts](../src/app-server.ts) | 原生双向 RPC、活动回合关联、最终文本、取消、空闲与总时长超时、失败原因和进程清理 |
 | [github.ts](../src/github.ts) | host-built GitHub 查询、Grep 代码搜索、质量门槛、固定提交树验证与 GitLab 官方 API 回退 |
 | [code-search.ts](../src/code-search.ts) | Grep 请求体、响应解析、按仓库聚合命中、批量 GitHub 元数据查询条件 |

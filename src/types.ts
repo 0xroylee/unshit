@@ -529,11 +529,26 @@ export interface ValidationRecord {
   resolved: boolean;
 }
 
+// The plan's design elements counted by the excerpts they cite, and its adopted patterns counted by their reference
+// tests. Each percent is a whole number of its total, or null when the total is 0.
+export interface EvidenceCoverage {
+  designElements: number;
+  reference: number;
+  referencePercent: number | null;
+  localOnly: number;
+  localOnlyPercent: number | null;
+  noSource: number;
+  noSourcePercent: number | null;
+  adoptedPatterns: number;
+  adoptedPatternsWithReferenceTest: number;
+  adoptedPatternsWithReferenceTestPercent: number | null;
+}
+
 export type RunOutcome =
   // previewStop: the run stopped at the reference preview after the search, because the reply was not yes (declined)
   // or because no person could be asked (unavailable); message says which, and previewPath names the page.
   | { status: "needs_input"; questions: MaterialQuestion[]; brief: IntakeBrief; answersFile?: string; checkpointPath?: string; approvalRequested?: boolean; resolvedAnswers?: ResolvedAnswer[]; previewStop?: "declined" | "unavailable"; message?: string; previewPath?: string }
-  | { status: "completed"; readiness: Readiness; brief: IntakeBrief; initialBrief?: IntakeBrief; research?: ResearchSummary; resolvedAnswers: ResolvedAnswer[]; briefApproval?: BriefApproval; answersFile?: string; plan: PlanDocument; sources: FinalSource[]; gaps: ResearchGap[]; reviews: ReviewResult[]; artifacts?: RunArtifacts; validationIssues: string[]; validationHistory: ValidationRecord[] }
+  | { status: "completed"; readiness: Readiness; evidenceCoverage: EvidenceCoverage; brief: IntakeBrief; initialBrief?: IntakeBrief; research?: ResearchSummary; resolvedAnswers: ResolvedAnswer[]; briefApproval?: BriefApproval; answersFile?: string; plan: PlanDocument; sources: FinalSource[]; gaps: ResearchGap[]; reviews: ReviewResult[]; artifacts?: RunArtifacts; validationIssues: string[]; validationHistory: ValidationRecord[] }
   | { status: "interrupted"; message: string; checkpointPath?: string }
   | { status: "timed_out"; message: string; stage: string; limit: "idle" | "total"; limitSeconds: number; checkpointPath?: string }
   | { status: "error"; message: string; checkpointPath?: string; code?: "agent_protocol_error" };

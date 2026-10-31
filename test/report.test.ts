@@ -977,4 +977,51 @@ describe("stack page and table", () => {
     ]);
     for (const row of rows) expect(row.split(/(?<!\\)\|/)).toHaveLength(6);
   });
+
+  test("opens the plan with its evidence coverage over every design element, before the scope", () => {
+    // Rejects leaving the section out, putting it after the scope, and taking shares of a different total.
+    const report = renderReport({ brief: parseIntake({ summary: "Sell tickets.", requirements: [{ description: "Sell.", observableAcceptance: ["A ticket is sold."] }], outOfScope: [], assumptions: [], materialQuestions: [], researchQueries: ["tickets"] }), resolvedAnswers: [], plan: stackPlan(), sources: [], evidence: { sources: stackSources, excerpts: stackExcerpts, bytesBySourceId: new Map(), textBySourceId: new Map(), gaps: [] }, gaps: [], reviews: [], validationIssues: [], validationHistory: [], commands: [] });
+    expect(report.indexOf("## Evidence coverage\n")).toBeGreaterThan(-1);
+    expect(report.indexOf("## Evidence coverage\n")).toBeLessThan(report.indexOf("## Scope\n"));
+    expect(report).toContain([
+      "Of the plan's 3 design elements (decisions, modules, data entities, invariants and access boundaries):",
+      "",
+      "| Cites | Elements | Share |",
+      "| --- | --- | --- |",
+      "| Source from a reference repository, read at a pinned commit | 2 | 67% |",
+      "| Only the local project | 0 | 0% |",
+      "| No source cited | 1 | 33% |",
+      "",
+      "The plan adopts no reference pattern.",
+      "",
+      "The host counted citations of excerpts it read. It did not check that an excerpt supports the claim beside it. Each share is rounded on its own, and these counts do not change readiness.",
+    ].join("\n"));
+  });
+
+  test("states how many adopted patterns cite a reference test, and says so when there is no design element to count", () => {
+    // Rejects swapping the tested and total pattern counts, and printing null percent shares for an empty design.
+    const input = (plan: PlanDocument) => ({ brief: parseIntake({ summary: "Sell tickets.", requirements: [{ description: "Sell.", observableAcceptance: ["A ticket is sold."] }], outOfScope: [], assumptions: [], materialQuestions: [], researchQueries: ["tickets"] }), resolvedAnswers: [], plan, sources: [], evidence: { sources: stackSources, excerpts: stackExcerpts, bytesBySourceId: new Map(), textBySourceId: new Map(), gaps: [] }, gaps: [], reviews: [], validationIssues: [], validationHistory: [], commands: [] });
+    const withPatterns = stackPlan();
+    withPatterns.referenceComparisons = [{
+      candidateId: "C1",
+      provider: "github",
+      repository: "org/a",
+      commitSha: sha,
+      selectionRationale: "Mature.",
+      adoptedPatterns: [
+        { pattern: "Seat hold", evidence: [{ excerptId: "E1", claim: "a holds seats" }], testEvidence: [{ excerptId: "E1", claim: "a tests the hold" }] },
+        { pattern: "Refund queue", evidence: [{ excerptId: "E1", claim: "a queues refunds" }], testEvidence: [], untestedReason: "No refund test." },
+        { pattern: "Receipt", evidence: [{ excerptId: "E1", claim: "a sends receipts" }], testEvidence: [], untestedReason: "No receipt test." },
+      ],
+      rejectedPatterns: [],
+      localAdaptation: "Use the project's queue.",
+    }];
+    expect(renderReport(input(withPatterns))).toContain("1 of 3 adopted patterns (33%) cite a reference test, read and not run.");
+    const empty = stackPlan();
+    empty.design.modules = [];
+    empty.design.dataModel.entities = [];
+    const report = renderReport(input(empty));
+    expect(report).toContain("## Evidence coverage\n\nThe plan has no design elements to count.\n");
+    expect(report).not.toContain("null%");
+  });
 });

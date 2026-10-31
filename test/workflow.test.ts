@@ -2663,6 +2663,8 @@ describe("evidence requests", () => {
         expect(outcome.gaps).toContainEqual({ kind: "file", material: false, message: "The model's requests for more source failed, so the plan uses the first excerpts." });
         // The flag comes from the first excerpts, which hold the comparator's production code.
         expect(outcome.research?.trustworthyReferenceFound).toBe(true);
+        // The plan has four design elements: three cite the comparator's excerpts and one is new design.
+        expect(outcome.evidenceCoverage).toMatchObject({ designElements: 4, reference: 3, referencePercent: 75, localOnly: 0, noSource: 1, noSourcePercent: 25, adoptedPatterns: 1, adoptedPatternsWithReferenceTest: 1 });
       }
       expect(events.filter((event) => event.stage === "evidence_requests").map((event) => event.state)).toEqual(["started", "warning"]);
     } finally {

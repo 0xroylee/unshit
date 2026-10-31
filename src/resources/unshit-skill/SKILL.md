@@ -74,8 +74,9 @@ The final result has `stage`, `limit` (`idle` or `total`) and `limitSeconds`. Te
 
 ## Read the result
 
-- Read the final `result` record. A completed result has `readiness`, `plan`, `research`, `gaps`, `sources` and `artifacts.reportPath`. Read and link that exact returned plan path; do not guess the newest run directory. The evidence is beside it in the returned `artifacts.evidenceDirectory`.
+- Read the final `result` record. A completed result has `readiness`, `evidenceCoverage`, `plan`, `research`, `gaps`, `sources` and `artifacts.reportPath`. Read and link that exact returned plan path; do not guess the newest run directory. The evidence is beside it in the returned `artifacts.evidenceDirectory`.
 - Tell the user whether it is Ready or Draft and why, the selected reference repositories and why they were chosen, what the quality bar excluded, the material gaps and the task list.
+- Give the user the evidence coverage from `evidenceCoverage`: of the plan's design elements, how many cite source read from a reference repository at a pinned commit, how many cite only the local project and how many cite no source, each with its percent, and how many adopted patterns cite a reference test. It counts citations of source the host read; do not call it proof, and do not treat it as a readiness rule.
 - Give the user the plan's "Trusted, not checked" section and ask each note starting with "Open decision for". Do not settle these decisions yourself. Once the user settles one, add it to the requirement in their words and start a new run with new brief and preview approvals. Implement from the new plan.
 - The plan's "Stages and references" section and `artifacts.previewPath` show each stage and its references, distinguishing search results, listed but unread files and source the host read. Answer questions about what a stage relied on from there.
 - `artifacts.stackPath` draws modules and data entities as bricks and shows the repositories and cited code behind each brick.

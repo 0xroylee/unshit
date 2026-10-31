@@ -2,8 +2,9 @@ import { topologicalTasks } from "./model-schema.ts";
 import { requirementLabel } from "./brief-approval.ts";
 import { changedStages, previewStageTitle } from "./preview.ts";
 import { brickDrawing, stackLayers, type StackLayer } from "./stack.ts";
+import { evidenceCoverage } from "./coverage.ts";
 import type { LoadedEvidence } from "./evidence.ts";
-import type { ExistingCommand } from "./types.ts";
+import type { EvidenceCoverage, ExistingCommand } from "./types.ts";
 import type {
   BriefApproval,
   FinalSource,
@@ -61,6 +62,7 @@ export function renderReport(input: ReportInput): string {
     lines.push(`Saved report: \`${input.artifacts.reportPath}\``, `Evidence manifest: \`${input.artifacts.manifestPath}\``, "");
   }
 
+  lines.push(...evidenceCoverageLines(evidenceCoverage(plan, input.evidence)));
   lines.push("## Scope", "", `**Final plan scope.** ${plan.summary}`);
   if (input.briefApproval?.via === "answers_file") {
     // A run from an approved answers file had no intake turn, so there is no initial summary to show.
@@ -843,6 +845,35 @@ document.addEventListener("keydown", function (event) { if (event.key === "Escap
 // One cell of a Markdown table: a single code span, with each pipe escaped so that it stays in its cell.
 function tableCode(value: string): string {
   return markdownCode(value).replace(/\|/g, "\\|");
+}
+
+// The plan.md Evidence coverage section: each class of design element with its count and its share of all of them,
+// then the adopted patterns that cite a reference test.
+function evidenceCoverageLines(coverage: EvidenceCoverage): string[] {
+  const lines = ["## Evidence coverage", ""];
+  if (coverage.designElements === 0) {
+    lines.push("The plan has no design elements to count.", "");
+  } else {
+    lines.push(
+      `Of the plan's ${coverage.designElements} design elements (decisions, modules, data entities, invariants and access boundaries):`,
+      "",
+      "| Cites | Elements | Share |",
+      "| --- | --- | --- |",
+      `| Source from a reference repository, read at a pinned commit | ${coverage.reference} | ${coverage.referencePercent}% |`,
+      `| Only the local project | ${coverage.localOnly} | ${coverage.localOnlyPercent}% |`,
+      `| No source cited | ${coverage.noSource} | ${coverage.noSourcePercent}% |`,
+      "",
+    );
+  }
+  lines.push(
+    coverage.adoptedPatterns === 0
+      ? "The plan adopts no reference pattern."
+      : `${coverage.adoptedPatternsWithReferenceTest} of ${coverage.adoptedPatterns} adopted patterns (${coverage.adoptedPatternsWithReferenceTestPercent}%) cite a reference test, read and not run.`,
+    "",
+    "The host counted citations of excerpts it read. It did not check that an excerpt supports the claim beside it. Each share is rounded on its own, and these counts do not change readiness.",
+    "",
+  );
+  return lines;
 }
 
 // The plan.md Stack section: one row per brick, from the bottom up. Names are untrusted text, so each is a code span.
