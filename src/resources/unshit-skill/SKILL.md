@@ -16,15 +16,33 @@ description: Plan a software feature or new application with the unshit CLI befo
 
 ## Run in one live process
 
-1. Pass the user's requirement in their words, plus facts they already stated. Point `--cwd` at the target project, or an empty directory for a new application:
+1. Pass the user's requirement in their words, plus facts they already stated. Point `--cwd` at the target project, or an empty directory for a new application. Each tool call starts a new shell, so write the run directory's literal path into every command; a variable set in an earlier call is empty. First create a new directory for this run and note the path it prints:
 
    ```sh
-   unshit "<requirement>" --cwd <project> --agent
+   mkdir -p "<project>/.unshit" && d=$(mktemp -d "<project>/.unshit/agent-XXXXXX") && : > "$d/in.jsonl" && : > "$d/out.jsonl" && : > "$d/exit.code" && echo "$d"
    ```
 
-2. Keep this one process alive with writable stdin while you talk to the user. A run takes several minutes and several model turns. Read stdout as JSONL, keep stdin open between replies, and do not start another run for the same project at the same time. `--agent` already enables JSONL; it cannot be combined with `--json` or `--install-skill`.
-3. Progress and preview records describe the work. An `input_request` pauses at one gate with a host-issued `requestId` and `kind`. Respond only to that pending request, using its exact ID. One final `result` record ends the run.
-4. Exit codes are `0` completed, `2` declined brief or preview, `124` model turn timeout, `130` cancelled or stdin ended, and `1` error. There is no timeout while waiting for the user's reply. A malformed, early, stale, duplicate or wrong-kind reply fails the run. To cancel, write `{"type":"cancel"}` on one line or send Ctrl+C.
+   Then start unshit with stdin fed from `in.jsonl`:
+
+   ```sh
+   d="<run directory>"; tail -f "$d/in.jsonl" | (sh -c 'echo $PPID' > "$d/pid"; unshit "<requirement>" --cwd "<project>" --agent > "$d/out.jsonl" 2> "$d/err.log"; echo $? > "$d/exit.code"; exec </dev/null; echo >> "$d/in.jsonl")
+   ```
+
+   `pid` holds the process that runs unshit. When unshit exits, the commands after it write its exit code to `exit.code` and stop `tail`. unshit does not read `.unshit` as project source.
+
+2. Keep this one process alive with writable stdin while you talk to the user. A run takes several minutes and several model turns, plus the time the user takes to answer. Start it where it outlives your turn. A terminal the user can see keeps it running however long the user takes. A background command of your tools works only if the run and the user's answers fit in its time limit: in Claude Code, use Bash `run_in_background` with the largest timeout; the default stops the run after 30 minutes, and a background command stops after two hours at most. A process started with `nohup … &` stops when a Claude Code Bash call ends. Do not start another run for the same project at the same time. `--agent` already enables JSONL; it cannot be combined with `--json` or `--install-skill`.
+3. The run is going while `exit.code` is empty and `kill -0 "$(cat "<run directory>/pid")"` succeeds. It has ended when `exit.code` holds a code. If `exit.code` is empty and that process is gone, or its background command ended or was stopped, the run is lost: tell the user and start a new run in a new directory.
+4. Reply only while the run is going, by appending exactly one line of JSON to `in.jsonl`, for example with a quoted heredoc (`cat >> "<run directory>/in.jsonl" <<'EOF'`) so the shell changes nothing. Never type an agent-protocol reply into a terminal: a terminal limits the length of an input line, and on macOS a line over about 1 KB never arrives, so unshit waits forever. Never close unshit's stdin; end of input cancels the run.
+5. Do not block your turn while unshit works. After you start it and after each reply, start one background waiter with the largest timeout, and then end your turn. A waiter that waits only for the process to exit never ends, because unshit pauses at each request without exiting. This waiter ends at the next `input_request` or `result` line, or when the run ends or is lost; `<n>` is the number of `input_request` and `result` lines you have already handled:
+
+   ```sh
+   d="<run directory>"; n=<n>; while sleep 2; do [ "$(grep -c -E '"type":"(input_request|result)"' "$d/out.jsonl")" -gt "$n" ] && break; [ -s "$d/exit.code" ] && break; kill -0 "$(cat "$d/pid")" 2> /dev/null || break; done
+   ```
+
+   When the waiter stops at its own time limit, start it again. If your tools cannot wake you when a background command ends, read `out.jsonl` about once a minute instead.
+6. End each of your turns during a run with one line for the user: the current stage, that they can keep chatting or ask for the status, and that you will come back when unshit needs them. When the user writes during a run, answer them, and give the stage and message of the last `progress` line in `out.jsonl` and whether the run is going. If unshit ended without a `result` line, say so and show the end of `err.log`.
+7. Progress and preview records describe the work. An `input_request` pauses at one gate with a host-issued `requestId` and `kind`. Respond only to that pending request, using its exact ID. One final `result` record ends the run.
+8. Exit codes are `0` completed, `2` declined brief or preview, `124` model turn timeout, `130` cancelled or stdin ended, and `1` error. There is no timeout while waiting for the user's reply. A malformed, early, stale, duplicate or wrong-kind reply fails the run. To cancel, append `{"type":"cancel"}` to `in.jsonl` or send Ctrl+C.
 
 ## Reply to input requests
 

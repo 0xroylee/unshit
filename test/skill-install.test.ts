@@ -38,7 +38,7 @@ describe("unshit agent skill", () => {
     expect(UNSHIT_SKILL.startsWith("---\nname: unshit\ndescription: ")).toBe(true);
     expect(UNSHIT_SKILL.trimEnd().endsWith(SKILL_MARKER)).toBe(true);
     for (const text of [
-      'unshit "<requirement>" --cwd <project> --agent',
+      'unshit "<requirement>" --cwd "<project>" --agent',
       "Keep this one process alive with writable stdin",
       '"type":"input_response","requestId":"<exact pending ID>"',
       "show the whole `questions` batch",
@@ -50,6 +50,21 @@ describe("unshit agent skill", () => {
       "If the process or session is lost, start again",
       "When live stdin is unavailable",
       "Read and link that exact returned plan path",
+    ]) expect(UNSHIT_SKILL).toContain(text);
+  });
+
+  test("describes a new directory per run, stdin fed from a file, and a waiter for the next request or a lost run", () => {
+    for (const text of [
+      "Each tool call starts a new shell, so write the run directory's literal path into every command",
+      'd=$(mktemp -d "<project>/.unshit/agent-XXXXXX")',
+      `tail -f "$d/in.jsonl" | (sh -c 'echo $PPID' > "$d/pid"; unshit "<requirement>" --cwd "<project>" --agent > "$d/out.jsonl"`,
+      'echo $? > "$d/exit.code"; exec </dev/null; echo >> "$d/in.jsonl")',
+      "the run is lost: tell the user and start a new run in a new directory",
+      "Never type an agent-protocol reply into a terminal",
+      "A waiter that waits only for the process to exit never ends",
+      `[ "$(grep -c -E '"type":"(input_request|result)"' "$d/out.jsonl")" -gt "$n" ] && break; [ -s "$d/exit.code" ] && break; kill -0 "$(cat "$d/pid")" 2> /dev/null || break`,
+      "When the waiter stops at its own time limit, start it again.",
+      "End each of your turns during a run with one line for the user",
     ]) expect(UNSHIT_SKILL).toContain(text);
   });
 
