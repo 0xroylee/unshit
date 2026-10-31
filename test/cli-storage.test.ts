@@ -7,12 +7,15 @@ import { PassThrough } from "node:stream";
 import { describe, expect, test } from "bun:test";
 import { answerOptions, createBriefApprover, createPreviewConfirmer, createRunWriters, createTerminalAsk, exitCodeFor, formatJsonlResult, gatewayOptions, helpText, main, needsInputMessage, parseCliArguments, readAnswerFile, runWithAnswers, terminalPrompts, withAnswersFile, type LoadedAnswers } from "../src/cli.ts";
 import { briefSha256, editableBrief, renderBriefForApproval } from "../src/brief-approval.ts";
+import { evidenceCoverage } from "../src/coverage.ts";
 import { sourceLocation } from "../src/evidence.ts";
 import { parseIntake, stableMaterialQuestionId } from "../src/model-schema.ts";
 import { createRunPublisher, writeAnswersTemplate, writeCheckpointArtifacts, writePlanArtifacts } from "../src/storage.ts";
 import { PREVIEW_DECLINED, PREVIEW_UNAVAILABLE, PUBLICATION_CLOSED, candidateReference, createPreviewRecorder, evidenceReferences } from "../src/preview.ts";
 import type { WorkflowOptions } from "../src/workflow.ts";
-import type { ApprovedBrief, BriefApproval, EvidenceSource, PlanDocument, ResearchSummary, RunOutcome, WorkflowPreview } from "../src/types.ts";
+import type { ApprovedBrief, BriefApproval, EvidenceCoverage, EvidenceSource, PlanDocument, ResearchSummary, RunOutcome, WorkflowPreview } from "../src/types.ts";
+
+const noCoverage: EvidenceCoverage = { designElements: 0, reference: 0, referencePercent: null, localOnly: 0, localOnlyPercent: null, noSource: 0, noSourcePercent: null, adoptedPatterns: 0, adoptedPatternsWithReferenceTest: 0, adoptedPatternsWithReferenceTestPercent: null };
 
 const brief = parseIntake({
   summary: "Build a small API.",
@@ -223,6 +226,7 @@ describe("answers and script output", () => {
     const outcome: RunOutcome = {
       status: "completed",
       readiness: "draft",
+      evidenceCoverage: noCoverage,
       brief,
       initialBrief,
       research,
@@ -352,6 +356,7 @@ describe("partial evidence persistence", () => {
       expect(finalManifest.resolvedAnswers).toEqual(resolvedAnswers);
       expect(finalManifest.initialBrief).toEqual(initialBrief);
       expect(finalManifest.research).toEqual(research);
+      expect(finalManifest.evidenceCoverage).toEqual(evidenceCoverage(input.plan, input.evidence));
       expect(savedReport).toContain("Who can approve a refund?");
       expect(savedReport).toContain("Only named refund managers.");
     } finally {
@@ -407,6 +412,7 @@ describe("brief approval files", () => {
   const unapproved: RunOutcome = {
     status: "completed",
     readiness: "draft",
+    evidenceCoverage: noCoverage,
     brief: labelledBrief,
     resolvedAnswers,
     plan: {

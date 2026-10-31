@@ -5,6 +5,7 @@ import { editableBrief, type EditableBrief } from "./brief-approval.ts";
 import { REFERENCE_POLICY_HASH } from "./instructions.ts";
 import { renderPreviewHtml, renderReport, renderStackHtml, type ReportInput } from "./report.ts";
 import { stackLayers } from "./stack.ts";
+import { evidenceCoverage } from "./coverage.ts";
 import type { LoadedEvidence } from "./evidence.ts";
 import { PREVIEW_FINALIZE_FAILED, PREVIEW_SAVE_FAILED, PREVIEW_SOURCES_FAILED, PUBLICATION_CLOSED } from "./preview.ts";
 import type { CheckpointStage, IntakeBrief, MaterialQuestion, PlanDocument, RunArtifacts, WorkflowPreview } from "./types.ts";
@@ -40,6 +41,7 @@ export async function writePlanArtifacts(options: {
     runId,
     generatedAt: new Date().toISOString(),
     readiness: options.input.plan.readiness,
+    evidenceCoverage: evidenceCoverage(options.input.plan, options.input.evidence),
     briefApproval: options.input.briefApproval ?? null,
     brief: options.input.brief,
     initialBrief: options.input.initialBrief,

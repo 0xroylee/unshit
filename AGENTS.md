@@ -18,6 +18,7 @@ intake → material answers → brief rebuild → brief approval → local basel
 | `src/workflow.ts` | The run: gates, search, screening, selection, evidence, plan, review and repair, readiness, checkpoints |
 | `src/preview.ts` | The stage-and-reference preview: the steps of a run, the recorder of host records and of the references each step used, reference classes |
 | `src/stack.ts` | The plan's bricks for the stack page and the brick drawing |
+| `src/coverage.ts` | Evidence coverage: the plan's design elements counted by what they cite, and the adopted patterns with a reference test |
 | `src/app-server.ts` | Codex App Server client: RPC, active-turn tracking, final text, cancellation, idle and total turn timeouts, process cleanup; `ModelGateway` is the seam |
 | `src/github.ts` | GitHub queries, Grep requests, the quality bar, commit-pinned trees, GitLab fallback |
 | `src/code-search.ts` | Grep request bodies, response parsing, hits per repository |
